@@ -1,0 +1,55 @@
+# Secrets and credentials — never commit these.
+.env
+.env.*
+!.env.example
+**/*credentials*.json
+**/*token*.json
+**/*oauth*.json
+**/*secret*.json
+**/*adc*.json
+**/application_default_credentials.json
+# Private credential directories (local OAuth / account profiles).
+.secrets/
+.gcloud-colab/
+
+# Python
+.venv/
+.venv-colab-cli/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Live local state (ledgers, sessions, depot state) — never commit.
+model_cache/*
+!model_cache/verified_manifest.example.json
+logs/
+runs/
+output/
+outputs/
+artifacts/
+
+# Real task specifications (not sanitized examples) — never commit.
+# config/task_spec.example.json and config/*.yaml stay tracked.
+config/tasks/
+
+# Model weights, media, and generated video — never commit.
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+*.mp4
+*.mov
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Partial / transient files
+*.part
+*.uploadstate
+*.pid
+*.log
