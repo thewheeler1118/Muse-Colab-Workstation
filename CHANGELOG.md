@@ -1,6 +1,44 @@
 # CHANGELOG
 
-## Unreleased — Muse Adapter (Stage 1, TASK-VERSION-ROADMAP-011)
+## Unreleased — v0.2.0 development (TASK-VERSION-ROADMAP-011)
+
+### F1 — Zero-copy high-concurrency Drive download (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.0 F1 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md` in the adapter PR). `h3_drive_download.py`:
+
+- Large fresh downloads no longer shard into `.part.shardN` temp
+  files plus a merge. One `.part` file is preallocated with
+  `os.truncate` and filled by lock-free multi-threaded `os.pwrite`
+  (peak disk `<= 1.0x` the file size).
+- `DEFAULT_CONCURRENT_WORKERS` 4 → 12, configurable via
+  `H3_DRIVE_CONCURRENT_WORKERS` (1..16); process-wide Drive
+  connection semaphore `DEFAULT_MAX_GLOBAL_CONNECTIONS = 16` via
+  `H3_DRIVE_MAX_GLOBAL_CONNECTIONS`.
+- Ordered in-flight streaming SHA-256: blocks hash in index order;
+  a block that finishes out of order is read back with `os.pread`
+  when its turn comes instead of being buffered whole. A successful
+  concurrent download no longer re-reads the whole file for a second
+  full hash — the streaming digest is the proof (post-metadata check
+  and atomic replace unchanged).
+- Atomic `.part.bitmap.json` block-level resume: an interrupted
+  download refetches only its missing blocks.
+- `abort_event` / `DriveDownloadAbortedError`: cancellation leaves
+  `.part` + bitmap for resume.
+- Single-flight `FileTokenProvider.refresh(failed_token_id=None)`:
+  concurrent 401s trigger one token-file re-read, not one per thread.
+
+Tests: new `tests/test_drive_download_v2.py` (17 tests, offline fake
+transport). Updated `tests/test_drive_download.py`: default-workers
+constant 12; the TASK-007.1 shard-merge test was retired because its
+implementation no longer exists (replaced by the pwrite tests — an
+intended behaviour change, recorded in the test file, not a silent
+deletion). Full offline suite: 760 tests, 0 failures. Live GPU
+verification: NOT_VERIFIED (no GPU run under this change).
+
+### Muse Adapter (Stage 1)
+
 
 Muse-original adapter layer over the unchanged v0.1.0 production
 core (`adapters/muse/`): TaskSpec mapping, explicit-authorization →

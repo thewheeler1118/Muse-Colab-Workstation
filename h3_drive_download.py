@@ -31,10 +31,27 @@ Download rules:
 - Error classification: 429/5xx are transient (bounded backoff);
   401 triggers exactly one token refresh, then fails closed;
   403 fails closed immediately; other 4xx fail immediately.
+
+v0.2.0 F1 (TASK-VERSION-ROADMAP-011, Muse-original reimplementation
+of the upstream v0.2.0 behaviour spec — no upstream code copied):
+large fresh downloads no longer shard into ``.part.shardN`` temp
+files plus a merge. Instead one ``.part`` file is preallocated with
+``os.truncate`` and filled by lock-free multi-threaded ``os.pwrite``
+(peak disk ``<= 1.0x`` the file size). Completion is tracked per
+worker-range block in an atomically written
+``.part.bitmap.json`` so an interrupted download resumes only its
+missing blocks. Integrity is checked in flight by an ordered
+streaming SHA-256: blocks hash in index order, and a block that
+finishes out of order is read back from disk with ``os.pread`` when
+its turn comes instead of being buffered whole in memory. An
+``abort_event`` cancels the transfer
+(``DriveDownloadAbortedError``) leaving ``.part`` + bitmap for
+resume, and token refresh is single-flight across threads.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -62,12 +79,71 @@ DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB streaming writes (TASK-007)
 DEFAULT_MAX_ATTEMPTS = 4
 DEFAULT_BACKOFF_BASE_SEC = 2.0
 DEFAULT_TIMEOUT_SEC = 300
-# Files at or above this size get a sharded concurrent download when
-# starting fresh (TASK-007): a 40 GiB restore over one TCP stream is
-# the single biggest cold-start risk against a ~60-minute session
-# budget. Below it the single stream is simpler and fast enough.
+# Files at or above this size get a concurrent download when starting
+# fresh (TASK-007): a 40 GiB restore over one TCP stream is the single
+# biggest cold-start risk against a ~60-minute session budget. Below
+# it the single stream is simpler and fast enough.
 CONCURRENT_MIN_SIZE = 256 * 1024 * 1024
-DEFAULT_CONCURRENT_WORKERS = 4
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    """Read an int env override, clamped to [lo, hi]; default on any
+    bad value. Used for the F1 worker / connection caps so operators
+    can tune without a code change."""
+    try:
+        value = int(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
+
+
+# v0.2.0 F1: 12 workers by default (was 4), 1..16 via
+# H3_DRIVE_CONCURRENT_WORKERS. The effective per-downloader count is
+# resolved in DriveDownloader.__init__ (explicit arg wins, else env,
+# else this default) so tests can pin either without reloading.
+DEFAULT_CONCURRENT_WORKERS = 12
+# v0.2.0 F1: process-wide cap on simultaneous Drive connections, 16
+# by default via H3_DRIVE_MAX_GLOBAL_CONNECTIONS (1..64). The
+# semaphore bounds connection establishment across every
+# DriveDownloader in this process; each HTTP call holds one permit
+# only while urlopen() runs.
+DEFAULT_MAX_GLOBAL_CONNECTIONS = 16
+_CONNECTION_SEMAPHORE = threading.BoundedSemaphore(
+    _env_int("H3_DRIVE_MAX_GLOBAL_CONNECTIONS",
+             DEFAULT_MAX_GLOBAL_CONNECTIONS, 1, 64))
+
+
+@contextlib.contextmanager
+def _drive_connection():
+    """Hold one process-wide Drive connection permit. Reads the
+    module-global semaphore at call time so tests can swap it."""
+    _CONNECTION_SEMAPHORE.acquire()
+    try:
+        yield
+    finally:
+        _CONNECTION_SEMAPHORE.release()
+
+
+def _urlopen(req, timeout):
+    """urlopen behind the global connection semaphore. Tests patch
+    the module-global ``urlopen``; this helper resolves it at call
+    time, so the patch still applies."""
+    with _drive_connection():
+        return urlopen(req, timeout=timeout)
+
+
+def resolve_concurrent_workers(explicit: int | None = None) -> int:
+    """Effective concurrent-worker count: explicit arg wins, else the
+    H3_DRIVE_CONCURRENT_WORKERS env override (1..16), else the
+    default. Raises ValueError on an explicit value below 1."""
+    if explicit is not None:
+        if explicit < 1:
+            raise ValueError("concurrent_workers must be >= 1")
+        return explicit
+    return _env_int("H3_DRIVE_CONCURRENT_WORKERS",
+                    DEFAULT_CONCURRENT_WORKERS, 1, 16)
+
+
 # A slow-but-alive download is not killed; the read timeout only bounds
 # a single stalled read inside urlopen.
 TRANSIENT_STATUSES = (429, 500, 502, 503, 504)
@@ -90,6 +166,12 @@ class DriveRetryExhaustedError(DriveDownloadError):
     """Transient failures outlived the bounded retry budget."""
 
 
+class DriveDownloadAbortedError(DriveDownloadError):
+    """An external ``abort_event`` cancelled the transfer. The
+    ``.part`` file (and its bitmap, for concurrent downloads) is left
+    in place so the next attempt resumes instead of restarting."""
+
+
 class _NoRangeSupport(Exception):
     """Internal: a ranged request was answered 200, so the server does
     not honour Range for this file. Signals the caller to fall back
@@ -97,7 +179,7 @@ class _NoRangeSupport(Exception):
 
 
 class _ProgressAborted(Exception):
-    """Internal: a shard stopped early because the progress callback
+    """Internal: a block stopped early because the progress callback
     raised (e.g. the worker's budget projection). The recorded
     callback error is what surfaces, never this marker."""
 
@@ -181,6 +263,10 @@ class FileTokenProvider:
         self._token: str | None = None
         self._expires_at: float | None = None
         self._token_id: str | None = None
+        # v0.2.0 F1 single-flight refresh: while one thread is
+        # re-reading the token file, other threads wait on this event
+        # instead of starting a second refresh. None when idle.
+        self._refreshing: threading.Event | None = None
 
     @property
     def token_id(self) -> str | None:
@@ -225,13 +311,46 @@ class FileTokenProvider:
                 return self._token
             raise TokenUnavailable("no usable Drive access token")
 
-    def refresh(self) -> str:
+    def refresh(self, failed_token_id: str | None = None) -> str:
         """Force a re-read of the token file (after a 401). Raises
-        TokenUnavailable when no fresh token file is present."""
+        TokenUnavailable when no fresh token file is present.
+
+        v0.2.0 F1 single-flight: when several download threads hit
+        401 at once, only the first re-reads the file; the rest wait
+        for that refresh to finish and then use its token. When
+        ``failed_token_id`` is given and it no longer matches the
+        current token, another thread already refreshed past the
+        failure, so this call returns the current token without
+        touching the file again. The wait is bounded (30 s) and never
+        holds ``self._lock``."""
         with self._lock:
-            if self._load_file_locked():
+            if failed_token_id is not None and self._token_id is not None \
+                    and failed_token_id != self._token_id:
                 return self._token
-            raise TokenUnavailable("no fresh Drive token file for refresh")
+            if self._refreshing is None:
+                event = threading.Event()
+                self._refreshing = event
+                refresher = True
+            else:
+                event = self._refreshing
+                refresher = False
+        if not refresher:
+            event.wait(timeout=30)
+            with self._lock:
+                if self._token is not None:
+                    return self._token
+                raise TokenUnavailable(
+                    "no fresh Drive token file for refresh")
+        try:
+            with self._lock:
+                if not self._load_file_locked():
+                    raise TokenUnavailable(
+                        "no fresh Drive token file for refresh")
+                return self._token
+        finally:
+            with self._lock:
+                self._refreshing = None
+            event.set()
 
     def seconds_remaining(self) -> float | None:
         with self._lock:
@@ -249,6 +368,114 @@ def _backoff_delay(attempt: int, base: float) -> float:
     return base * (2 ** (attempt - 1)) + random.uniform(0, 1.0)
 
 
+# -- v0.2.0 F1: bitmap resume + ordered streaming hash (module level) --
+
+BITMAP_VERSION = 1
+
+
+def _bitmap_path(part: Path) -> Path:
+    return Path(str(part) + ".bitmap.json")
+
+
+def _discard_bitmap(part: Path) -> None:
+    try:
+        _bitmap_path(part).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _save_bitmap_atomic(part: Path, expected_size: int,
+                        expected_sha256: str, workers: int,
+                        done: set[int]) -> None:
+    """Atomically record which worker-range blocks are complete.
+    Written (temp file + os.replace) after every block completes, so
+    a crash never leaves a torn bitmap behind."""
+    doc = {"version": BITMAP_VERSION, "size": expected_size,
+           "sha256": expected_sha256.lower(), "workers": workers,
+           "done": sorted(done)}
+    tmp = Path(str(_bitmap_path(part)) + f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(doc), encoding="utf-8")
+    os.replace(tmp, _bitmap_path(part))
+
+
+def _load_bitmap(part: Path, expected_size: int, expected_sha256: str,
+                 workers: int) -> set[int] | None:
+    """Load a valid resume bitmap, or None. Validates size, pinned
+    SHA-256, worker count (block boundaries depend on it) and that
+    every recorded block index exists; never raises on bad content —
+    a corrupt or mismatched bitmap simply means 'start fresh'."""
+    try:
+        if not part.is_file() or part.stat().st_size != expected_size:
+            return None
+        doc = json.loads(_bitmap_path(part).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("version") != BITMAP_VERSION:
+        return None
+    if doc.get("size") != expected_size:
+        return None
+    if str(doc.get("sha256", "")).lower() != expected_sha256.lower():
+        return None
+    if doc.get("workers") != workers:
+        return None
+    done = doc.get("done")
+    if not isinstance(done, list):
+        return None
+    if any(not isinstance(i, int) for i in done):
+        return None
+    block_count = (expected_size + workers - 1) // workers
+    if any(i < 0 or i >= block_count for i in done):
+        return None
+    return set(done)
+
+
+class _OrderedBlockHasher:
+    """Ordered in-flight SHA-256 over downloaded blocks, bounded
+    memory: this class never holds block bytes. Blocks are pwritten
+    to disk as they arrive; when a block completes out of order, its
+    bytes are read back from disk with ``os.pread`` when its turn
+    comes (spillback) instead of being buffered whole."""
+
+    def __init__(self, part_fd: int, ranges, chunk_size: int):
+        self._fd = part_fd
+        self._ranges = list(ranges)
+        self._chunk_size = chunk_size
+        self._hasher = hashlib.sha256()
+        self._next = 0
+        self._done: set[int] = set()
+        self._lock = threading.Lock()
+
+    def block_completed(self, index: int) -> None:
+        """Record that ``index`` is fully on disk, then hash every
+        contiguous completed block starting at the next unhashed one."""
+        with self._lock:
+            self._done.add(index)
+            while self._next in self._done:
+                start, end = self._ranges[self._next]
+                remaining = end - start + 1
+                offset = start
+                while remaining > 0:
+                    step = min(self._chunk_size, remaining)
+                    data = os.pread(self._fd, step, offset)
+                    if not data:
+                        raise DriveDownloadError(
+                            "short pread while hashing block "
+                            f"{self._next}")
+                    self._hasher.update(data)
+                    offset += len(data)
+                    remaining -= len(data)
+                self._done.discard(self._next)
+                self._next += 1
+
+    def hexdigest(self) -> str:
+        with self._lock:
+            if self._next != len(self._ranges):
+                raise DriveDownloadError(
+                    "streaming hash incomplete: hashed "
+                    f"{self._next} of {len(self._ranges)} blocks")
+            return self._hasher.hexdigest()
+
+
 class DriveDownloader:
     """Range-resuming Drive file downloader over a token provider.
 
@@ -259,8 +486,8 @@ class DriveDownloader:
     ``on_token_expiring`` is called as ``on_token_expiring(token_id,
     seconds_remaining)`` when the provider reports less than the
     renewal margin during a download.
-    ``concurrent_workers`` bounds the sharded download of large fresh
-    files (``>= CONCURRENT_MIN_SIZE``); it is separate from
+    ``concurrent_workers`` bounds the concurrent download of large
+    fresh files (``>= CONCURRENT_MIN_SIZE``); it is separate from
     ``max_workers``, which bounds multi-file ``download_all``.
     """
 
@@ -268,20 +495,20 @@ class DriveDownloader:
                  max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                  backoff_base_sec: float = DEFAULT_BACKOFF_BASE_SEC,
                  max_workers: int = 1,
-                 concurrent_workers: int = DEFAULT_CONCURRENT_WORKERS,
+                 concurrent_workers: int | None = None,
                  timeout_sec: int = DEFAULT_TIMEOUT_SEC):
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if max_workers < 1:
             raise ValueError("max_workers must be >= 1")
-        if concurrent_workers < 1:
-            raise ValueError("concurrent_workers must be >= 1")
         self.token_provider = token_provider
         self.chunk_size = chunk_size
         self.max_attempts = max_attempts
         self.backoff_base_sec = backoff_base_sec
         self.max_workers = max_workers
-        self.concurrent_workers = concurrent_workers
+        # v0.2.0 F1: None means env override (H3_DRIVE_CONCURRENT_WORKERS)
+        # else the 12-worker default.
+        self.concurrent_workers = resolve_concurrent_workers(concurrent_workers)
         self.timeout_sec = timeout_sec
 
     # -- HTTP plumbing (stdlib only; urlopen is module-level for tests) --
@@ -293,7 +520,7 @@ class DriveDownloader:
         if headers:
             req_headers.update(headers)
         req = urllib.request.Request(url, headers=req_headers, method=method)
-        return urlopen(req, timeout=self.timeout_sec)
+        return _urlopen(req, self.timeout_sec)
 
     def get_metadata(self, file_id: str) -> dict:
         """Server-side metadata for one Drive file. Raises
@@ -341,14 +568,18 @@ class DriveDownloader:
     def download_file(self, file_id: str, expected_size: int,
                       expected_sha256: str, dest,
                       expected_md5: str | None = None,
-                      on_progress=None, on_token_expiring=None) -> dict:
+                      on_progress=None, on_token_expiring=None,
+                      abort_event: threading.Event | None = None) -> dict:
         """Download one pinned Drive file to ``dest``.
 
         Returns ``{"drive_file_id", "size", "sha256", "path"}``. The
         destination is atomically replaced only after the full SHA-256
         verifies; a ``.part`` file is left behind on failure for resume.
         Raises DriveDownloadError (or a subclass) on any failure; the
-        exception message never contains a token value.
+        exception message never contains a token value. When
+        ``abort_event`` is set the transfer raises
+        DriveDownloadAbortedError and leaves ``.part`` (+ bitmap) for
+        resume instead of deleting them.
         """
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or "", re.I):
             raise ValueError("Pinned SHA-256 required for " + str(file_id))
@@ -373,32 +604,57 @@ class DriveDownloader:
                         "sha256": expected_sha256.lower(), "path": str(dest)}
             dest.unlink()  # stale or corrupt local copy; never trust it
 
-        start = part.stat().st_size if part.is_file() else 0
-        if start > expected_size:
-            part.unlink()
-            start = 0
-        if start == expected_size:
-            from h3_contract import sha256_file
+        # v0.2.0 F1 bitmap resume: a preallocated .part with a valid
+        # bitmap resumes only its missing blocks (concurrent path).
+        # Without a valid bitmap the old prefix rules apply below.
+        bitmap = _load_bitmap(part, expected_size, expected_sha256,
+                              self.concurrent_workers)
+        streaming_sha256: str | None = None
+        if bitmap is not None:
+            concurrent = self._download_concurrent(
+                file_id, expected_size, expected_sha256, part, on_progress,
+                on_token_expiring, abort_event, resume_bitmap=bitmap)
+            if concurrent is not False:
+                streaming_sha256 = concurrent["streaming_sha256"]
+                start = expected_size
+            else:
+                # Fallback: the concurrent attempt cleaned its part +
+                # bitmap, so the single stream below starts fresh.
+                start = 0
+        else:
+            start = part.stat().st_size if part.is_file() else 0
+            if start > expected_size:
+                part.unlink()
+                _discard_bitmap(part)
+                start = 0
+            if start == expected_size:
+                from h3_contract import sha256_file
 
-            if sha256_file(part) == expected_sha256.lower():
-                os.replace(part, dest)
-                return {"drive_file_id": file_id, "size": expected_size,
-                        "sha256": expected_sha256.lower(), "path": str(dest)}
-            part.unlink()
-            start = 0
+                if sha256_file(part) == expected_sha256.lower():
+                    os.replace(part, dest)
+                    _discard_bitmap(part)
+                    return {"drive_file_id": file_id, "size": expected_size,
+                            "sha256": expected_sha256.lower(),
+                            "path": str(dest)}
+                part.unlink()
+                _discard_bitmap(part)
+                start = 0
 
         last_error: Exception | None = None
         refreshed_once = False
         url = f"{DRIVE_API_BASE}/files/{file_id}?alt=media&supportsAllDrives=true"
-        # TASK-007: large fresh downloads go sharded first. A merged
-        # .part still passes through the standard final verification
-        # below (size + full SHA-256 + post-metadata + atomic replace);
-        # False means "fall back to the single stream".
+        # v0.2.0 F1: large fresh downloads go concurrent (pwrite) first.
+        # The concurrent path returns its streaming SHA-256 on success;
+        # the standard final verification below still runs the
+        # post-metadata check + atomic replace. False means "fall back
+        # to the single stream".
         if start == 0 and expected_size >= CONCURRENT_MIN_SIZE \
                 and self.concurrent_workers > 1:
-            if self._download_concurrent(
-                    file_id, expected_size, part, on_progress,
-                    on_token_expiring):
+            concurrent = self._download_concurrent(
+                file_id, expected_size, expected_sha256, part, on_progress,
+                on_token_expiring, abort_event)
+            if concurrent is not False:
+                streaming_sha256 = concurrent["streaming_sha256"]
                 start = expected_size
         for attempt in range(1, self.max_attempts + 1):
             if start >= expected_size:
@@ -425,7 +681,7 @@ class DriveDownloader:
                 # request directly so Range headers are preserved.
                 token = self.token_provider.get_token()
                 req.add_header("Authorization", "Bearer " + token)
-                with urlopen(req, timeout=self.timeout_sec) as resp:
+                with _urlopen(req, self.timeout_sec) as resp:
                     status = getattr(resp, "status", 200)
                     if status == 401:
                         if not refreshed_once:
@@ -493,6 +749,10 @@ class DriveDownloader:
                     written = start
                     with part.open(mode) as f:
                         while True:
+                            if abort_event is not None and abort_event.is_set():
+                                raise DriveDownloadAbortedError(
+                                    "Drive download aborted for "
+                                    + str(file_id))
                             chunk = resp.read(self.chunk_size)
                             if not chunk:
                                 break
@@ -552,10 +812,17 @@ class DriveDownloader:
 
         # Final verification: size + full SHA-256, then atomic replace.
         # The part is only promoted when it proves to be the pinned file.
+        # A concurrent download already proved the bytes with its
+        # ordered streaming SHA-256 (same bytes, same hash, no second
+        # full read); otherwise the part is hashed here.
         from h3_contract import sha256_file
 
-        if part.is_file() and part.stat().st_size == expected_size \
-                and sha256_file(part) == expected_sha256.lower():
+        verified = False
+        if streaming_sha256 is not None:
+            verified = streaming_sha256 == expected_sha256.lower()
+        elif part.is_file() and part.stat().st_size == expected_size:
+            verified = sha256_file(part) == expected_sha256.lower()
+        if part.is_file() and part.stat().st_size == expected_size and verified:
             # Post-check: the server file must still be the pinned one;
             # a file that changed mid-transfer is refused even if the
             # downloaded bytes happen to hash correctly.
@@ -563,29 +830,49 @@ class DriveDownloader:
             self._check_metadata(post, file_id, expected_size,
                                  expected_sha256, expected_md5)
             os.replace(part, dest)
+            _discard_bitmap(part)
             return {"drive_file_id": file_id, "size": expected_size,
                     "sha256": expected_sha256.lower(), "path": str(dest)}
         if part.is_file():
             part.unlink(missing_ok=True)
+        _discard_bitmap(part)
         detail = (str(last_error)[:120] if last_error else "unknown")
         raise DriveRetryExhaustedError(
             "Drive download failed checksum/size for " + str(file_id)
             + ": " + detail)
 
-    # -- sharded concurrent download (TASK-007) --
+    # -- concurrent download, v0.2.0 F1: preallocated pwrite, no shards --
 
-    def _download_shard(self, url: str, file_id: str, start: int, end: int,
-                        expected_size: int, shard_path: Path, report,
-                        abort: threading.Event) -> None:
-        """Download one byte range ``[start, end]`` into ``shard_path``.
+    def _block_ranges(self, expected_size: int) -> list:
+        """Split the file into ``concurrent_workers`` contiguous ranges
+        (one block per worker). The last block may be shorter."""
+        n = self.concurrent_workers
+        block_size = (expected_size + n - 1) // n
+        ranges = []
+        for i in range(n):
+            start = i * block_size
+            end = min((i + 1) * block_size, expected_size) - 1
+            ranges.append((start, end))
+        return ranges
 
-        Each attempt rewrites the shard from scratch. Raises
-        ``_NoRangeSupport`` when the server answers 200 (Range
-        ignored), ``DriveAuthError`` on 403 (fail closed, never falls
-        back), ``DriveRetryExhaustedError`` when retries run out, and
-        ``_ProgressAborted`` when the shared abort flag is set (the
-        progress callback raised; the recorded callback error is what
-        surfaces). Token refresh stays inside the thread-safe provider.
+    def _download_block(self, url: str, file_id: str, index: int,
+                        start: int, end: int, expected_size: int,
+                        part_fd: int, report, abort: threading.Event,
+                        external_abort: threading.Event | None) -> int:
+        """Download one byte range ``[start, end]`` with ``os.pwrite``
+        at its offset into the preallocated ``.part`` file.
+
+        Each attempt rewrites the block from scratch (the previous
+        attempt's bytes are overwritten in place, never appended).
+        Returns ``index`` on success. Raises ``_NoRangeSupport`` when
+        the server answers 200 (Range ignored), ``DriveAuthError`` on
+        403 (fail closed, never falls back), ``DriveRetryExhaustedError``
+        when retries run out, ``_ProgressAborted`` when the shared
+        abort flag is set (the progress callback raised; the recorded
+        callback error is what surfaces), and
+        ``DriveDownloadAbortedError`` when the caller's abort event
+        fires. Token refresh stays inside the thread-safe provider
+        and is single-flight (see FileTokenProvider.refresh).
         """
         length = end - start + 1
         last_error: Exception | None = None
@@ -593,13 +880,17 @@ class DriveDownloader:
         for attempt in range(1, self.max_attempts + 1):
             if abort.is_set():
                 raise _ProgressAborted()
+            if external_abort is not None and external_abort.is_set():
+                raise DriveDownloadAbortedError(
+                    "Drive download aborted for " + str(file_id))
             try:
                 token = self.token_provider.get_token()
+                failed_id = token_id_for(token)
                 req = urllib.request.Request(
                     url, headers={"Authorization": "Bearer " + token,
                                   "Range": f"bytes={start}-{end}"},
                     method="GET")
-                with urlopen(req, timeout=self.timeout_sec) as resp:
+                with _urlopen(req, self.timeout_sec) as resp:
                     status = getattr(resp, "status", 200)
                     if status == 200:
                         raise _NoRangeSupport(
@@ -609,7 +900,8 @@ class DriveDownloader:
                         if not refreshed_once:
                             refreshed_once = True
                             try:
-                                self.token_provider.refresh()
+                                self.token_provider.refresh(
+                                    failed_token_id=failed_id)
                             except TokenUnavailable as e:
                                 raise DriveAuthError(
                                     "Drive download 401 and no fresh "
@@ -642,26 +934,31 @@ class DriveDownloader:
                         raise DriveChangedError(
                             "Unexpected Content-Range for " + str(file_id))
                     written = 0
-                    with shard_path.open("wb") as f:
-                        while True:
-                            if abort.is_set():
-                                raise _ProgressAborted()
-                            chunk = resp.read(self.chunk_size)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            written += len(chunk)
-                            if written > length:
-                                raise DriveDownloadError(
-                                    "Drive shard overran its range for "
-                                    + str(file_id))
-                            report(len(chunk))
+                    while True:
+                        if abort.is_set():
+                            raise _ProgressAborted()
+                        if external_abort is not None \
+                                and external_abort.is_set():
+                            raise DriveDownloadAbortedError(
+                                "Drive download aborted for "
+                                + str(file_id))
+                        chunk = resp.read(self.chunk_size)
+                        if not chunk:
+                            break
+                        # Lock-free: distinct offsets never overlap.
+                        os.pwrite(part_fd, chunk, start + written)
+                        written += len(chunk)
+                        if written > length:
+                            raise DriveDownloadError(
+                                "Drive block overran its range for "
+                                + str(file_id))
+                        report(len(chunk))
                     if written == length:
-                        return
+                        return index
                     last_error = DriveDownloadError(
-                        "Drive shard short read for " + str(file_id))
+                        "Drive block short read for " + str(file_id))
             except (DriveAuthError, DriveChangedError, _NoRangeSupport,
-                    _ProgressAborted):
+                    _ProgressAborted, DriveDownloadAbortedError):
                 raise
             except urllib.error.HTTPError as e:
                 if e.code == 401 and not refreshed_once:
@@ -697,24 +994,33 @@ class DriveDownloader:
             if attempt < self.max_attempts:
                 _sleep(_backoff_delay(attempt, self.backoff_base_sec))
         raise DriveRetryExhaustedError(
-            "Drive shard retries exhausted for " + str(file_id)
+            "Drive block retries exhausted for " + str(file_id)
             + ": " + (str(last_error)[:120] if last_error else "unknown"))
 
     def _download_concurrent(self, file_id: str, expected_size: int,
-                             part: Path, on_progress,
-                             on_token_expiring) -> bool:
-        """Shard a fresh large download across ``concurrent_workers``
-        Range requests into independent temp files, then merge them in
-        order into ``part``.
+                             expected_sha256: str, part: Path, on_progress,
+                             on_token_expiring,
+                             abort_event: threading.Event | None = None,
+                             resume_bitmap: set[int] | None = None):
+        """Concurrent download into one preallocated ``.part`` file
+        (v0.2.0 F1): ``os.truncate`` to the full size, then
+        ``concurrent_workers`` threads each ``os.pwrite`` their block
+        at its offset. Peak disk is ``<= 1.0x`` the file size — no
+        shard temp files, no merge copy.
 
-        Returns True when the merge is done (the caller then runs the
-        standard final verification). Returns False to fall back to
-        the single-stream path: the server ignored Range, or a shard
-        exhausted its retries. A 403 (DriveAuthError), a metadata
-        disagreement (DriveChangedError), or an ``on_progress``
-        exception is fatal: the callback error is re-raised after the
-        pool finishes, and no fallback is attempted. Shard files are
-        cleaned up on every exit path.
+        Returns ``{"streaming_sha256": hex}`` when every block is on
+        disk and the ordered streaming hash is complete; the caller
+        still runs the post-metadata check + atomic replace. Returns
+        False to fall back to the single-stream path: the server
+        ignored Range, or a block exhausted its retries. On fallback
+        the preallocated part + bitmap are removed so the single
+        stream starts clean. A 403 (DriveAuthError), a metadata
+        disagreement (DriveChangedError), an ``on_progress`` exception
+        or an external abort is fatal: the callback error / abort is
+        re-raised after the pool finishes, and no fallback is
+        attempted. On abort the part + bitmap are left in place for
+        resume; a valid bitmap lets the next attempt fetch only the
+        missing blocks.
         """
         # Token-expiry signal once, before the pool starts.
         if on_token_expiring is not None:
@@ -726,24 +1032,43 @@ class DriveDownloader:
             if remaining is not None and remaining < TOKEN_REFRESH_MARGIN_SEC:
                 token_id = getattr(self.token_provider, "token_id", None)
                 on_token_expiring(token_id, remaining)
+        if abort_event is not None and abort_event.is_set():
+            raise DriveDownloadAbortedError(
+                "Drive download aborted for " + str(file_id))
 
         url = f"{DRIVE_API_BASE}/files/{file_id}?alt=media&supportsAllDrives=true"
-        n = self.concurrent_workers
-        shard_size = (expected_size + n - 1) // n
-        ranges = []
-        for i in range(n):
-            start = i * shard_size
-            end = min((i + 1) * shard_size, expected_size) - 1
-            ranges.append((start, end))
-        shard_paths = [Path(str(part) + f".shard{i}") for i in range(n)]
+        ranges = self._block_ranges(expected_size)
+        n = len(ranges)
+        done_blocks: set[int] = set(resume_bitmap) if resume_bitmap else set()
 
-        done = [0]
+        # Fresh: preallocate the whole file up front. Resume: the part
+        # was already validated at full size by _load_bitmap.
+        if resume_bitmap is None:
+            fd = os.open(part, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+            try:
+                os.ftruncate(fd, expected_size)
+            except OSError:
+                os.close(fd)
+                raise
+            _save_bitmap_atomic(part, expected_size, expected_sha256,
+                                self.concurrent_workers, set())
+        else:
+            fd = os.open(part, os.O_RDWR)
+
+        hasher = _OrderedBlockHasher(fd, ranges, self.chunk_size)
+        # Re-commit already-downloaded blocks to the hash state, in
+        # order (reads them back from disk; no memory buffering).
+        for index in sorted(done_blocks):
+            hasher.block_completed(index)
+
+        done = [sum(ranges[i][1] - ranges[i][0] + 1 for i in done_blocks)]
         progress_lock = threading.Lock()
         progress_error: list = []
         abort = threading.Event()
+        bitmap_lock = threading.Lock()
 
         def _report(nbytes: int) -> None:
-            # Held across the callback so concurrent shards report a
+            # Held across the callback so concurrent blocks report a
             # monotonic cumulative total.
             with progress_lock:
                 done[0] += nbytes
@@ -756,49 +1081,48 @@ class DriveDownloader:
                             progress_error.append(exc)
                         abort.set()
 
+        def _mark_done(index: int) -> None:
+            with bitmap_lock:
+                done_blocks.add(index)
+                _save_bitmap_atomic(part, expected_size, expected_sha256,
+                                    self.concurrent_workers, done_blocks)
+
         errors: list = []
+        fallback = False
         try:
             with ThreadPoolExecutor(max_workers=n) as pool:
                 futs = [pool.submit(
-                    self._download_shard, url, file_id, s, e, expected_size,
-                    shard_paths[i], _report, abort)
-                    for i, (s, e) in enumerate(ranges)]
+                    self._download_block, url, file_id, i, s, e,
+                    expected_size, fd, _report, abort, abort_event)
+                    for i, (s, e) in enumerate(ranges)
+                    if i not in done_blocks]
                 for fut in futs:
                     try:
-                        fut.result()
+                        index = fut.result()
+                        hasher.block_completed(index)
+                        _mark_done(index)
                     except Exception as exc:  # collected; classified below
                         errors.append(exc)
             if progress_error:
                 raise progress_error[0]
             for exc in errors:
-                if isinstance(exc, (DriveAuthError, DriveChangedError)):
+                if isinstance(exc, (DriveAuthError, DriveChangedError,
+                                    DriveDownloadAbortedError)):
                     raise exc
             if errors:
-                return False  # no Range support, or a shard gave up
-            # TASK-007.1: merge without a second full copy. The old code
-            # opened a fresh .part and copied every shard into it while
-            # all shards still existed — for the 25.3 GB main weight
-            # that held ~70 GB at once, past the 45.1 GB restore
-            # capacity gate (ENOSPC risk). Instead, move shard 0 into
-            # place with zero-copy os.replace, then append each later
-            # shard and unlink it immediately: the extra disk peak is
-            # one shard, not the whole file. A mid-merge failure leaves
-            # a valid prefix in .part (resume-safe) and the finally
-            # below still cleans any shard that was not yet released.
-            os.replace(shard_paths[0], part)
-            with part.open("ab") as out:
-                for shard_path in shard_paths[1:]:
-                    with shard_path.open("rb") as f:
-                        while True:
-                            chunk = f.read(self.chunk_size)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                    shard_path.unlink(missing_ok=True)
-            return True
+                fallback = True
+            else:
+                digest = hasher.hexdigest()
+                # Durability before declaring success: the bitmap's
+                # claim that every block is on disk must be true.
+                os.fsync(fd)
+                return {"streaming_sha256": digest}
         finally:
-            for shard_path in shard_paths:
-                shard_path.unlink(missing_ok=True)
+            os.close(fd)
+        if fallback:
+            part.unlink(missing_ok=True)
+            _discard_bitmap(part)
+            return False
 
     def probe_transport(self, file_id: str, probe_bytes: int = 1024 * 1024) -> dict:
         """Cheap auth + transport probe: metadata GET, then a single
@@ -820,7 +1144,7 @@ class DriveDownloader:
             url, headers={"Authorization": "Bearer " + token,
                           "Range": f"bytes=0-{want - 1}"}, method="GET")
         try:
-            with urlopen(req, timeout=self.timeout_sec) as resp:
+            with _urlopen(req, self.timeout_sec) as resp:
                 status = getattr(resp, "status", 200)
                 if status != 206:
                     raise DriveDownloadError(
