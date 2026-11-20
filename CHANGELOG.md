@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## Unreleased — v0.3.0 development (TASK-VERSION-ROADMAP-011)
+
+### M1 — GPU 503 elastic backoff & error classification (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.3.0 M1 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `h3_budget.py` gains
+`classify_allocation_error()` (`AUTH_FATAL`, `QUOTA_EXCEEDED`,
+`CAPACITY_TRANSIENT`, `TRANSPORT_TRANSIENT`, `UNKNOWN_FATAL`) and
+`compute_backoff_delay()` (`15s / 45s / 90s ±20%` jitter, later rounds
+reuse 90s). `h3_controller.py` wraps the existing inner attempt plan
+(`G4`, `G4`, `A100_HIGH_MEM`) in outer `--allocation-rounds` rounds
+(1..5; default `3` for `deliver` / `--auto-recover`, `1` for a raw
+run): capacity failures exhaust the inner plan, then back off before
+the next round unless the task deadline leaves less than
+`MIN_ATTEMPT_WALL_SEC + DEADLINE_MARGIN_SEC` after the delay; fatal,
+quota and unknown errors fail fast with no retry; transport errors
+retry the same G4 once and never fall back to A100. Each backoff
+records `GPU_ALLOCATION_BACKOFF` in the controller audit log and the
+run-manifest audit log. A failed attempt's lease and allocating
+watchdog record are marked stopped immediately (no phantom
+`not_yet_due` leases). `scripts/run_h3_task.sh` passes
+`--allocation-rounds` through.
+
+Tests: `tests/test_v030_m1_backoff.py` (21: classification matrix,
+backoff schedule/jitter/clamps, rounds resolution/defaults, and
+fault-injection execution — round-1 503 exhaustion → 15.0s sleep →
+round-2 success, auth/quota fail-fast, deadline abort, stale ledger
+deadline ignored, failed leases stopped immediately). Full offline
+suite: 968 tests, 0 failures. Live GPU verification: NOT_VERIFIED.
+
 ## Unreleased — v0.2.1 development (TASK-VERSION-ROADMAP-011)
 
 ### P1 — Drive upload MD5 hex alignment (2026-11-20)

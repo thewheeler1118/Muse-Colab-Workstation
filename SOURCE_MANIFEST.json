@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 24796,
-      "sha256": "db3021e63ee028c4b8819d72535b9dc24c068d14e1f8d6b923eeb54eb1dc46dd",
+      "size_bytes": 26538,
+      "sha256": "2110906f1ecc3821f22e25e32e5570daa299579f9d5bfbeb0109315579980355",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 59161,
-      "sha256": "2c5dc4a4fdfb2d8ebb03ab35aa75ccb800bc1ed5797f8d1656b159c0fbb19174",
+      "size_bytes": 59616,
+      "sha256": "a5d1e970da34182e097037ddbe0d0039cd0eb25c3d0809890d4dc2416ffb96ac",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 19448,
-      "sha256": "4c69c175d0d4a46ca1a73f58078442b5d18934e9d88b0328e196b0b642fb5a89",
+      "size_bytes": 20522,
+      "sha256": "eb6f6affd11967c0b74a424ed145c730c2243e51f5dfd26a3c5472b0338b9e83",
       "role": "Documentation / evidence"
     },
     {
@@ -635,8 +635,8 @@
     },
     {
       "path": "h3_budget.py",
-      "size_bytes": 23246,
-      "sha256": "408afb4149b2339c36fd401ed2c313a43ea8a47886155c959390f2efa06d1915",
+      "size_bytes": 26684,
+      "sha256": "bd27ea8a9c78aa3c0dcc9c8ee41f506314d411033efbe9858fd5ae6083c95f9f",
       "role": "Per-task CU ledger (30 CU) + GPU choice policy (G4/G4/A100_HIGH_MEM)"
     },
     {
@@ -653,8 +653,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 204761,
-      "sha256": "9d55c27c1b03f3026799baaaf7d2be39a955fca20afdc128386ebc9dedbe641c",
+      "size_bytes": 211797,
+      "sha256": "7d0fd29c512272a3324f91bf1d7b3b7355144709bbe9870a8f5104ab1cc125bb",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -971,8 +971,8 @@
     },
     {
       "path": "scripts/run_h3_task.sh",
-      "size_bytes": 7325,
-      "sha256": "586e28b39af472526efa5605a075e72c9c17e2c61ef99684c402926cf2e315ee",
+      "size_bytes": 7676,
+      "sha256": "dbc742204121c30fb1ba183ea27bec031bb15fa5fc089a971dd4addfa5503efe",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1291,6 +1291,12 @@
       "path": "tests/test_task_spec.py",
       "size_bytes": 30751,
       "sha256": "d1472a2cbd60c75b4013c4113c7efae2824a18464a5918a62f0edbc080a5619c",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m1_backoff.py",
+      "size_bytes": 13106,
+      "sha256": "dadd68e3c8a2b72146bf392c0fefea07bfbbe7b36e2fc4cf3ccaa00e0b9dda7c",
       "role": "Tests"
     },
     {

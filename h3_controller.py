@@ -34,11 +34,14 @@ from h3_budget import (
     MAX_SESSION_SECONDS,
     DEFAULT_PRODUCTION_TASK_ID,
     GPU_CHOICES,
+    GPU_ATTEMPT_PLAN,
     initial_session_wall_seconds,
     ledger_path_for_task,
     effective_hard_stop_cu,
     allocation_command,
     choose_gpu_candidate,
+    classify_allocation_error,
+    compute_backoff_delay,
     estimate_unbilled_cu,
     effective_balance_cu,
     is_capacity_failure,
@@ -2787,6 +2790,36 @@ def run_variant(args) -> dict:
 
 DEFAULT_MAX_TASK_ATTEMPTS = 2
 MAX_TASK_ATTEMPTS_LIMIT = 3
+# v0.3.0 M1: elastic backoff rounds for GPU allocation. A deliver /
+# --auto-recover run retries capacity failures across rounds (default 3);
+# a raw single run does not (default 1). --allocation-rounds overrides
+# either (1..5).
+DEFAULT_ALLOCATION_ROUNDS_DELIVER = 3
+DEFAULT_ALLOCATION_ROUNDS_RUN = 1
+MAX_ALLOCATION_ROUNDS = 5
+# Backoff sleep indirection: tests patch hc.sleep_fn instead of sleeping.
+sleep_fn = time.sleep
+
+
+def resolve_allocation_rounds(args) -> int:
+    """Resolve --allocation-rounds for one run (v0.3.0 M1).
+
+    An explicit value must be an integer 1..MAX_ALLOCATION_ROUNDS.
+    Otherwise deliver / --auto-recover default to
+    DEFAULT_ALLOCATION_ROUNDS_DELIVER and a raw run to
+    DEFAULT_ALLOCATION_ROUNDS_RUN."""
+    raw = getattr(args, "allocation_rounds", None)
+    if raw is None:
+        if getattr(args, "action", None) == "deliver" or getattr(args, "auto_recover", False):
+            return DEFAULT_ALLOCATION_ROUNDS_DELIVER
+        return DEFAULT_ALLOCATION_ROUNDS_RUN
+    try:
+        rounds = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"--allocation-rounds must be an integer 1..{MAX_ALLOCATION_ROUNDS}, got {raw!r}") from None
+    if not 1 <= rounds <= MAX_ALLOCATION_ROUNDS:
+        raise ValueError(f"--allocation-rounds must be 1..{MAX_ALLOCATION_ROUNDS}, got {rounds}")
+    return rounds
 # Minimum viable wall time for a fresh attempt (40 min): model restore
 # plus ~22 min inference plus download/stop margin. The actual wall is
 # whatever allowed_runtime_seconds() grants from the live rate and the
@@ -3370,8 +3403,12 @@ def _run_variant_inner(args) -> dict:
     start = time.monotonic()
     session_spent_start = float(ledger.get("max_observed_spent_cu", 0.0))
     try:
-        # Allocation loop: G4, G4 retry, A100_HIGH_MEM (only on capacity failure).
-        # Transport errors retry the same G4 once and never trigger A100 fallback.
+        # Allocation loop (v0.3.0 M1): outer elastic backoff rounds
+        # wrapping the inner GPU_ATTEMPT_PLAN = (G4, G4 retry,
+        # A100_HIGH_MEM). Capacity failures exhaust the inner plan, then
+        # back off (15s / 45s / 90s ±20%) before the next round; fatal,
+        # quota and unknown errors fail fast with no retry. Transport
+        # errors retry the same G4 once and never trigger A100 fallback.
         # Empty POSTs carry data=b'{}' via the vendored CLI patch (see
         # cli_post_body_patch_present / V3_CLI_PROXY_PATCH.md); without it
         # the egress proxy strips Content-Length: 0 and Google returns 411.
@@ -3383,59 +3420,145 @@ def _run_variant_inner(args) -> dict:
         # a record reconcile can resolve, not an invisible billing GPU.
         # The post-probe update replaces this deadline with the
         # budget-derived value at the actual live rate.
+        allocation_rounds = resolve_allocation_rounds(args)
+        # Sleep injection for offline tests: args may carry sleep_fn /
+        # jitter_fn (the fault-injection harness passes them); production
+        # uses the module-level sleep_fn (time.sleep) and random jitter.
+        _sleep = getattr(args, "sleep_fn", None) or sleep_fn
+        _jitter = getattr(args, "jitter_fn", None)
+        alloc_started_utc = datetime.datetime.now(datetime.timezone.utc)
         pre_max_rate = max(c["max_rate_cu_h"] for c in GPU_CHOICES.values())
-        pre_deadline = (datetime.datetime.now(datetime.timezone.utc)
+        pre_deadline = (alloc_started_utc
                         + datetime.timedelta(
                             seconds=initial_session_wall_seconds(pre_max_rate)))
-        for attempt in range(3):
-            choice = choose_gpu_candidate(attempt)
-            chosen_key = choice["key"]
-            session = allocate_managed_session(choice, args.run_id)
-            allocation_attempted = True
-            record({"event": "allocation_attempt", "session": session, "gpu": chosen_key, "variant": variant, "run_id": args.run_id})
-            # TASK-006 P1-B: pre-register the session as `allocating`
-            # and the lease as non-final BEFORE the CLI `new` call.
-            # A lease-registration failure here raises before any GPU
-            # exists; the outer finally stops nothing (the session was
-            # never created) and the run fails closed.
-            from h3_session_watchdog import record_session
-
-            record_session(session, chosen_key, args.run_id, pre_deadline.isoformat(),
-                           production_task_id=args.production_task_id, status="allocating")
-            _register_gpu_lease(session, chosen_key, args.run_id,
-                                args.production_task_id, pre_deadline.isoformat(),
-                                args.per_session_budget_cu,
-                                max_wall_sec=args.max_wall_sec)
+        explicit_deadline = parse_task_deadline(getattr(args, "task_deadline_utc", "") or "")
+        ledger_deadline = ledger.get("deadline_utc") if isinstance(ledger, dict) else None
+        effective_deadline = explicit_deadline
+        if effective_deadline is None and ledger_deadline:
             try:
-                cmd = allocation_command(session, chosen_key, allow_g4=args.allow_g4, allow_a100_highmem=args.allow_a100_highmem)
-                # 420s: with the POST-body patch a G4 503 is retried inside
-                # the CLI (up to 3 retries, 30s each + 10/20/40s backoff).
-                run_cli(cmd, timeout=420)
-            except Exception as e:
-                attempts.append({"session": session, "gpu": chosen_key, "status": "allocation_failed", "error": str(e)[:500]})
-                # Reconcile late allocation before deciding on fallback.
-                time.sleep(5)
+                ledger_dt = datetime.datetime.strptime(
+                    str(ledger_deadline), "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=datetime.timezone.utc)
+                if ledger_dt <= alloc_started_utc:
+                    record({
+                        "event": "stale_ledger_deadline_ignored",
+                        "run_id": args.run_id,
+                        "stale_deadline_utc": ledger_deadline,
+                    })
+                else:
+                    effective_deadline = ledger_deadline
+            except ValueError:
+                effective_deadline = None
+        for round_idx in range(allocation_rounds):
+            round_last_capacity_err = None
+            for attempt in range(len(GPU_ATTEMPT_PLAN)):
+                choice = choose_gpu_candidate(attempt)
+                chosen_key = choice["key"]
+                session = allocate_managed_session(choice, args.run_id)
+                allocation_attempted = True
+                record({"event": "allocation_attempt", "session": session, "gpu": chosen_key, "variant": variant, "run_id": args.run_id,
+                        "round": round_idx + 1, "total_rounds": allocation_rounds})
+                # TASK-006 P1-B: pre-register the session as `allocating`
+                # and the lease as non-final BEFORE the CLI `new` call.
+                # A lease-registration failure here raises before any GPU
+                # exists; the outer finally stops nothing (the session was
+                # never created) and the run fails closed.
+                from h3_session_watchdog import record_session
+
+                record_session(session, chosen_key, args.run_id, pre_deadline.isoformat(),
+                               production_task_id=args.production_task_id, status="allocating")
+                _register_gpu_lease(session, chosen_key, args.run_id,
+                                    args.production_task_id, pre_deadline.isoformat(),
+                                    args.per_session_budget_cu,
+                                    max_wall_sec=args.max_wall_sec)
                 try:
-                    live_sessions = inspect()["sessions"]
-                    if any(s["name"] == session for s in live_sessions):
-                        raise RuntimeError(f"Late allocation appeared for {session} after a failed `new`; stop it and abort")
-                except RuntimeError:
-                    raise
+                    cmd = allocation_command(session, chosen_key, allow_g4=args.allow_g4, allow_a100_highmem=args.allow_a100_highmem)
+                    # 420s: with the POST-body patch a G4 503 is retried inside
+                    # the CLI (up to 3 retries, 30s each + 10/20/40s backoff).
+                    run_cli(cmd, timeout=420)
+                except Exception as e:
+                    attempts.append({"session": session, "gpu": chosen_key, "round": round_idx + 1,
+                                     "status": "allocation_failed", "error": str(e)[:500]})
+                    # Reconcile late allocation before deciding on fallback.
+                    _sleep(5)
+                    try:
+                        live_sessions = inspect()["sessions"]
+                        if any(s["name"] == session for s in live_sessions):
+                            raise RuntimeError(f"Late allocation appeared for {session} after a failed `new`; stop it and abort")
+                        # Confirmed no live session was created for this
+                        # failed attempt: mark its pre-registered lease
+                        # and allocating watchdog record stopped so it
+                        # never lingers as phantom `not_yet_due` in the
+                        # LeaseRegistry.
+                        _confirm_gpu_lease_stopped(session)
+                        try:
+                            from h3_session_watchdog import mark_session_stopped
+
+                            mark_session_stopped(session)
+                        except Exception:
+                            pass
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass
+                    err_class = classify_allocation_error(str(e))
+                    if err_class in ("AUTH_FATAL", "QUOTA_EXCEEDED", "UNKNOWN_FATAL"):
+                        raise RuntimeError(
+                            f"GPU allocation failed ({chosen_key}, {err_class}): {str(e)[:500]}; no fallback unless capacity failure"
+                        )
+                    if err_class == "CAPACITY_TRANSIENT":
+                        round_last_capacity_err = (err_class, str(e))
+                        if attempt < len(GPU_ATTEMPT_PLAN) - 1:
+                            continue
+                        break  # inner round exhausted on CAPACITY_TRANSIENT
+                    # TRANSPORT_TRANSIENT: retry the SAME GPU once
+                    # (attempt 0 -> 1, both G4). Never fall back to A100.
+                    if err_class == "TRANSPORT_TRANSIENT" and chosen_key == "G4" and attempt == 0:
+                        record({"event": "allocation_transport_retry", "session": session, "gpu": chosen_key, "error": str(e)[:300]})
+                        continue
+                    raise RuntimeError(f"GPU allocation failed ({chosen_key}): {str(e)[:500]}; no fallback unless capacity failure")
+                created = True
+                record({"event": "allocated", "session": session, "gpu": chosen_key,
+                        "round": round_idx + 1})
+                _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
+                                 session_id=session, session_state="ACTIVE")
+                break
+            if created:
+                break
+            if round_last_capacity_err is not None and round_idx + 1 < allocation_rounds:
+                err_class, err_msg = round_last_capacity_err
+                delay = compute_backoff_delay(round_idx, jitter_fn=_jitter)
+                if effective_deadline:
+                    deadline_dt = datetime.datetime.strptime(
+                        effective_deadline, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=datetime.timezone.utc)
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                    if (deadline_dt - now_dt).total_seconds() - delay < MIN_ATTEMPT_WALL_SEC + DEADLINE_MARGIN_SEC:
+                        raise RuntimeError(
+                            f"GPU allocation backoff aborted before round {round_idx + 2}: "
+                            f"task deadline {effective_deadline} too close"
+                        )
+                backoff_payload = {
+                    "round": round_idx + 1,
+                    "total_rounds": allocation_rounds,
+                    "sleep_sec": round(delay, 2),
+                    "error_class": err_class,
+                    "last_gpu": chosen_key,
+                }
+                record({"event": "GPU_ALLOCATION_BACKOFF", "run_id": args.run_id, **backoff_payload})
+                try:
+                    from h3_run_manifest import record_audit_event
+
+                    record_audit_event(ROOT, args.run_id, "GPU_ALLOCATION_BACKOFF", backoff_payload)
                 except Exception:
                     pass
-                if is_capacity_failure(str(e)) and attempt < 2:
-                    continue
-                # Transport errors retry the SAME GPU once (attempt 0 -> 1,
-                # both G4). They never justify falling back to A100.
-                if is_transient_transport_error(str(e)) and chosen_key == "G4" and attempt == 0:
-                    record({"event": "allocation_transport_retry", "session": session, "gpu": chosen_key, "error": str(e)[:300]})
-                    continue
-                raise RuntimeError(f"GPU allocation failed ({chosen_key}): {str(e)[:500]}; no fallback unless capacity failure")
-            created = True
-            record({"event": "allocated", "session": session, "gpu": chosen_key})
-            _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
-                             session_id=session, session_state="ACTIVE")
-            break
+                _sleep(delay)
+                continue
+            if round_last_capacity_err is not None:
+                raise RuntimeError(
+                    f"GPU allocation failed ({chosen_key}): {round_last_capacity_err[1][:500]}; "
+                    f"exhausted {allocation_rounds} round(s)"
+                )
         if not created or session is None:
             raise RuntimeError("GPU allocation did not complete")
         # TASK-006 P1-B: confirm the pre-registered record. The CLI
@@ -3848,6 +3971,10 @@ def main():
     parser.add_argument("--max-task-attempts", type=int, default=DEFAULT_MAX_TASK_ATTEMPTS,
                         help="TASK-008: deliver / run --auto-recover: maximum GPU "
                              "attempts for the whole task (1..3, default 2).")
+    parser.add_argument("--allocation-rounds", type=int, default=None,
+                        help="v0.3.0 M1: elastic backoff rounds on transient GPU capacity "
+                             "failure (1..5). Default 3 for deliver / --auto-recover, "
+                             "1 for a raw run.")
     parser.add_argument("--max-rate-cu-h", type=float, default=14.0)
     parser.add_argument("--max-wall-sec", type=int, default=MAX_SESSION_SECONDS)
     parser.add_argument("--poll-interval-sec", type=int, default=60,
@@ -3864,6 +3991,10 @@ def main():
         parser.add_argument("--" + flag, action="store_true")
     a = parser.parse_args()
     _COLAB_AUTH = a.colab_auth
+    try:
+        a.allocation_rounds = resolve_allocation_rounds(a)
+    except ValueError as e:
+        parser.error(str(e))
     if a.action == "run" and not a.production_task_id:
         parser.error("--production-task-id is required for run; the historical default is never reused silently")
     # TASK-007: preflight/plan with --task-spec and no --production-task-id

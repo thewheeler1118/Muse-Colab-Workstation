@@ -44,7 +44,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 CONFIRM_LIVE=0; VARIANT=""; TASK_SPEC=""; RUN_ID=""; TASK_ID=""; AUTHORIZE_NEW_TASK=0
-DELIVER=0; AUTO_RECOVER=0; MAX_ATTEMPTS=""; TASK_DEADLINE=""
+DELIVER=0; AUTO_RECOVER=0; MAX_ATTEMPTS=""; TASK_DEADLINE=""; ALLOCATION_ROUNDS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --confirm-live) CONFIRM_LIVE=1; shift ;;
@@ -56,6 +56,7 @@ while [ $# -gt 0 ]; do
     --deliver) DELIVER=1; shift ;;
     --auto-recover) AUTO_RECOVER=1; shift ;;
     --max-task-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
+    --allocation-rounds) ALLOCATION_ROUNDS="$2"; shift 2 ;;
     --task-deadline-utc) TASK_DEADLINE="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -74,6 +75,12 @@ if [ -n "$MAX_ATTEMPTS" ]; then
   case "$MAX_ATTEMPTS" in
     1|2|3) ;;
     *) echo "REFUSED: --max-task-attempts must be 1, 2 or 3" >&2; exit 2 ;;
+  esac
+fi
+if [ -n "$ALLOCATION_ROUNDS" ]; then
+  case "$ALLOCATION_ROUNDS" in
+    1|2|3|4|5) ;;
+    *) echo "REFUSED: --allocation-rounds must be 1, 2, 3, 4 or 5" >&2; exit 2 ;;
   esac
 fi
 # --run-id is required for a single run; the deliver loop derives a
@@ -123,6 +130,7 @@ if [ -n "$TASK_SPEC" ]; then EXTRA+=(--task-spec "$TASK_SPEC"); else EXTRA+=(--v
 if [ -n "$RUN_ID" ]; then EXTRA+=(--run-id "$RUN_ID"); fi
 if [ -n "$TASK_DEADLINE" ]; then EXTRA+=(--task-deadline-utc "$TASK_DEADLINE"); fi
 if [ -n "$MAX_ATTEMPTS" ]; then EXTRA+=(--max-task-attempts "$MAX_ATTEMPTS"); fi
+if [ -n "$ALLOCATION_ROUNDS" ]; then EXTRA+=(--allocation-rounds "$ALLOCATION_ROUNDS"); fi
 if [ "$DELIVER" -eq 1 ]; then
   exec "$PY" h3_controller.py deliver --execute --confirm-gpu --authorize-task-gpu --allow-g4 --allow-a100-highmem --fresh-inference --production-task-id "$TASK_ID" "${EXTRA[@]}"
 fi
