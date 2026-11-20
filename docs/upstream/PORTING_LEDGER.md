@@ -51,11 +51,11 @@ worktree.
 | `scripts/_colab_env.sh` | `bf5cc966170c76952f33611b2d38b2050d56b202` | TBD (F-stage) | No | SPEC PENDING — shell env helper; adapt to Muse VM paths only if needed, never with local absolute paths | TBD | PENDING |
 | `scripts/install_macos_guardian.sh` | `73fefd8ea88680b57b7f6bfa4a67aaeb1a4de931` | — (none) | No | REJECTED — macOS guardian; North Star forbids Mac as a runtime dependency | — | Reviewed |
 | `scripts/run_shutdown_guardian.py` | `17e1448ec1745da5a8274c7e3e42c529891222f4` | — (none) | No | REJECTED as-is — shutdown enforcement is `h3_shutdown_executor.py` + lease registry; a separate guardian/cron needs its own user approval | — | Reviewed |
-| `scripts/setup_isolated_account.py` | `e29699f03b16c696bb0402470ada0b47f0155fb6` | TBD (F-stage) | No | SPEC PENDING — isolated-account setup touches credentials by design; any Muse version needs its own security review before any work | TBD | PENDING — high-risk area |
-| `tests/test_comfyui_wheelhouse.py` | `89ff7f3d92118a74f86a932508975a646c640f27` | TBD (F2) | No | SPEC PENDING — test intent may be reimplemented in Muse-original tests; test files are not copied verbatim without a license | TBD | PENDING |
-| `tests/test_controller_wheelhouse_telemetry.py` | `994e4ba816a3bd909953f596c38f9d00fe97cfc1` | TBD (F2/F5) | No | SPEC PENDING | TBD | PENDING |
+| `scripts/setup_isolated_account.py` | `e29699f03b16c696bb0402470ada0b47f0155fb6` | — (none) | No | NOT-APPLICABLE (decided F2, 2026-11-20): Muse has no such script; its discover/verify role is covered by `verify_wheelhouse_on_drive` in `h3_comfyui_cache.py` + controller wiring (PR #6). No new isolated-account script is created — it would be a new subsystem, not a port, and it touches credentials by design. | — | Reviewed |
+| `tests/test_comfyui_wheelhouse.py` | `89ff7f3d92118a74f86a932508975a646c640f27` | `tests/test_comfyui_wheelhouse.py` (Muse-original) | No | IMPLEMENTED (F2, PR #6, commit `fd61ece`): test intent reimplemented from the behaviour spec; no upstream test code copied | `tests/test_comfyui_wheelhouse.py` (19 tests, in 763-test suite) | PASS — offline only, fake wheels, no credentials |
+| `tests/test_controller_wheelhouse_telemetry.py` | `994e4ba816a3bd909953f596c38f9d00fe97cfc1` | TBD (F5) | No | SPEC PENDING — telemetry wiring is F5's area (cold-start metrics); F2's controller wiring is covered by `tests/test_comfyui_wheelhouse.py` | TBD | PENDING |
 | `tests/test_drive_depot_remote_seed.py` | `8063669e320785ae63c522fbfdef2ca5f3dcbca4` | TBD (F5) | No | SPEC PENDING — Remote Seed stays optional; no live GPU test without separate approval | TBD | PENDING |
-| `tests/test_drive_download_v2.py` | `8ea33c16390b0237f1a3231a111cb362c8e3cf23` | TBD (F1) | No | SPEC PENDING | TBD | PENDING |
+| `tests/test_drive_download_v2.py` | `8ea33c16390b0237f1a3231a111cb362c8e3cf23` | `tests/test_drive_download_v2.py` (Muse-original) | No | IMPLEMENTED (F1, PR #4, commit `2f3c425`): test intent reimplemented from the behaviour spec; no upstream test code copied. The TASK-007.1 shard-merge test in `tests/test_drive_download.py` was retired (its implementation no longer exists) — an intended behaviour change, recorded in the test file. | `tests/test_drive_download_v2.py` (17 tests, in 760-test suite) | PASS — offline only, fake transport, no credentials |
 | `tests/test_reliability_coldstart.py` | `3cb19ac48697ccb840687a02d8419930d06a568b` | TBD (F5) | No | SPEC PENDING | TBD | PENDING |
 | `tests/test_remote_worker_v020.py` | `38ea495e40be5f52569d337512df420e5f5bfd84` | TBD (F1/F3/F4) | No | SPEC PENDING | TBD | PENDING |
 
@@ -95,6 +95,17 @@ Each shared module gets its own ledger row when its feature PR opens.
 | `h3_reliability.py` | `be0734b2857472043d2200647adecfdb69f6fd1b` | `fa24f1c3f16bc1f064eba85fe5e31a10160c9e0b` | No | F5/P3 area |
 | `h3_budget.py` | `d4208b3a08130aee090e047185f6ec31c4440f9f` | `9d5b9dceb8ac82fa52bbf536761601d822624f7f` | No | Upstream budget module differs — Muse keeps 30 / 25 / 0.75 / 14400; any change needs its own PR + config mirrors, never a silent port |
 | `tests/test_drive_depot.py` | `a0f365dcbe388df332e5cf49fd9f11034f2fa5a2` | `a0f365dcbe388df332e5cf49fd9f11034f2fa5a2` | Yes | Unchanged upstream |
+
+## Implemented features (Stage 3, v0.2.0)
+
+Each row is a Muse-original reimplementation from the upstream
+behaviour spec (CHANGELOG text only). No upstream source was copied
+in any of them.
+
+| Feature | Muse PR / commit | Muse modules changed | Tests | CI | Live verification |
+|---|---|---|---|---|---|
+| F1 zero-copy high-concurrency Drive download (pwrite + bitmap resume) | PR #4 / `2f3c425` (Issue #3) | `h3_drive_download.py` (preallocated single `.part`, `os.pwrite`, 12 workers, global connection cap 16, ordered streaming SHA-256, `.part.bitmap.json` resume, abort, single-flight refresh); `tests/test_drive_download.py` (constants + retired shard-merge test) | `tests/test_drive_download_v2.py` (17 new tests) | Run 44662119661, 6/6 pass (2026-11-20) | NOT_VERIFIED |
+| F2 offline ComfyUI wheelhouse cache | PR #6 / `fd61ece` (Issue #5) | `h3_comfyui_cache.py` (lazy Drive imports, pure-stdlib helpers, deterministic `comfyui-wheelhouse-<commit>-<pytag>.tar.gz` build/publish/verify, `verify_wheelhouse_on_drive`); `h3_controller.py` (optional `drive_download["wheelhouses"]`) | `tests/test_comfyui_wheelhouse.py` (19 new tests) | CI run pending at PR creation (local suite 763 tests, 0 failures) | NOT_VERIFIED |
 
 ## Security review status key
 

@@ -78,8 +78,8 @@ brief — a counting-method difference, not a finding).
 
 | Feature | Upstream version | Key files + diffstat vs Muse v0.1.0 | Muse status |
 |---|---|---|---|
-| F1 high-concurrency zero-merge download | v0.2.0 | `h3_drive_download.py` (+902/−350, frozen after v0.2.0); `tests/test_drive_download_v2.py`, `tests/test_drive_download.py` | SPEC READY — reimplement from behavior, own PR |
-| F2 ComfyUI offline wheelhouse | v0.2.0 | `h3_comfyui_cache.py` (+833/−45); `scripts/setup_isolated_account.py`; controller wiring; `tests/test_comfyui_wheelhouse.py`, `tests/test_controller_wheelhouse_telemetry.py` | SPEC READY — reimplement from behavior, own PR |
+| F1 high-concurrency zero-merge download | v0.2.0 | `h3_drive_download.py` (+902/−350, frozen after v0.2.0); `tests/test_drive_download_v2.py`, `tests/test_drive_download.py` | IMPLEMENTED — PR #4 (`2f3c425`), CI run 44662119661 6/6 pass, 760 tests 0 failures; live NOT_VERIFIED |
+| F2 ComfyUI offline wheelhouse | v0.2.0 | `h3_comfyui_cache.py` (+833/−45); `scripts/setup_isolated_account.py`; controller wiring; `tests/test_comfyui_wheelhouse.py`, `tests/test_controller_wheelhouse_telemetry.py` | IMPLEMENTED — PR #6 (`fd61ece`), 763 tests 0 failures locally; `setup_isolated_account.py` NOT-APPLICABLE (no Muse equivalent); live NOT_VERIFIED |
 | F3 parallel install + model restore | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F4); `tests/test_remote_worker_v020.py` (CHANGELOG says `test_remote_worker_v2.py`, shipped file is `…_v020.py`) | SPEC READY — reimplement from behavior, own PR |
 | F4 standalone NVMe model storage + VRAM optimization | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F3); `tests/test_remote_worker_v020.py` | SPEC READY — reimplement from behavior, own PR |
 | F5 Remote Seed + cold-start telemetry | v0.2.0 | `drive_depot.py` (+572/−6); `h3_run_manifest.py`; `scripts/reliability_report.py`; `tests/test_drive_depot_remote_seed.py`, `tests/test_reliability_coldstart.py`; triple-flag gated | SPEC READY — Remote Seed stays optional, no live GPU without separate approval |
