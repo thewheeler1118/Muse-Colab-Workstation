@@ -21,7 +21,7 @@ Both are covered by `scripts/verify_manifest.py`.
 | `.github/workflows/ci.yml` | 3889 | 062c68c75e11e4e4c34b3daaac6d8e9e17d8c5a1d9bbb35581a9006bb820a518 | YAML | CI / templates | n/a | n/a | Low |
 | `.gitignore` | 904 | 015494328818556fdbd25c4286ef1a91a7a951fe086b91d8de6596ea87b100c7 | File | Supporting file | n/a | n/a | Low |
 | `AGENTS.md` | 4928 | 7660298b332ab5a03676370a074001d6a5786a71ada375d84a015805fc1e6f82 | Markdown | Supporting file | n/a | n/a | Low |
-| `CHANGELOG.md` | 8246 | 2c302c7d915aa3b86ce4de73ac0ddae0a688e5c696d8da052fdbb068882a0de6 | Markdown | Supporting file | n/a | n/a | Low |
+| `CHANGELOG.md` | 10853 | 79247e5f3775b9a384c3d3c1f995102b242184f028d2ab7549381ff353248639 | Markdown | Supporting file | n/a | n/a | Low |
 | `environment_manifest.json` | 1591 | 79ce5d8e7115608c94b0de846389009a780cbd716089c7301b60e46c00b88ed1 | JSON | Environment contract: pinned CLI 0.7.5 + client hash + both patches, ffmpeg/ffprobe, allowed Python, remote expectations; Drive transport now requests, GATED (TASK-005 §7, Issue #30) | Generated from the proven patched scratch venv 2026-11-13 | Y | Low |
 | `README.md` | 7857 | 18f6862e565c1b226e162aa9ea4926351615bac72846678577da665d7718394c | Markdown | Supporting file | n/a | n/a | Low |
 | `assemble.py` | 2927 | cca6a5feb2c49636373bc977343b21b52b669934df724d0de5d86aedf6ea30fe | Python | Video assembly: 226 generated frames + 48 poster frames = 274 (ffmpeg) | A run h3-20261112T090027Z-8b07c6: assembled 274f, A.mp4 7,453,808 B | N | Low |
