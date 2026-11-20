@@ -945,7 +945,15 @@ def emit_coldstart_metrics(setup_started: float, run_id: str, variant: str,
                                       warm_session_reused=warm_session_reused)
     try:
         print("COLDSTART_METRICS_JSON", json.dumps(metrics, ensure_ascii=False), flush=True)
-        write_job_state(ROOT, run_id, variant, _LAST_STAGE or "restore_weights",
+        # TASK-HOTFIX-016 (Issue #19) P0-A: the job-state stage must be
+        # a canonical job stage, never the raw worker phase. The metrics
+        # write happens mid-setup (after comfyui_start / after
+        # object_info_validation), so an unmapped phase falls back to
+        # RESTORING_MODELS — the honest stage for setup in progress.
+        # The old code wrote _LAST_STAGE verbatim, so a poll landing on
+        # this state raised "Unknown worker job stage" in the controller.
+        write_job_state(ROOT, run_id, variant,
+                        WORKER_PHASE_TO_JOB_STAGE.get(_LAST_STAGE, "RESTORING_MODELS"),
                         extra={"coldstart_metrics": metrics})
     except Exception as e:  # noqa: BLE001 — observability only
         print("COLDSTART_METRICS_UNAVAILABLE", type(e).__name__, flush=True)
@@ -1925,11 +1933,21 @@ def main():
             try:
                 remote_upload=upload_remote_archive(final,info,task,run_id,version,spec)
             except Exception as e:
-                try:write_job_state(ROOT,run_id,version,'REMOTE_UPLOAD_FAILED',extra={'remote_upload_failed':{'error_type':type(e).__name__,'error':str(e)[:300]}})
+                # TASK-HOTFIX-016 (Issue #19) P0-A: the job-state stage
+                # here is INFERENCE_COMPLETED — the stage the mapping
+                # already declares for all three upload phases. The
+                # upload outcome itself travels in `extra` and on the
+                # REMOTE_UPLOAD_FAILED_JSON stdout line. The old literal
+                # 'REMOTE_UPLOAD_FAILED' is not a job stage, so a poll
+                # landing on it raised "Unknown worker job stage".
+                try:write_job_state(ROOT,run_id,version,'INFERENCE_COMPLETED',extra={'remote_upload_failed':{'error_type':type(e).__name__,'error':str(e)[:300]}})
                 except Exception:pass
                 print('REMOTE_UPLOAD_FAILED_JSON:'+json.dumps({'error_type':type(e).__name__,'error':str(e)[:300]},ensure_ascii=False),flush=True)
         if remote_upload is not None:
-            try:write_job_state(ROOT,run_id,version,'REMOTE_UPLOAD_VERIFIED',extra={'remote_upload':remote_upload})
+            # TASK-HOTFIX-016 (Issue #19) P0-A: see the failure branch
+            # above — INFERENCE_COMPLETED on the job-state axis, with
+            # the upload evidence in `extra`.
+            try:write_job_state(ROOT,run_id,version,'INFERENCE_COMPLETED',extra={'remote_upload':remote_upload})
             except Exception:pass
             print('REMOTE_UPLOAD_JSON:'+json.dumps(remote_upload,ensure_ascii=False),flush=True)
         set_stage('done')

@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 34476,
-      "sha256": "e9a1880970e02811e25b2da0c9a0d69639df243d6fa8f696cbaec9f1a7f83cc4",
+      "size_bytes": 42517,
+      "sha256": "7025bfa0afbc38b41bfadc300b8603a7c99da97742bd5f4c56393ec2a0e8f5d3",
       "role": "Supporting file"
     },
     {
@@ -665,8 +665,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 257116,
-      "sha256": "e0e9d0a8da4c1836d562cfaec926fde84d55d4131ced389bdb25ababe89cb6f4",
+      "size_bytes": 279143,
+      "sha256": "8bd33a3bd8d1d7c4b5aa041955a7c58a8f615ec63979cadc4de231485f4c032c",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -737,8 +737,8 @@
     },
     {
       "path": "h3_job_state.py",
-      "size_bytes": 4577,
-      "sha256": "e5c7a1c9a952270b584826e79761a8199d0e36e0702b5dfed932624ecc943920",
+      "size_bytes": 5092,
+      "sha256": "148408079f49742688ecaa320e4a6a5975c65dadd5baff50b25af3da6a098eff",
       "role": "Supporting file"
     },
     {
@@ -773,8 +773,8 @@
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 98556,
-      "sha256": "4137c14160038af9e53af4befab411c50a80c5797506787a2563059cffa3f9a0",
+      "size_bytes": 99783,
+      "sha256": "4500fe65b289efef45f2e70d8c6c5d690e91f631f7acaeea928ffdbe438b49af",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -876,7 +876,7 @@
     {
       "path": "pyproject.toml",
       "size_bytes": 870,
-      "sha256": "93380209ea018344754db2b0403b4492b6e6594692837083d8e200a6990b5e6b",
+      "sha256": "5931d5e076fc99a124d7bf53d6e1a212c5eaf4b24e5bb1c4b38709d4742a4d11",
       "role": "Supporting file"
     },
     {
@@ -1205,8 +1205,8 @@
     },
     {
       "path": "tests/test_recoverable_controller.py",
-      "size_bytes": 32922,
-      "sha256": "f3309b1ac953b28c0a33e34b87a73137016466be61dffb9459dd3a51f17ed963",
+      "size_bytes": 34012,
+      "sha256": "ee2f06d40dd91cf0ffb02ee5a923bba3a93907168ba51b672d356f0f12502ea4",
       "role": "Tests"
     },
     {
@@ -1339,6 +1339,18 @@
       "path": "tests/test_v030_m4_warm_infra.py",
       "size_bytes": 23056,
       "sha256": "9c34c0c65ed85a4ac49e337cf99fcf10bb11d9951dc6dc3b5f6f93d18dc35761",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v031_hotfix_session_recovery.py",
+      "size_bytes": 45699,
+      "sha256": "2da579784d310bc8ac969de9ce16c49b87f7ffe7011db24c3924422ed6249fb8",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v031_hotfix_stage_contract.py",
+      "size_bytes": 12476,
+      "sha256": "ceba9ecd748ae6b655a8f9a951d1a04adff1a1b46886573a391d0d214881b2d2",
       "role": "Tests"
     },
     {

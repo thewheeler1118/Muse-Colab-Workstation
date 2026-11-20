@@ -1,5 +1,149 @@
 # CHANGELOG
 
+## v0.3.1 — Live E2E Recovery Hotfix (TASK-HOTFIX-016, Issue #19)
+
+Hotfix for the two defects `TASK-LIVE-E2E-015` exposed on real Colab
+GPU (`V030_LIVE_E2E_FAILED`, task `shao-nian-v030-e2e-20261120-01`).
+No feature work, no GPU-policy / backoff / timeout / budget changes,
+no production-directory change. The 30 CU/task, 25 CU/session,
+0.75 CU cleanup-reserve, 14400 s cap, TaskLock, ledger, version-gate
+and shutdown-safety rules are unchanged.
+
+Release status: `OFFLINE_VERIFIED` (1081 offline tests, 0 failures,
+incl. 35 new hotfix tests and 18 deterministic fault-injection
+scenarios T01–T18; GitHub Actions 6/6 on the PR HEAD) —
+`LIVE_E2E_NOT_YET_RETESTED` (no paid GPU session was started, no CU
+spent; the fix must be re-proven live with a NEW task id and a NEW
+budget ledger after release — v0.3.0 history runs are never
+force-taken-over by the v0.3.1 controller) —
+`PRODUCTION_NOT_UPGRADED` (the production directory was never touched;
+upgrading production needs separate approval).
+
+### P0-A — F3 worker/controller stage contract
+
+- `h3_job_state.py`: `WORKER_PHASE_TO_JOB_STAGE` gains
+  `"setup_parallel": "RESTORING_MODELS"` — the F3 parallel-setup
+  phase is worker-internal work, never `MODELS_READY`. This mirrors
+  upstream's `dual_track_setup` → `RESTORING_MODELS` (upstream
+  `h3_remote_worker.py:1237`, `_job_stage_for()`); Muse's F3 port had
+  renamed the phase and dropped the normalizer, so the controller
+  raised `RuntimeError: Unknown worker job stage: 'setup_parallel'`
+  and failed run `h3-20261120T071209Z-4ea108`.
+- `h3_remote_worker.py`: `emit_coldstart_metrics` no longer writes
+  the raw worker phase into the job state — it maps through
+  `WORKER_PHASE_TO_JOB_STAGE` (fallback `RESTORING_MODELS`). The
+  upload block no longer writes the non-canonical stages
+  `REMOTE_UPLOAD_FAILED` / `REMOTE_UPLOAD_VERIFIED` directly; both
+  map to `INFERENCE_COMPLETED` (the outcome still travels in `extra`
+  and the `REMOTE_UPLOAD_*_JSON` stdout lines). All twelve
+  `set_stage(...)` call sites now map to a canonical job stage, and
+  truly unknown stages still raise fail-closed at the controller.
+- Tests: `tests/test_v031_hotfix_stage_contract.py` (15 tests,
+  written first — 5 failed + 2 errored pre-fix, reproducing the
+  defect exactly).
+
+### P0-B — GPU session identity persistence and restart recovery
+
+- `h3_controller.py`: the allocation loop now persists the session
+  identity BEFORE `colab new` runs, via the new strict helper
+  `_manifest_update_strict` (raises on failure; re-reads the manifest
+  and verifies the session id landed). A failed pre-allocation write
+  refuses the GPU — no session may exist without a recorded identity.
+  The write is a pre-registration only: task_state stays
+  `TASK_AUTHORIZED`, session_state stays `UNKNOWN` until the server
+  confirms the session. The post-allocation `GPU_ALLOCATED` move
+  (cold path and warm-claim path) is strict as well. Defect B is a
+  gap upstream shares (upstream allocates before its manifest write
+  too) — the fix is Muse-original, not a port.
+- `_resume_sessionless_run` + `_find_interrupted_session_candidates`:
+  a manifest with no session id is recovered from registry evidence
+  (lease registry, managed-session file, Drive mirror only when local
+  sources yield nothing), never by guessing: exact run_id +
+  production_task_id match; foreign-owner records are never claimed
+  (an explicit foreign owner poisons the session in every source);
+  any UNKNOWN candidate refuses; two or more ACTIVE candidates refuse
+  as conflicting; exactly one ACTIVE candidate is adopted (strict
+  write + `SESSION_RECOVERED_FROM_REGISTRY` audit event) and flows
+  into the existing session-state handling; all STOPPED candidates are
+  confirmed in the registries and the existing stopped-session path
+  decides (0-GPU Drive recovery or an audited FAILED close); zero
+  candidates closes FAILED only after the live server confirms no
+  session exists at all. The version and ledger gates still run first
+  (B6: v0.3.0 runs are never force-taken-over).
+- `_attempts_used` now counts distinct run ids with verified
+  allocation evidence from the manifest OR the lease registry — one
+  run counts once across its G4 → G4 → A100 rounds, and an unreadable
+  registry raises instead of silently undercounting.
+- Allocation-failure handler: `mark_session_stopped(session)` now
+  passes the confirmed `"STOPPED"` verdict (the live-list check just
+  above is the verdict) — the old call raised `ValueError` inside the
+  helper and was swallowed, so the allocating record was never marked
+  stopped.
+- `_reconcile_task` reports sessionless manifests with their registry
+  candidates (read-only: no live queries, no stops, no allocations).
+- `deliver_task` gains two new refusal classes in
+  `_RESUME_LIVE_SESSION_MARKERS` (`"conflicting"`,
+  `"different account"`): both block a second GPU.
+- Tests: `tests/test_v031_hotfix_session_recovery.py` (20 tests).
+
+### §5.1 — G4 allocation-failure observability
+
+- The allocation-failure handler now records a durable
+  `allocation_failed` audit event (session, GPU, run, round, error
+  class, error text). Previously only the in-memory `attempts` list
+  carried the error — the E2E G4 failures (~212–214 s each) left no
+  error text anywhere. No GPU policy, backoff, timeout or budget
+  change; the class is only the recorded classification, never proof
+  of a cause (G4 failure is NOT asserted to be capacity).
+
+### §5.2 — fast-path contract review
+
+- Re-audited the whole allocate → bootstrap → launch_worker → poll →
+  models_ready → inference → validate → Drive → stop → completed
+  chain: every `set_stage(...)` call site maps, every direct
+  `write_job_state` uses a canonical stage, and every job stage the
+  mapping can emit is in `JOB_STAGE_TO_MANIFEST_STAGE`. No further
+  stage gap was found; no other code changed. Residual note: the
+  worker's `_LAST_STAGE` starts as `"init"` (unmapped) — a token
+  refresh before the first `set_stage` would still write the raw
+  phase and fail closed at the controller, which is the safe
+  direction; no silent wrong state is possible.
+
+### TASK-HOTFIX-016B — ownership verification (PR #20 review patch)
+
+- `_find_interrupted_session_candidates` no longer degrades a failed
+  `current_owner_id()` lookup to "owner unknown, treat all as ours":
+  a failed lookup, or a `None`/empty identity, refuses the whole
+  recovery with `OWNER_ID_UNVERIFIABLE`. A candidate now needs a
+  trusted lease/mirror record whose `owner_id` matches the current
+  account; a managed record never carries `owner_id` and can only
+  corroborate a session a trusted source already proves. Sessions
+  with no ownership proof are reported as `unattributable` and block
+  the recovery; sessions whose trusted sources disagree about the
+  owner are reported as `conflicting` and block it too; a proven
+  foreign session is never claimed (a valid candidate next to foreign
+  evidence is still adopted, the foreign session untouched). Both new
+  refusal classes are in `_RESUME_LIVE_SESSION_MARKERS`, so `deliver`
+  blocks a second GPU on them as well.
+- Tests: `OwnerVerificationTest` O01–O12 in
+  `tests/test_v031_hotfix_session_recovery.py` (12 tests; 7 of them
+  failed or errored against the pre-patch code, proving the hole).
+  Full suite: 1093 tests, 0 failures.
+
+### Tests
+
+- New: `tests/test_v031_hotfix_stage_contract.py` (15),
+  `tests/test_v031_hotfix_session_recovery.py` (20).
+- Updated: `tests/test_recoverable_controller.py`
+  (`test_no_session_id_refuses` now pins the new evidence-based
+  refusal: no registry evidence + unreadable live list → refuse on
+  UNKNOWN without closing the run).
+- Fault-injection scenarios T01–T18 all covered (T01/T02 in the
+  stage-contract file, T03–T18 in the session-recovery file);
+  T03b (orphan allocating record resolves cleanly) is extra.
+- Full suite: 1081 tests, 0 failures (Python 3.12 locally; 3.11 via
+  CI), secret scan + gitleaks clean, Source Manifest verified.
+
 ## v0.3.0 — 2026-11-20 (TASK-VERSION-ROADMAP-011 / TASK-VERSION-INTEGRATION-012)
 
 Integrated release (PR #18, single Merge Commit into `main`): the v0.2.0

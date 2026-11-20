@@ -417,11 +417,27 @@ class ResumeRefusalTest(_ResumeBase):
         self.assertFalse(ledger_path_for_task(self.root, TASK).is_file())
 
     def test_no_session_id_refuses(self):
+        # TASK-HOTFIX-016 P0-B: a sessionless manifest no longer refuses
+        # with the bare "no session id" — the resume path now looks for
+        # registry evidence first. This fixture has none (no lease or
+        # managed record for the run) AND the live session list is
+        # unreadable here (no Colab CLI), so the run still refuses — but
+        # fail-closed on UNKNOWN, without closing the run or allocating
+        # anything. A readable empty server list would close it FAILED
+        # instead (see tests/test_v031_hotfix_session_recovery.py).
+        # TASK-HOTFIX-016B: the owner gate runs before the evidence
+        # branch, so the fixture pins a verifiable owner here — the
+        # unverifiable-owner refusal itself is covered by O01/O02.
         self._manifest(task_state="GPU_ALLOCATED", session_id=None)
         self._ledger()
-        result = hc._resume_run(self._args())
+        with mock.patch("h3_gpu_lease_registry.current_owner_id",
+                        return_value="owner-test-0001"):
+            result = hc._resume_run(self._args())
         self.assertFalse(result["resumed"])
-        self.assertIn("no session id", result["reason"])
+        self.assertIn("UNKNOWN", result["reason"])
+        self.assertIn("live session list unreadable", result["reason"])
+        self.assertEqual(rm.load_run_manifest(self.root, RUN_ID)["task_state"],
+                         "GPU_ALLOCATED")
 
     def test_unknown_session_state_refuses(self):
         self._manifest(task_state="GPU_ALLOCATED")
