@@ -1,6 +1,44 @@
 # CHANGELOG
 
-## Unreleased — Muse Adapter (Stage 1, TASK-VERSION-ROADMAP-011)
+## Unreleased — v0.2.0 development (TASK-VERSION-ROADMAP-011)
+
+
+### F2 — Offline ComfyUI wheelhouse cache (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.0 F2 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md` in the adapter PR). `h3_comfyui_cache.py`:
+
+- Drive SDK imports are lazy: the pure-stdlib wheelhouse helpers
+  (`normalize_pkg_name`, `normalize_python_tag`,
+  `filter_requirements_lines`, `filter_requirements_file`,
+  `validate_wheelhouse_entry`, `select_wheelhouse_entry`,
+  `build_wheelhouse_task_descriptor`, `verify_local_wheelhouse`)
+  work with no Drive dependency (proven by a test that blocks all
+  `google*` imports).
+- `build-wheelhouse` / `publish-wheelhouse` (publish gated by
+  `--allow-drive-write`) package deterministic
+  `comfyui-wheelhouse-<commit>-<pytag>.tar.gz`
+  (`wheelhouse/*.whl` + `wheelhouse/WHEELHOUSE_META.json`, mtime 0,
+  rebuilds byte-identical) for Colab Linux x86_64 (`py311`/`py312`),
+  excluding preinstalled `torch`, `torchvision`, `torchaudio`,
+  `triton`, `nvidia-*`. A required package with no matching local
+  wheel fails closed with its name listed.
+- `verify_wheelhouse_on_drive` discovers commit-matching bundles in
+  `Muse-H3-ComfyUI-Source` alongside the source tarball (the Muse
+  equivalent of the upstream `--sync-shared-caches` discovery; Muse
+  has no `setup_isolated_account.py` script, so there was nothing to
+  update there — recorded NOT-APPLICABLE in the ledger).
+- `h3_controller.py` wires optional `drive_download["wheelhouses"]`
+  (one-entry list when a wheelhouse manifest exists, key absent
+  otherwise). Worker-side install from the wheelhouse is F3, not F2.
+
+Tests: new `tests/test_comfyui_wheelhouse.py` (19 tests, offline).
+Full offline suite: 763 tests, 0 failures. Live GPU verification:
+NOT_VERIFIED (no GPU run under this change).
+
+### Muse Adapter (Stage 1)
+
 
 Muse-original adapter layer over the unchanged v0.1.0 production
 core (`adapters/muse/`): TaskSpec mapping, explicit-authorization →
