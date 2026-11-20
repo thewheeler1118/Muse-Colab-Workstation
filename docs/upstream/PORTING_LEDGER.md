@@ -57,7 +57,7 @@ worktree.
 | `tests/test_drive_depot_remote_seed.py` | `8063669e320785ae63c522fbfdef2ca5f3dcbca4` | TBD (F5) | No | SPEC PENDING — Remote Seed stays optional; no live GPU test without separate approval | TBD | PENDING |
 | `tests/test_drive_download_v2.py` | `8ea33c16390b0237f1a3231a111cb362c8e3cf23` | `tests/test_drive_download_v2.py` (Muse-original) | No | IMPLEMENTED (F1, PR #4, commit `2f3c425`): test intent reimplemented from the behaviour spec; no upstream test code copied. The TASK-007.1 shard-merge test in `tests/test_drive_download.py` was retired (its implementation no longer exists) — an intended behaviour change, recorded in the test file. | `tests/test_drive_download_v2.py` (17 tests, in 760-test suite) | PASS — offline only, fake transport, no credentials |
 | `tests/test_reliability_coldstart.py` | `3cb19ac48697ccb840687a02d8419930d06a568b` | TBD (F5) | No | SPEC PENDING | TBD | PENDING |
-| `tests/test_remote_worker_v020.py` | `38ea495e40be5f52569d337512df420e5f5bfd84` | TBD (F1/F3/F4) | No | SPEC PENDING | TBD | PENDING |
+| `tests/test_remote_worker_v020.py` | `38ea495e40be5f52569d337512df420e5f5bfd84` | `tests/test_remote_worker_v020.py` (Muse-original) | No | IMPLEMENTED (F3, PR #8, commit `2364408`): test intent reimplemented from the behaviour spec; no upstream test code copied | `tests/test_remote_worker_v020.py` (25 tests, in 818-test suite) | PASS — offline only, fake transport/pip, no credentials |
 
 ## Upstream new files — v0.3.0 (`2fa7ba48c55614ccca157880e6b90d20f468f871`)
 
@@ -106,6 +106,7 @@ in any of them.
 |---|---|---|---|---|---|
 | F1 zero-copy high-concurrency Drive download (pwrite + bitmap resume) | PR #4 / `2f3c425` (Issue #3) | `h3_drive_download.py` (preallocated single `.part`, `os.pwrite`, 12 workers, global connection cap 16, ordered streaming SHA-256, `.part.bitmap.json` resume, abort, single-flight refresh); `tests/test_drive_download.py` (constants + retired shard-merge test) | `tests/test_drive_download_v2.py` (17 new tests) | Run 44662119661, 6/6 pass (2026-11-20) | NOT_VERIFIED |
 | F2 offline ComfyUI wheelhouse cache | PR #6 / `fd61ece` (Issue #5) | `h3_comfyui_cache.py` (lazy Drive imports, pure-stdlib helpers, deterministic `comfyui-wheelhouse-<commit>-<pytag>.tar.gz` build/publish/verify, `verify_wheelhouse_on_drive`); `h3_controller.py` (optional `drive_download["wheelhouses"]`) | `tests/test_comfyui_wheelhouse.py` (19 new tests) | CI run pending at PR creation (local suite 763 tests, 0 failures) | NOT_VERIFIED |
+| F3 dual-track parallel setup + wheelhouse-first install | PR #8 / `2364408` (Issue #7) | `h3_remote_worker.py` (run_setup_parallel ThreadPoolExecutor max_workers=2, shared abort_event via progress callback, thread-safe token refresh, thread-local cmd-failure record, SetupTrackFailed attribution; wheelhouse-first pip install with WHEELHOUSE_FALLBACK_PYPI, safe tar extract + META verify); `tests/test_h3_comfyui_cache.py` (TestGitFailureRecord updated to _cmd_failure_get) | `tests/test_remote_worker_v020.py` (25 new tests) | CI run pending at PR creation (local suite 818 tests, 0 failures) | NOT_VERIFIED |
 
 ## Legacy repository — `LEGACY_REPOSITORY_NOT_ACCESSIBLE`
 
