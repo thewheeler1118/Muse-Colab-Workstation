@@ -415,18 +415,61 @@ def _spec_satisfied(version: str, spec: str) -> bool:
     return True
 
 
-def log_requirements_status(requirements_path):
+# v0.2.1 P2: headless-optional ComfyUI UI asset packages (same set as
+# h3_comfyui_cache.HEADLESS_OPTIONAL_*; the worker is self-contained
+# and does not import the cache module). Verified optional in headless
+# API mode by the upstream audit of pinned ComfyUI commit
+# 61e524bdba7a4e193b45c2697f1af83c1beb86d6.
+# comfyui-frontend-package is intentionally NOT excluded
+# (default_frontend_path calls sys.exit(-1) on ImportError).
+HEADLESS_EXCLUDED_PACKAGES = ("comfyui-workflow-templates",
+                              "comfyui-embedded-docs")
+HEADLESS_EXCLUDED_PREFIXES = ("comfyui-workflow-templates-",)
+
+
+def _normalize_pkg_name(name: str) -> str:
+    """PEP 503 normalization (same rule as h3_comfyui_cache)."""
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+
+def _is_headless_optional(normalized_name: str,
+                          excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+                          excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES) -> bool:
+    """True for ComfyUI UI asset packages headless API mode never
+    needs (v0.2.1 P2)."""
+    excl_exact = {_normalize_pkg_name(p) for p in (excluded_packages or ())}
+    if normalized_name in excl_exact:
+        return True
+    return any(normalized_name.startswith(_normalize_pkg_name(p))
+               for p in (excluded_prefixes or ()) if str(p).strip())
+
+
+def log_requirements_status(
+    requirements_path,
+    excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+    excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES,
+):
     """Best-effort, no-network diagnostic: which requirements of the pinned
     ComfyUI tree are already satisfied in this runtime. Never blocks the
     install; on any doubt the entry is 'unknown' and pip runs as before.
-    Returns a dict {satisfied, missing, unknown} (lists of requirement lines)."""
+    Headless-optional packages (verified optional in ComfyUI API mode) are
+    recorded under 'excluded' rather than 'missing'.
+    Returns a dict {satisfied, missing, unknown, excluded} (lists of requirement lines)."""
     from importlib import metadata as _md
-    satisfied, missing, unknown = [], [], []
+    satisfied, missing, unknown, excluded = [], [], [], []
     try:
         for line in Path(requirements_path).read_text().splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
+            head = line.split('#', 1)[0].split(';', 1)[0].strip()
+            m_name = re.match(r'^([A-Za-z0-9][A-Za-z0-9_.\-]*)', head)
+            if m_name:
+                norm = _normalize_pkg_name(m_name.group(1))
+                if _is_headless_optional(norm, excluded_packages,
+                                         excluded_prefixes):
+                    excluded.append(line)
+                    continue
             m = re.match(r'^([A-Za-z0-9_.\-]+)\s*(.*)$', line)
             if not m:
                 unknown.append(line)
@@ -443,17 +486,26 @@ def log_requirements_status(requirements_path):
                 missing.append(line + ' (installed ' + installed + ')')
     except Exception as e:
         print('REQUIREMENTS_CHECK_UNAVAILABLE', type(e).__name__, str(e)[:200], flush=True)
-        return {"satisfied": [], "missing": [], "unknown": ["check failed"]}
-    status = {"satisfied": satisfied, "missing": missing, "unknown": unknown}
+        return {"satisfied": [], "missing": [], "unknown": ["check failed"], "excluded": []}
+    status = {"satisfied": satisfied, "missing": missing, "unknown": unknown, "excluded": excluded}
     print('REQUIREMENTS_STATUS', json.dumps(status, ensure_ascii=False), flush=True)
     return status
 
 
-def pip_install_needed(requirements_path):
+def pip_install_needed(
+    requirements_path,
+    excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+    excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES,
+):
     """True unless the requirements check ran cleanly (no unknowns) and
-    nothing is missing. Skipping pip then is equivalent to running it:
-    pip would install nothing new. Any doubt -> run pip as before."""
-    status = log_requirements_status(requirements_path)
+    nothing is missing (excluding headless-optional packages). Skipping pip
+    then is equivalent to running it: pip would install nothing needed.
+    Any doubt -> run pip as before."""
+    status = log_requirements_status(
+        requirements_path,
+        excluded_packages=excluded_packages,
+        excluded_prefixes=excluded_prefixes,
+    )
     return bool(status["missing"] or status["unknown"])
 
 
@@ -784,13 +836,40 @@ def _download_and_prepare_wheelhouse(entry, token_provider, abort_event=None):
     return wheels_dir
 
 
+def _filter_requirements_for_wheelhouse(requirements) -> Path:
+    """Write the requirements minus headless-optional packages (v0.2.1
+    P2) next to the original file and return its path. The offline
+    wheelhouse install must not ask pip for packages that are neither
+    installed nor in the bundle, or --no-index fails and the install
+    silently falls back to PyPI. The plain-PyPI fallback always uses
+    the original file."""
+    requirements = Path(requirements)
+    filtered = requirements.with_name("wheelhouse_requirements.txt")
+    kept = []
+    for line in requirements.read_text(encoding="utf-8").splitlines():
+        text = line.split("#", 1)[0].strip()
+        if not text or text.startswith("-"):
+            continue
+        m_name = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.\-]*)", text)
+        if m_name and _is_headless_optional(
+                _normalize_pkg_name(m_name.group(1))):
+            continue
+        kept.append(text)
+    filtered.write_text("\n".join(kept) + ("\n" if kept else ""),
+                        encoding="utf-8")
+    return filtered
+
+
 def _install_requirements(requirements, drive_download=None, token_provider=None, abort_event=None):
     """Install requirements, preferring the offline wheelhouse (F3).
 
     Plain PyPI install when there is no usable wheelhouse entry.
     Offline install failure (download, extract, verify, or pip) falls
     back to plain PyPI and emits WHEELHOUSE_FALLBACK_PYPI with the
-    reason; the plain install's own failure still raises."""
+    reason; the plain install's own failure still raises. The offline
+    path installs a filtered requirements file (v0.2.1 P2) without the
+    headless-optional packages that are neither installed nor in the
+    bundle; the PyPI fallback uses the original file."""
     global _WHEELHOUSE_HIT
     entry, reason = _select_wheelhouse_entry(drive_download)
     if entry is None:
@@ -803,8 +882,9 @@ def _install_requirements(requirements, drive_download=None, token_provider=None
         return
     try:
         wheels_dir = _download_and_prepare_wheelhouse(entry, token_provider, abort_event=abort_event)
+        filtered = _filter_requirements_for_wheelhouse(requirements)
         run_cmd([sys.executable, "-m", "pip", "install", "--no-index",
-                 "--find-links", str(wheels_dir), "-r", str(requirements)], timeout=1200)
+                 "--find-links", str(wheels_dir), "-r", str(filtered)], timeout=1200)
     except Exception as e:
         print("WHEELHOUSE_FALLBACK_PYPI",
               json.dumps({"reason": f"{type(e).__name__}: {str(e)[:300]}",

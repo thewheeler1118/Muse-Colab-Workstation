@@ -365,6 +365,34 @@ class TestRequirementsCheck(unittest.TestCase):
             bad.write_text("definitely-not-installed-xyz>=1\n")
             self.assertTrue(pip_install_needed(bad))
 
+    def test_headless_optional_packages_are_excluded_not_missing(self):
+        # v0.2.1 P2: headless UI asset packages land in 'excluded',
+        # never in 'missing'; comfyui-frontend-package still counts.
+        with tempfile.TemporaryDirectory() as d:
+            req = Path(d) / "requirements.txt"
+            req.write_text("comfyui-workflow-templates==1.0.0\n"
+                           "comfyui-embedded-docs\n"
+                           "comfyui-workflow-templates-extra>=0.1\n"
+                           "comfyui-frontend-package==1.0\n"
+                           "pip>=1\n")
+            status = log_requirements_status(req)
+            self.assertEqual(status["excluded"], [
+                "comfyui-workflow-templates==1.0.0",
+                "comfyui-embedded-docs",
+                "comfyui-workflow-templates-extra>=0.1",
+            ])
+            self.assertEqual(status["satisfied"], ["pip>=1"])
+            self.assertEqual(status["missing"],
+                             ["comfyui-frontend-package==1.0"])
+            self.assertTrue(pip_install_needed(req))
+
+    def test_only_headless_optional_means_no_pip_needed(self):
+        with tempfile.TemporaryDirectory() as d:
+            req = Path(d) / "requirements.txt"
+            req.write_text("comfyui-workflow-templates==1.0.0\n"
+                           "comfyui-embedded-docs\n")
+            self.assertFalse(pip_install_needed(req))
+
 
 if __name__ == "__main__":
     unittest.main()

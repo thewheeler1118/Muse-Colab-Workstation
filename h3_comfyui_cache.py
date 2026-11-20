@@ -79,12 +79,22 @@ STAGING = ROOT / "model_cache" / "comfyui_source"
 
 # Python tags a wheelhouse bundle may be built for. The tag
 # normalizer itself is generic (no hardcoded list); this tuple is
-# the build-time allowlist for Colab (P2 adds py313).
-SUPPORTED_PYTHON_TAGS = ("py311", "py312")
+# the build-time allowlist for Colab.
+SUPPORTED_PYTHON_TAGS = ("py311", "py312", "py313")
 # Packages the Colab image already provides: never bundled, never
 # installed from the wheelhouse. nvidia-* matches by prefix.
 PREINSTALLED_PACKAGES = ("torch", "torchvision", "torchaudio", "triton")
 PREINSTALLED_PREFIXES = ("nvidia-",)
+# v0.2.1 P2: headless-optional ComfyUI UI asset packages. Verified
+# optional in headless API mode (--listen 127.0.0.1 --port 8188) by
+# the upstream audit of pinned ComfyUI commit
+# 61e524bdba7a4e193b45c2697f1af83c1beb86d6 (app/frontend_management.py
+# catches ImportError and returns None; server.py skips /templates
+# and /docs cleanly). comfyui-frontend-package is intentionally NOT
+# excluded (default_frontend_path calls sys.exit(-1) on ImportError).
+HEADLESS_OPTIONAL_PACKAGES = ("comfyui-workflow-templates",
+                              "comfyui-embedded-docs")
+HEADLESS_OPTIONAL_PREFIXES = ("comfyui-workflow-templates-",)
 WHEELHOUSE_LOCAL_MANIFEST = (
     ROOT / "model_cache" / "comfyui_wheelhouse_manifest.json")
 WHEELHOUSE_STAGING = ROOT / "model_cache" / "comfyui_wheelhouse"
@@ -230,9 +240,20 @@ def _is_preinstalled(normalized_name: str) -> bool:
     return any(normalized_name.startswith(p) for p in PREINSTALLED_PREFIXES)
 
 
+def _is_headless_optional(normalized_name: str) -> bool:
+    """True for ComfyUI UI asset packages that headless API mode never
+    needs (v0.2.1 P2). Never bundled, never installed from the
+    wheelhouse; the plain-PyPI fallback still installs them."""
+    if normalized_name in HEADLESS_OPTIONAL_PACKAGES:
+        return True
+    return any(normalized_name.startswith(p)
+               for p in HEADLESS_OPTIONAL_PREFIXES)
+
+
 def filter_requirements_lines(lines) -> list:
     """Keep the requirement lines a wheelhouse must cover: strip
-    comments/blanks/installer options and drop preinstalled packages.
+    comments/blanks/installer options and drop preinstalled packages
+    and headless-optional UI asset packages (v0.2.1 P2).
     Returns the kept lines (comment-stripped, whitespace-trimmed) in
     file order."""
     kept = []
@@ -241,7 +262,7 @@ def filter_requirements_lines(lines) -> list:
         if not text or text.startswith("-"):
             continue
         name = _requirement_name(line)
-        if name is None or _is_preinstalled(name):
+        if name is None or _is_preinstalled(name) or _is_headless_optional(name):
             continue
         kept.append(text)
     return kept
@@ -694,8 +715,13 @@ def publish(repo_dir: Path, commit: str, colab_auth: str) -> dict:
 
 
 def verify(colab_auth: str) -> dict:
-    """Read-only: re-check the Drive cache files against the local manifest."""
-    from drive_api import verify_uploaded_file
+    """Read-only: re-check the Drive cache files against the local manifest.
+
+    v0.2.1 P2: entries whose local copy is gone (staging cleaned
+    after publish, remote-only synced Drive entries) are verified from
+    server metadata alone — size + MD5 + SHA-256 against the manifest —
+    instead of failing on the missing local file."""
+    from drive_api import get_file_evidence, verify_uploaded_file
     from drive_depot import account_matches, drive_service
 
     if not LOCAL_MANIFEST.exists():
@@ -706,11 +732,30 @@ def verify(colab_auth: str) -> dict:
         raise RuntimeError("ACCOUNT_MISMATCH")
     result = {"folder_id": manifest.get("drive_folder_id"), "files": {}}
     for rel, info in manifest.get("drive_files", {}).items():
-        proof = verify_uploaded_file(
-            service, info["id"], STAGING / rel)
+        local_path = STAGING / rel
+        if local_path.is_file():
+            proof = verify_uploaded_file(
+                service, info["id"], local_path)
+            result["files"][rel] = {
+                "drive_file_id": info["id"], "size": proof["size"],
+                "sha256": proof["sha256"], "server_verified": True}
+            continue
+        meta = get_file_evidence(service, info["id"])
+        if meta.get("trashed"):
+            raise RuntimeError(f"Drive file is trashed: {rel}")
+        if int(meta.get("size", -1)) != int(info["size"]):
+            raise RuntimeError(f"Server size mismatch for {rel}")
+        expected_md5 = str(info.get("server_md5", "")).strip().lower()
+        actual_md5 = str(meta.get("md5Checksum", "")).strip().lower()
+        if expected_md5 and actual_md5 != expected_md5:
+            raise RuntimeError(f"Drive server MD5 mismatch for {rel}")
+        server_sha = str(meta.get("sha256Checksum", "")).strip().lower()
+        expected_sha = str(info.get("sha256", "")).strip().lower()
+        if server_sha and expected_sha and server_sha != expected_sha:
+            raise RuntimeError(f"Drive server SHA256 mismatch for {rel}")
         result["files"][rel] = {
-            "drive_file_id": info["id"], "size": proof["size"],
-            "sha256": proof["sha256"], "server_verified": True}
+            "drive_file_id": info["id"], "size": int(meta["size"]),
+            "sha256": expected_sha, "server_verified": True}
     return result
 
 

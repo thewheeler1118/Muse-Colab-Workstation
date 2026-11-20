@@ -421,6 +421,57 @@ class WheelhouseInstallTest(WheelhouseTestBase):
         self.assertEqual(_runtime_python_tag(),
                          f"py{sys.version_info.major}{sys.version_info.minor}")
 
+    def test_offline_install_uses_filtered_requirements(self):
+        # v0.2.1 P2: the --no-index install gets a requirements file
+        # without the headless-optional packages (neither installed nor
+        # in the bundle); the file next to it keeps them for PyPI.
+        req = Path(self.tmp.name) / "requirements.txt"
+        req.write_text("fake-pkg==1.0\n"
+                       "comfyui-workflow-templates==1.0.0\n"
+                       "comfyui-embedded-docs\n")
+        pip_calls = []
+
+        def fake_run_cmd(args, timeout=1200, cwd=None):
+            pip_calls.append(list(args))
+            return mock.Mock()
+
+        with mock.patch("h3_drive_download.DriveDownloader",
+                        self._fake_downloader([])), \
+                mock.patch.object(hrw, "run_cmd", fake_run_cmd):
+            hrw._install_requirements(
+                req, {"wheelhouses": [self.entry]}, token_provider=mock.Mock())
+        offline = [c for c in pip_calls if "--no-index" in c]
+        self.assertEqual(len(offline), 1)
+        req_arg = offline[0][offline[0].index("-r") + 1]
+        self.assertEqual(Path(req_arg).name, "wheelhouse_requirements.txt")
+        self.assertEqual(Path(req_arg).read_text().splitlines(),
+                         ["fake-pkg==1.0"])
+        self.assertIn("comfyui-workflow-templates==1.0.0",
+                      req.read_text())
+
+    def test_offline_failure_falls_back_to_original_requirements(self):
+        req = Path(self.tmp.name) / "requirements.txt"
+        req.write_text("fake-pkg==1.0\ncomfyui-workflow-templates==1.0.0\n")
+        pip_calls = []
+
+        def fake_run_cmd(args, timeout=1200, cwd=None):
+            pip_calls.append(list(args))
+            if "--no-index" in args:
+                raise subprocess.CalledProcessError(1, args, "", "offline fail")
+            return mock.Mock()
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch("h3_drive_download.DriveDownloader",
+                           self._fake_downloader([])), \
+                mock.patch.object(hrw, "run_cmd", fake_run_cmd):
+            hrw._install_requirements(
+                req, {"wheelhouses": [self.entry]}, token_provider=mock.Mock())
+        self.assertEqual(len(pip_calls), 2)
+        self.assertEqual(Path(pip_calls[1][pip_calls[1].index("-r") + 1]),
+                         req)
+        self.assertIn("WHEELHOUSE_FALLBACK_PYPI", out.getvalue())
+
 
 class AbortProgressTest(unittest.TestCase):
     def test_wrapper_raises_when_event_set(self):

@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 20598,
-      "sha256": "106e18c151785ce7e4957c2faea916d2b8dfd25af27654797c2b9f08aab61f66",
+      "size_bytes": 23049,
+      "sha256": "42ba77ecb527101645ddb58f3e0e55aefc68538009b3f2241c42982350098939",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 58299,
-      "sha256": "328155818235c729631fddd0d7900f8d9aaf2373da3d8bfa093baca44030c5ec",
+      "size_bytes": 58612,
+      "sha256": "dad2db3fc1f64f6328fdb9dff63f36c29d1d088aaff5f53effd92acf41bef08a",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 17510,
-      "sha256": "cd37850714f5d6fb2a8910dcfd14d80871a51a18dfbe21d2e607bfea919de466",
+      "size_bytes": 18499,
+      "sha256": "3a56b6c91caf345cff510e01ef45040a7e781c9bbcb9afb7f411ac320ee4f6bd",
       "role": "Documentation / evidence"
     },
     {
@@ -641,8 +641,8 @@
     },
     {
       "path": "h3_comfyui_cache.py",
-      "size_bytes": 36479,
-      "sha256": "a335ebf6426c6214e6d8e9a7fe7777ccf028a113b20833a6d38bdf1e6a635195",
+      "size_bytes": 38999,
+      "sha256": "6baeb333c22d87fd047dfeb2a691af6d47e5976384505c327a77f53049dd7560",
       "role": "ComfyUI source archive build / verify / publish to Drive cache"
     },
     {
@@ -761,8 +761,8 @@
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 89978,
-      "sha256": "f9035612a7073931b91e2cac70caefeb69acd8c898bcf593c280141f05130ac7",
+      "size_bytes": 93649,
+      "sha256": "b639870083642b4a53f429d51e6300ce40dc47ca58c4bc26d8668cf7767d5141",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -1043,8 +1043,8 @@
     },
     {
       "path": "tests/test_comfyui_wheelhouse.py",
-      "size_bytes": 19149,
-      "sha256": "f0c5ae6492cb8dac8a1bcbf00c0435f5aa6d826e1b292ff41073830f0b6999b4",
+      "size_bytes": 24972,
+      "sha256": "1598417da7d00296f341748f2232a8899182a18557492eff868f7f6ee780f6b3",
       "role": "Tests"
     },
     {
@@ -1151,8 +1151,8 @@
     },
     {
       "path": "tests/test_h3_comfyui_cache.py",
-      "size_bytes": 16554,
-      "sha256": "8de937cae5b037acfaed40e7496b753a0e7413069fa03c496e51c9b062d4b5b1",
+      "size_bytes": 17974,
+      "sha256": "8aa32e852d8ce2476dd607f78b7d0d16950c84b1024949ffff2b66ba20ca0667",
       "role": "Tests: ComfyUI cache build/verify/publish (21 tests)"
     },
     {
@@ -1211,8 +1211,8 @@
     },
     {
       "path": "tests/test_remote_worker_v020.py",
-      "size_bytes": 39034,
-      "sha256": "b6f88fddb550df52315b3c723c7efc625352d25893a0f5fce86b336629f70990",
+      "size_bytes": 41481,
+      "sha256": "fa3d29a449a98522a6a5ce51e023b6845f2c91e95d69ead1b6d0f49d4770bfd3",
       "role": "Tests"
     },
     {

@@ -23,6 +23,52 @@ server-MD5 fail-closed case plus the no-MD5-requested pass case
 `tests/test_remote_worker_v020.py`. Full offline suite: 925 tests,
 0 failures. Live GPU verification: NOT_VERIFIED.
 
+### P2 — Headless wheelhouse exclusions + py313 (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.1 P2 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `h3_comfyui_cache.py`:
+
+- `SUPPORTED_PYTHON_TAGS` gains `py313` (the tag normalizer was
+  already generic — "3.13"/"cp313"/"py313" all normalize without a
+  code change).
+- Headless-optional ComfyUI UI asset packages
+  (`comfyui-workflow-templates`, `comfyui-workflow-templates-*`,
+  `comfyui-embedded-docs`) are excluded from the wheelhouse by
+  `filter_requirements_lines`, per the upstream audit of the pinned
+  ComfyUI commit `61e524bdba7a4e193b45c2697f1af83c1beb86d6`
+  (`server.py` + `app/frontend_management.py`);
+  `comfyui-frontend-package` is intentionally kept (it calls
+  `sys.exit(-1)` on `ImportError`).
+- `manylinux_2_28_x86_64` (required by `av>=17.0.0`) needs no code
+  change: `_wheel_matches_pytag` already accepts any
+  `manylinux.*_x86_64` tag generically; a regression test proves a
+  `manylinux_2_28_x86_64` wheel validates for `py313`.
+- `verify()` gains the remote-only branch: an entry whose local copy
+  is gone (staging cleaned after publish) is verified from server
+  metadata alone — size + MD5 + SHA-256 against the manifest —
+  instead of failing on the missing local file.
+
+`h3_remote_worker.py`: the same headless set lives worker-side
+(`HEADLESS_EXCLUDED_PACKAGES`/`HEADLESS_EXCLUDED_PREFIXES`);
+`log_requirements_status` records headless-optional packages under
+`excluded` instead of `missing`, and `pip_install_needed` no longer
+counts them; `_install_requirements` installs a filtered
+`wheelhouse_requirements.txt` on the offline path (otherwise
+`--no-index` fails on packages neither installed nor in the bundle
+and silently falls back to PyPI), while the PyPI fallback uses the
+original file.
+
+Tests: filter exclusions incl. prefix variants + frontend-package
+kept, `py313` archive name + entry selection, `verify()` remote-only
+(happy path, bad server MD5, local-file path) in
+`tests/test_comfyui_wheelhouse.py`; excluded bucket + no-pip-needed
+in `tests/test_h3_comfyui_cache.py`; filtered offline install +
+fallback-to-original in `tests/test_remote_worker_v020.py`. Full
+offline suite: 934 tests, 0 failures. The actual `py313` wheelhouse
+bundle was NOT built or published (live network + Drive write, needs
+separate authorization). Live GPU verification: NOT_VERIFIED.
+
 ## Unreleased — v0.2.0 development (TASK-VERSION-ROADMAP-011)
 
 ### F1 — Zero-copy high-concurrency Drive download (2026-11-20)

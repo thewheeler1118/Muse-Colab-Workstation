@@ -94,6 +94,22 @@ class FilterRequirementsTest(unittest.TestCase):
             "some-pkg @ https://example.com/some-pkg-1.0.tar.gz",
         ])
 
+    def test_filter_drops_headless_optional_packages(self):
+        # v0.2.1 P2: headless UI asset packages are excluded from the
+        # wheelhouse; comfyui-frontend-package is KEPT (it exits on
+        # ImportError).
+        lines = [
+            "comfyui-workflow-templates==1.0.0",
+            "comfyui-workflow-templates-extra>=0.1",
+            "comfyui-embedded-docs",
+            "comfyui-frontend-package==1.26.2",
+            "pillow==10.4.0",
+        ]
+        self.assertEqual(filter_requirements_lines(lines), [
+            "comfyui-frontend-package==1.26.2",
+            "pillow==10.4.0",
+        ])
+
     def test_filter_requirements_file(self):
         with tempfile.TemporaryDirectory() as d:
             req = Path(d) / "requirements.txt"
@@ -275,8 +291,9 @@ class BuildWheelhouseTest(unittest.TestCase):
         self.assertFalse((self.dir / "x.tar.gz").exists())
 
     def test_build_unsupported_pytag_and_missing_dirs(self):
+        # v0.2.1 P2: py313 is now supported; py310 is the unsupported tag.
         with self.assertRaises(ValueError):
-            build_wheelhouse(self.req, "abc123", "py313", self.wheels,
+            build_wheelhouse(self.req, "abc123", "py310", self.wheels,
                              self.dir / "x.tar.gz")
         with self.assertRaises(RuntimeError):
             build_wheelhouse(self.req, "abc123", "py311",
@@ -386,6 +403,105 @@ class ControllerWiringTest(unittest.TestCase):
         self.assertIsNone(self.hc._wheelhouse_download_task())
         block = self.hc._build_drive_download_block(self.cache_manifest)
         self.assertNotIn("wheelhouses", block)
+
+
+class Py313AndRemoteVerifyTest(unittest.TestCase):
+    """v0.2.1 P2: py313 wheelhouse support + verify() for remote-only
+    (staging-cleaned) Drive entries."""
+
+    def test_py313_archive_name_and_entry_selection(self):
+        self.assertEqual(wheelhouse_archive_name("abc123", "py313"),
+                         "comfyui-wheelhouse-abc123-py313.tar.gz")
+        with tempfile.TemporaryDirectory() as d:
+            entry = validate_wheelhouse_entry(
+                _fake_wheel(Path(d),
+                            "av-17.0.0-cp313-cp313-manylinux_2_28_x86_64.whl"),
+                "py313")
+            self.assertEqual(entry["name"], "av")
+            self.assertEqual(entry["platform_tag"], "manylinux_2_28_x86_64")
+            picked = select_wheelhouse_entry([entry], "av", "py313")
+            self.assertIsNotNone(picked)
+            self.assertIsNone(select_wheelhouse_entry([entry], "av", "py312"))
+
+    def _manifest(self, tmp: Path, rel: str = "comfyui-abc123.tar.gz"):
+        manifest = {"drive_folder_id": "folder-1",
+                    "drive_files": {rel: {"id": "drive-file-1", "size": 100,
+                                          "sha256": "a" * 64,
+                                          "server_md5": "b" * 32}}}
+        (tmp / "manifest.json").write_text(json.dumps(manifest))
+        return manifest
+
+    def test_verify_remote_only_entry_uses_server_metadata(self):
+        import drive_api
+        import drive_depot
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._manifest(tmp)
+            meta = {"id": "drive-file-1", "size": "100",
+                    "md5Checksum": "B" * 32, "sha256Checksum": "A" * 64,
+                    "trashed": False}
+            with mock.patch.object(wc, "LOCAL_MANIFEST",
+                                   tmp / "manifest.json"), \
+                    mock.patch.object(wc, "STAGING", tmp / "staging"), \
+                    mock.patch.object(drive_depot, "drive_service",
+                                      return_value=mock.Mock()), \
+                    mock.patch.object(drive_depot, "account_matches",
+                                      return_value=True), \
+                    mock.patch.object(drive_api, "get_file_evidence",
+                                      return_value=meta) as evidence, \
+                    mock.patch.object(drive_api, "verify_uploaded_file") as local_verify:
+                result = wc.verify("adc")
+            evidence.assert_called_once()
+            local_verify.assert_not_called()
+            self.assertTrue(result["files"]["comfyui-abc123.tar.gz"]["server_verified"])
+            self.assertEqual(result["files"]["comfyui-abc123.tar.gz"]["sha256"],
+                             "a" * 64)
+
+    def test_verify_remote_only_rejects_bad_server_md5(self):
+        import drive_api
+        import drive_depot
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._manifest(tmp)
+            meta = {"id": "drive-file-1", "size": "100",
+                    "md5Checksum": "c" * 32, "sha256Checksum": "A" * 64,
+                    "trashed": False}
+            with mock.patch.object(wc, "LOCAL_MANIFEST",
+                                   tmp / "manifest.json"), \
+                    mock.patch.object(wc, "STAGING", tmp / "staging"), \
+                    mock.patch.object(drive_depot, "drive_service",
+                                      return_value=mock.Mock()), \
+                    mock.patch.object(drive_depot, "account_matches",
+                                      return_value=True), \
+                    mock.patch.object(drive_api, "get_file_evidence",
+                                      return_value=meta):
+                with self.assertRaises(RuntimeError):
+                    wc.verify("adc")
+
+    def test_verify_local_entry_still_uses_local_file(self):
+        import drive_api
+        import drive_depot
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            self._manifest(tmp)
+            staging = tmp / "staging"
+            staging.mkdir()
+            (staging / "comfyui-abc123.tar.gz").write_bytes(b"x" * 100)
+            proof = {"size": 100, "sha256": "a" * 64}
+            with mock.patch.object(wc, "LOCAL_MANIFEST",
+                                   tmp / "manifest.json"), \
+                    mock.patch.object(wc, "STAGING", staging), \
+                    mock.patch.object(drive_depot, "drive_service",
+                                      return_value=mock.Mock()), \
+                    mock.patch.object(drive_depot, "account_matches",
+                                      return_value=True), \
+                    mock.patch.object(drive_api, "verify_uploaded_file",
+                                      return_value=proof) as local_verify, \
+                    mock.patch.object(drive_api, "get_file_evidence") as evidence:
+                result = wc.verify("adc")
+            local_verify.assert_called_once()
+            evidence.assert_not_called()
+            self.assertTrue(result["files"]["comfyui-abc123.tar.gz"]["server_verified"])
 
 
 class CliGateTest(unittest.TestCase):
