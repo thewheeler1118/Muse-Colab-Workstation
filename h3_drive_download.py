@@ -51,7 +51,6 @@ resume, and token refresh is single-flight across threads.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import os
@@ -102,34 +101,81 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
 # resolved in DriveDownloader.__init__ (explicit arg wins, else env,
 # else this default) so tests can pin either without reloading.
 DEFAULT_CONCURRENT_WORKERS = 12
-# v0.2.0 F1: process-wide cap on simultaneous Drive connections, 16
-# by default via H3_DRIVE_MAX_GLOBAL_CONNECTIONS (1..64). The
-# semaphore bounds connection establishment across every
-# DriveDownloader in this process; each HTTP call holds one permit
-# only while urlopen() runs.
+# v0.2.0 F1 (+ TASK-012 §2 fix): process-wide cap on simultaneously
+# ACTIVE HTTP download streams, 16 by default via
+# H3_DRIVE_MAX_GLOBAL_CONNECTIONS (1..64). The semaphore is held from
+# connection establishment until the Response is fully read and
+# closed (see _PermitResponse): a slow stream keeps counting against
+# the cap for as long as it reads. The limit is therefore on active
+# streams, not on connections merely established — the old wording
+# ("one permit only while urlopen() runs") understated it and is
+# corrected here. The cap is shared across every DriveDownloader in
+# this process.
 DEFAULT_MAX_GLOBAL_CONNECTIONS = 16
 _CONNECTION_SEMAPHORE = threading.BoundedSemaphore(
     _env_int("H3_DRIVE_MAX_GLOBAL_CONNECTIONS",
              DEFAULT_MAX_GLOBAL_CONNECTIONS, 1, 64))
 
 
-@contextlib.contextmanager
-def _drive_connection():
-    """Hold one process-wide Drive connection permit. Reads the
-    module-global semaphore at call time so tests can swap it."""
-    _CONNECTION_SEMAPHORE.acquire()
-    try:
-        yield
-    finally:
-        _CONNECTION_SEMAPHORE.release()
+class _PermitResponse:
+    """An HTTP response that holds one process-wide Drive connection
+    permit until it is closed (TASK-012 §2).
+
+    The cap is on simultaneously ACTIVE HTTP download streams: the
+    permit is acquired before urlopen() and released only when the
+    response is closed (or its context exits), so a slow stream keeps
+    counting against the cap of 16 for as long as it reads. Release
+    is idempotent and guarded by a lock, so double close, exception
+    exits, and repeated close calls can never release twice (the
+    semaphore is bounded: a double release would raise) or leak a
+    permit. Callers must use the response as a context manager — all
+    current call sites do — or close it explicitly.
+    """
+
+    __slots__ = ("_resp", "_released", "_lock")
+
+    def __init__(self, resp):
+        self._resp = resp
+        self._released = False
+        self._lock = threading.Lock()
+
+    def close(self):
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        try:
+            close = getattr(self._resp, "close", None)
+            if close is not None:
+                close()
+        finally:
+            _CONNECTION_SEMAPHORE.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __getattr__(self, name):
+        resp = object.__getattribute__(self, "_resp")
+        return getattr(resp, name)
 
 
 def _urlopen(req, timeout):
-    """urlopen behind the global connection semaphore. Tests patch
-    the module-global ``urlopen``; this helper resolves it at call
-    time, so the patch still applies."""
-    with _drive_connection():
-        return urlopen(req, timeout=timeout)
+    """urlopen behind the global connection semaphore. The returned
+    response holds one permit until it is closed (see
+    _PermitResponse). If urlopen() itself raises, the permit is
+    released immediately — a failed connection attempt never leaks
+    one. Tests patch the module-global ``urlopen``; this helper
+    resolves it at call time, so the patch still applies."""
+    _CONNECTION_SEMAPHORE.acquire()
+    try:
+        return _PermitResponse(urlopen(req, timeout=timeout))
+    except BaseException:
+        _CONNECTION_SEMAPHORE.release()
+        raise
 
 
 def resolve_concurrent_workers(explicit: int | None = None) -> int:

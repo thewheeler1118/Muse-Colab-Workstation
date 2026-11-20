@@ -20,6 +20,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -314,6 +315,217 @@ class GlobalCapTest(F1TestBase):
             out = self._download_big(concurrent_workers=12)
         self.assertEqual(Path(out["path"]).read_bytes(), self.CONTENT)
         self.assertLessEqual(self.drive.max_in_flight, 2)
+
+
+class _BlockingResp:
+    """Response whose read() waits until released, so a test can
+    observe whether a permit is still held mid-read."""
+
+    def __init__(self, body=b"hello"):
+        self.status = 200
+        self.headers = {}
+        self._body = body
+        self._off = 0
+        self.entered_read = threading.Event()
+        self.release_read = threading.Event()
+        self.closed = False
+
+    def read(self, n=-1):
+        self.entered_read.set()
+        self.release_read.wait(timeout=10)
+        if n is None or n < 0:
+            chunk, self._off = self._body[self._off:], len(self._body)
+            return chunk
+        chunk = self._body[self._off:self._off + n]
+        self._off += len(chunk)
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class _CountingWrapper:
+    """Wraps a real fake response and counts concurrent read() calls,
+    to prove the cap bounds active streams across Downloaders."""
+
+    def __init__(self, resp, counter):
+        self._resp = resp
+        self._counter = counter
+
+    def read(self, n=-1):
+        with self._counter["lock"]:
+            self._counter["in_flight"] += 1
+            self._counter["max"] = max(
+                self._counter["max"], self._counter["in_flight"])
+        try:
+            time.sleep(0.05)
+            return self._resp.read(n)
+        finally:
+            with self._counter["lock"]:
+                self._counter["in_flight"] -= 1
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _probe_free(sem):
+    """True iff at least one permit is currently available (consumes
+    one and immediately returns it)."""
+    if sem.acquire(blocking=False):
+        sem.release()
+        return True
+    return False
+
+
+class ConnectionPermitLifetimeTest(F1TestBase):
+    """TASK-012 §2: the global cap is on simultaneously ACTIVE HTTP
+    download streams — a permit is held until the Response is read
+    and closed, not just until urlopen() returns."""
+
+    def test_permit_held_during_slow_read(self):
+        sem = threading.BoundedSemaphore(1)
+        resp = _BlockingResp(b"hello")
+        errors = []
+
+        def reader():
+            try:
+                req = urllib.request.Request("https://example.invalid/x")
+                with dd._urlopen(req, 30) as r:
+                    r.read()
+            except Exception as e:  # noqa: BLE001 - surfaced below
+                errors.append(e)
+
+        with patch.object(dd, "_CONNECTION_SEMAPHORE", sem), \
+             patch.object(dd, "urlopen", lambda req, timeout=None: resp):
+            t = threading.Thread(target=reader)
+            t.start()
+            self.assertTrue(resp.entered_read.wait(timeout=10))
+            # Permit still held while the stream is open and reading.
+            self.assertFalse(_probe_free(sem))
+            resp.release_read.set()
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(errors, [])
+            # Permit released after the response closed.
+            self.assertTrue(_probe_free(sem))
+
+    def test_permit_released_on_exception_exit(self):
+        sem = threading.BoundedSemaphore(1)
+        resp = _BlockingResp(b"hello")
+        with patch.object(dd, "_CONNECTION_SEMAPHORE", sem), \
+             patch.object(dd, "urlopen", lambda req, timeout=None: resp):
+            with self.assertRaises(RuntimeError):
+                with dd._urlopen(
+                        urllib.request.Request("https://example.invalid/x"),
+                        30):
+                    raise RuntimeError("boom")
+            self.assertTrue(_probe_free(sem))
+
+    def test_permit_released_when_urlopen_raises(self):
+        sem = threading.BoundedSemaphore(1)
+
+        def boom(request, timeout=None):
+            raise urllib.error.URLError("no route")
+
+        with patch.object(dd, "_CONNECTION_SEMAPHORE", sem), \
+             patch.object(dd, "urlopen", boom):
+            with self.assertRaises(urllib.error.URLError):
+                dd._urlopen(
+                    urllib.request.Request("https://example.invalid/x"), 30)
+            self.assertTrue(_probe_free(sem))
+
+    def test_double_close_releases_once(self):
+        sem = threading.BoundedSemaphore(1)
+        resp = _BlockingResp(b"hello")
+        with patch.object(dd, "_CONNECTION_SEMAPHORE", sem), \
+             patch.object(dd, "urlopen", lambda req, timeout=None: resp):
+            got = dd._urlopen(
+                urllib.request.Request("https://example.invalid/x"), 30)
+            got.close()
+            got.close()  # must not raise, must not double-release
+            self.assertTrue(sem.acquire(blocking=False))
+            # Second acquire fails: the value is 1, not 2.
+            self.assertFalse(sem.acquire(blocking=False))
+            sem.release()
+
+    def test_metadata_request_holds_permit(self):
+        sem = threading.BoundedSemaphore(1)
+        body = json.dumps({
+            "id": self.FILE_ID, "size": "10", "md5Checksum": "",
+            "sha256Checksum": "", "trashed": False}).encode()
+        resp = _BlockingResp(body)
+        errors = []
+
+        def reader():
+            try:
+                self._downloader().get_metadata(self.FILE_ID)
+            except Exception as e:  # noqa: BLE001 - surfaced below
+                errors.append(e)
+
+        with patch.object(dd, "_CONNECTION_SEMAPHORE", sem), \
+             patch.object(dd, "urlopen", lambda req, timeout=None: resp):
+            t = threading.Thread(target=reader)
+            t.start()
+            self.assertTrue(resp.entered_read.wait(timeout=10))
+            self.assertFalse(_probe_free(sem))
+            resp.release_read.set()
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(_probe_free(sem))
+
+    def test_cap_bounds_concurrent_streams_across_downloaders(self):
+        cap = threading.BoundedSemaphore(2)
+        counter = {"lock": threading.Lock(), "in_flight": 0, "max": 0}
+        real_drive = self.drive
+
+        def counting_urlopen(request, timeout=None):
+            return _CountingWrapper(real_drive(request, timeout), counter)
+
+        start = threading.Barrier(3)
+        results = []
+
+        def run_one(i):
+            start.wait(timeout=10)
+            # Each thread needs its own destination: three downloads
+            # sharing one .part/bitmap would clobber each other's
+            # resume state and final rename.
+            dest = Path(self.td) / f"big-{i}.bin"
+            results.append(
+                self._downloader(concurrent_workers=4).download_file(
+                    self.BIG_ID, len(self.CONTENT), sha(self.CONTENT),
+                    dest))
+
+        with patch.object(dd, "_CONNECTION_SEMAPHORE", cap), \
+             patch.object(dd, "urlopen", counting_urlopen):
+            threads = [threading.Thread(target=run_one, args=(i,))
+                       for i in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        self.assertEqual(len(results), 3)
+        for out in results:
+            self.assertEqual(Path(out["path"]).read_bytes(), self.CONTENT)
+        self.assertLessEqual(counter["max"], 2)
+        # All permits released at the end.
+        self.assertTrue(cap.acquire(blocking=False))
+        self.assertTrue(cap.acquire(blocking=False))
+        cap.release()
+        cap.release()
 
 
 class StreamingHashTest(F1TestBase):

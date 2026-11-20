@@ -38,6 +38,24 @@ deletion). Full offline suite: 760 tests, 0 failures. Live GPU
 verification: NOT_VERIFIED (no GPU run under this change).
 
 
+TASK-012 §2 fix (2026-11-20, integration stage): the global
+connection cap is now defined as simultaneously ACTIVE HTTP download
+streams, not connections merely established. `_urlopen` returns a
+`_PermitResponse` that holds one permit from connection
+establishment until the Response is fully read and closed; the
+previous helper released the permit as soon as `urlopen()` returned,
+so a slow stream stopped counting against the cap while still
+reading. The fix covers Range downloads, the single-stream path,
+metadata requests and the probe. Release is idempotent (bounded
+semaphore, lock-guarded), a failed `urlopen()` releases immediately,
+and no code path acquires a second permit while holding one, so no
+deadlock. 429/5xx backoff, token refresh and SHA-256 verification
+are untouched. Tests: new `ConnectionPermitLifetimeTest` (6 tests in
+`tests/test_drive_download_v2.py`): permit held during a slow read,
+released on exception exit, released when `urlopen()` raises,
+double close releases once, metadata request holds its permit, and
+the cap bounds concurrent streams across three Downloaders.
+
 ### F2 — Offline ComfyUI wheelhouse cache (2026-11-20)
 
 Muse-original reimplementation of the upstream v0.2.0 F2 behaviour

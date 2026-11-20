@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 12794,
-      "sha256": "108c8ac46df2a59f0e2a387e9b5a88b05f03a50ac94a3274f32eb400b7c857ad",
+      "size_bytes": 13898,
+      "sha256": "2302ec0a8fe0fd8ec13391e7de8f8ace6f837f00e1fcc9757c42ba23379e64c6",
       "role": "Supporting file"
     },
     {
@@ -462,7 +462,7 @@
     {
       "path": "docs/module_inventory.md",
       "size_bytes": 56294,
-      "sha256": "ed69f0283e8996a2f787cf47e8ecc819ad07a817eb5c49c86a5e3c104c43381e",
+      "sha256": "225487e0896141d4ef67cae2927fbeb5b3e2fc41b26e8b72284d756e4dbdd98f",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -659,8 +659,8 @@
     },
     {
       "path": "h3_drive_download.py",
-      "size_bytes": 56206,
-      "sha256": "b2fd78875920538669fb16a4f760520d1a57f38659c68441ddef237e06c0d95a",
+      "size_bytes": 58018,
+      "sha256": "9aba764a2f3ea7497753cb73b846da3e9dafdabdf983e04fee75f2b1f0328911",
       "role": "Supporting file"
     },
     {
@@ -1091,8 +1091,8 @@
     },
     {
       "path": "tests/test_drive_download_v2.py",
-      "size_bytes": 21025,
-      "sha256": "ff0da3b29fccccfbc1ce31cbcac0159faf4ef41479b677a45a541f5afce4b6be",
+      "size_bytes": 28735,
+      "sha256": "1a2c0307bc1f9fc6a4c74f15ca8627ea84230d8c3f27fe6e3366a33ee71ee46e",
       "role": "Tests"
     },
     {
