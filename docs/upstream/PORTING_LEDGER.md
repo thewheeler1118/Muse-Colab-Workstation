@@ -107,6 +107,16 @@ in any of them.
 | F1 zero-copy high-concurrency Drive download (pwrite + bitmap resume) | PR #4 / `2f3c425` (Issue #3) | `h3_drive_download.py` (preallocated single `.part`, `os.pwrite`, 12 workers, global connection cap 16, ordered streaming SHA-256, `.part.bitmap.json` resume, abort, single-flight refresh); `tests/test_drive_download.py` (constants + retired shard-merge test) | `tests/test_drive_download_v2.py` (17 new tests) | Run 44662119661, 6/6 pass (2026-11-20) | NOT_VERIFIED |
 | F2 offline ComfyUI wheelhouse cache | PR #6 / `fd61ece` (Issue #5) | `h3_comfyui_cache.py` (lazy Drive imports, pure-stdlib helpers, deterministic `comfyui-wheelhouse-<commit>-<pytag>.tar.gz` build/publish/verify, `verify_wheelhouse_on_drive`); `h3_controller.py` (optional `drive_download["wheelhouses"]`) | `tests/test_comfyui_wheelhouse.py` (19 new tests) | CI run pending at PR creation (local suite 763 tests, 0 failures) | NOT_VERIFIED |
 
+## Legacy repository — `LEGACY_REPOSITORY_NOT_ACCESSIBLE`
+
+Recorded 2026-11-20 (user decision, TASK-VERSION-ROADMAP-011
+review): `thewheeler1118/colab-workstation` returns 404 from the
+GitHub API (re-verified 2026-11-20). Recorded as
+`LEGACY_REPOSITORY_NOT_ACCESSIBLE`. No deletion reason is assumed,
+no recovery is attempted, and the old repository is not a
+development source for this project — all work continues from
+`thewheeler1118/Muse-Colab-Workstation` (`61aa33a9` baseline).
+
 ## Security review status key
 
 - `PASS` — reviewed, no issue, with evidence.
