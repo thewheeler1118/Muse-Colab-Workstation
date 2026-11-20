@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## Unreleased — Muse Adapter (Stage 1, TASK-VERSION-ROADMAP-011)
+
+Muse-original adapter layer over the unchanged v0.1.0 production
+core (`adapters/muse/`): TaskSpec mapping, explicit-authorization →
+wrapper args, read-only restart check, redacted status reports, and
+explicit production-dir / task-file location. No production module
+was changed; budget constants (30 / 25 / 0.75 CU, 14400 s) are
+asserted, not redefined. Antigravity compatibility, upstream lock,
+porting ledger and version matrix: `adapters/antigravity/
+COMPATIBILITY.md`, `docs/upstream/UPSTREAM_LOCK.json`,
+`docs/upstream/PORTING_LEDGER.md`,
+`docs/upstream/COMPATIBILITY_MATRIX.md`. License verdict: no license
+was found upstream, so no Antigravity source is copied verbatim;
+porting proceeds as specification + Muse-original reimplementation.
+
 ## v0.1.0 — 2026-11-12 — initial migration (TASK-001, local repo)
 
 Initial private migration of the verified Muse Colab H3 production

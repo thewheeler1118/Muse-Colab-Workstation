@@ -78,6 +78,9 @@ Muse-Colab-Workstation/
 ├── workflows/               # source UI workflow, api copy, JSON schema
 ├── patches/google-colab-cli-0.7.5/   # real diffs vs pristine 0.7.5 wheel
 ├── scripts/                 # preflight / sessions / budget / drive / run / outputs / shutdown
+├── adapters/muse/           # Muse adapter (TaskSpec mapping, explicit authorization, restart check, redaction)
+├── adapters/antigravity/    # upstream compatibility notes (hooks.json is NOT a Muse hook)
+├── docs/upstream/           # UPSTREAM_LOCK.json, PORTING_LEDGER.md, COMPATIBILITY_MATRIX.md
 ├── tests/                   # 8 migrated suites + test_savevideo_history.py + test_config_contract.py
 ├── docs/                    # architecture, execution_flow, module_inventory, code_provenance,
 │                            # runbooks, incidents (24), audits, research, decisions (5), issues (9)
