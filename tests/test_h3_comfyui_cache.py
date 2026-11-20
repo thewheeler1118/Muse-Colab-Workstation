@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 import h3_remote_worker
 from h3_remote_worker import (
-    _LAST_CMD_FAILURE,
+    _cmd_failure_get,
     _sanitize_text,
     clone_comfyui_atomic,
     comfyui_commit,
@@ -64,7 +64,7 @@ class TestGitFailureRecord(unittest.TestCase):
                      "import sys; sys.stderr.write('fatal: boom\\n'); "
                      "raise SystemExit(3)"])
         self.assertEqual(cm.exception.returncode, 3)
-        detail = h3_remote_worker._LAST_CMD_FAILURE
+        detail = _cmd_failure_get()
         self.assertIsNotNone(detail)
         self.assertEqual(detail["returncode"], 3)
         self.assertIn("fatal: boom", detail["stderr"])
@@ -85,9 +85,9 @@ class TestGitFailureRecord(unittest.TestCase):
     def test_last_cmd_failure_clears_on_success(self):
         with self.assertRaises(subprocess.CalledProcessError):
             run_cmd([sys.executable, "-c", "raise SystemExit(1)"])
-        self.assertIsNotNone(h3_remote_worker._LAST_CMD_FAILURE)
+        self.assertIsNotNone(_cmd_failure_get())
         run_cmd([sys.executable, "-c", "pass"])
-        self.assertIsNone(h3_remote_worker._LAST_CMD_FAILURE)
+        self.assertIsNone(_cmd_failure_get())
 
 
 class TestAtomicClone(unittest.TestCase):
@@ -364,6 +364,34 @@ class TestRequirementsCheck(unittest.TestCase):
             bad = Path(d) / "bad.txt"
             bad.write_text("definitely-not-installed-xyz>=1\n")
             self.assertTrue(pip_install_needed(bad))
+
+    def test_headless_optional_packages_are_excluded_not_missing(self):
+        # v0.2.1 P2: headless UI asset packages land in 'excluded',
+        # never in 'missing'; comfyui-frontend-package still counts.
+        with tempfile.TemporaryDirectory() as d:
+            req = Path(d) / "requirements.txt"
+            req.write_text("comfyui-workflow-templates==1.0.0\n"
+                           "comfyui-embedded-docs\n"
+                           "comfyui-workflow-templates-extra>=0.1\n"
+                           "comfyui-frontend-package==1.0\n"
+                           "pip>=1\n")
+            status = log_requirements_status(req)
+            self.assertEqual(status["excluded"], [
+                "comfyui-workflow-templates==1.0.0",
+                "comfyui-embedded-docs",
+                "comfyui-workflow-templates-extra>=0.1",
+            ])
+            self.assertEqual(status["satisfied"], ["pip>=1"])
+            self.assertEqual(status["missing"],
+                             ["comfyui-frontend-package==1.0"])
+            self.assertTrue(pip_install_needed(req))
+
+    def test_only_headless_optional_means_no_pip_needed(self):
+        with tempfile.TemporaryDirectory() as d:
+            req = Path(d) / "requirements.txt"
+            req.write_text("comfyui-workflow-templates==1.0.0\n"
+                           "comfyui-embedded-docs\n")
+            self.assertFalse(pip_install_needed(req))
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ Rules:
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 
 from h3_drive_download import (
@@ -49,6 +50,7 @@ __all__ = [
     "TOKEN_REFRESH_MARGIN_SEC",
     "mint_readonly_token",
     "mint_file_token",
+    "ensure_token_freshness",
     "write_token_file",
     "validate_token_doc",
     "token_id_for",
@@ -114,3 +116,48 @@ def write_token_file(path, token_doc: dict) -> Path:
 def token_fingerprint(token_doc: dict) -> str:
     """Audit-safe identifier for a minted token document."""
     return str(token_doc.get("token_id", ""))
+
+
+def _expiry_to_utc(expiry) -> datetime.datetime | None:
+    if expiry is None:
+        return None
+    if expiry.tzinfo is None:
+        return expiry.replace(tzinfo=datetime.timezone.utc)
+    return expiry.astimezone(datetime.timezone.utc)
+
+
+def ensure_token_freshness(min_remaining_sec: int = 900) -> dict:
+    """Ensure the user ADC has a valid, fresh access token with at least
+    ``min_remaining_sec`` seconds remaining (v0.3.0 M3, 0 CU).
+
+    Silently refreshes via ``creds.refresh(Request())`` when expired,
+    invalid, or within ``min_remaining_sec`` of expiry. Same ADC path
+    and service-account refusal as ``_mint_token``. Never logs or
+    returns raw token material — only ``refreshed``, ``remaining_sec``
+    and ``expires_at_utc``.
+    """
+    import google.auth
+    from google.auth.transport.requests import Request
+
+    creds, _ = google.auth.default(scopes=[READONLY_SCOPE])
+    if getattr(creds, "service_account_email", None):
+        raise RuntimeError(
+            "Service-account credentials do not guarantee same personal "
+            "Drive owner; use user ADC")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expiry_utc = _expiry_to_utc(getattr(creds, "expiry", None))
+    remaining = int((expiry_utc - now).total_seconds()) if expiry_utc is not None else -1
+    refreshed = False
+    if not getattr(creds, "valid", False) or remaining < int(min_remaining_sec):
+        creds.refresh(Request())
+        refreshed = True
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expiry_utc = _expiry_to_utc(getattr(creds, "expiry", None))
+        remaining = int((expiry_utc - now).total_seconds()) if expiry_utc is not None else -1
+    if not getattr(creds, "token", None) or expiry_utc is None:
+        raise RuntimeError("ADC refresh did not yield an access token")
+    return {
+        "refreshed": refreshed,
+        "remaining_sec": max(0, remaining),
+        "expires_at_utc": expiry_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }

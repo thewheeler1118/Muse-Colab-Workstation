@@ -5,13 +5,14 @@ tests and runbooks. The production baseline is the Muse
 Colab H3 controller/worker that renders MiniMax-H3 A/B video on Google
 Colab GPUs from a Drive-hosted model depot.
 
-> Visibility (2026-11-12, verified live): this repo is currently
-> **PUBLIC**. The change to private is blocked — the stored GitHub
-> token lacks the Administration scope (see
-> `TASK-002_SECURITY_CI_PRODUCTION_REMEDIATION.md`). Do not treat the
-> repo as private until the visibility is re-verified.
+> Visibility: this repo is **PUBLIC** — a deliberate, user-approved
+> choice (approved 2026-11-16 for the migration, TASK-MIGRATION-010.1;
+> re-confirmed 2026-11-20 for the v0.3.0 release). The earlier plan to
+> make it private was dropped, not blocked: the token-scope note in
+> `TASK-002_SECURITY_CI_PRODUCTION_REMEDIATION.md` no longer applies.
+> Do not treat the repo as private.
 
-## Status (2026-11-12, v0.1.0 — initial migration + TASK-002 local integration, not yet pushed)
+## Status (2026-11-20, v0.3.0 — integrated engine, PR #18)
 
 - **Variant A: SUCCEEDED** — run `h3-20261112T090027Z-8b07c6` (G4,
   274 frames, A.mp4 7,453,808 B, SHA-256
@@ -22,15 +23,18 @@ Colab GPUs from a Drive-hosted model depot.
   `17tMh9D_a6a1tz0bPgPHZoaAI6YflyS_S`, local MD5 = server MD5
   `77f132fdf32c4a1a3ca1246b54371303`) — verified 2026-11-12 in the H3
   production session, not re-checked inside TASK-002.
-- **Variant B: PENDING RE-RUN** — run `h3-20261112T093207Z-7ab515` was
+- **Variant B: CANCELLED** — run `h3-20261112T093207Z-7ab515` was
   interrupted by a VM restart ~09:48 UTC; the orphan A100 session was
-  stopped and no MP4 was produced.
+  stopped and no MP4 was produced. The B re-run was later cancelled
+  (TASK-007): A/B was a probe, not the system goal, and the generic
+  task engine is the production path.
 - **Budget (task `h3-ab-20261111`)**: baseline 162.77 CU, max observed
   spent 18.58 CU (2026-11-12T09:49 UTC). Per-task independent 30 CU —
   never cumulative (see `docs/decisions/ADR-001.md`).
-- **Tests in this repo**: 224 total.
-  **222 pass, 2 fail** in a clean checkout. The 2 failures are the
-  asset-gated poster tests below — expected, not a regression.
+- **Tests in this repo**: 1048 total (1046 via the CI entry point).
+  **1046 pass, 0 failures** (`python tests/run_ci_tests.py`); the
+  plain discovery shows the same 2 asset-gated poster errors below —
+  expected, not a regression.
 - **No Colab GPU was created, no CU was spent, and no Drive content was
   touched by this migration.**
 
@@ -53,8 +57,8 @@ those two tests with a printed reason. Run the plain discovery locally
 only if the poster asset is present:
 
 ```bash
-python -m unittest discover -s tests -q   # 185 tests, 2 poster-gated errors in a clean checkout
-python tests/run_ci_tests.py               # 183 tests, 0 failures, 2 asset-gated skips
+python -m unittest discover -s tests -q   # 1048 tests, 2 poster-gated errors in a clean checkout
+python tests/run_ci_tests.py               # 1046 tests, 0 failures, 2 asset-gated skips
 ```
 
 ## Layout — flat repo root is deliberate (ADR-003)

@@ -140,6 +140,21 @@ def _metric(k: int, n: int, definition: str,
             "unknown_reason": None}
 
 
+def _percentile(sorted_values: list, q: float) -> float | None:
+    """Linear-interpolation percentile over an already-sorted list
+    (v0.2.0 F5 cold-start latencies). Returns None for an empty list.
+    ``q`` is a fraction in [0, 1]."""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return round(float(sorted_values[0]), 3)
+    pos = q * (len(sorted_values) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = pos - lo
+    return round(float(sorted_values[lo]) + frac * float(sorted_values[hi] - sorted_values[lo]), 3)
+
+
 def _audit_stages(root: Path, run_id: str) -> set[str]:
     try:
         return {e.get("detail", {}).get("to")
@@ -267,6 +282,30 @@ def _expected_frames(manifest: dict) -> int:
     return TOTAL_FRAMES
 
 
+def _has_models_ready_evidence(root: Path, run_id: str,
+                               stages: dict[str, list[str]]) -> bool:
+    """True when durable audit evidence proves models were restored and loaded
+    (v0.2.1 P3): explicit MODELS_READY stage, OR a COLDSTART_METRICS audit
+    event (emitted after ComfyUI /object_info passes), OR monotonic stage
+    progression WORKER_STARTED -> INFERENCE_COMPLETED -> VIDEO_VALIDATED
+    (which can only occur when a fast worker crossed MODELS_READY between
+    60s controller polls)."""
+    if "MODELS_READY" in stages:
+        return True
+    try:
+        if any(e.get("event") == "COLDSTART_METRICS"
+               for e in rm.read_audit_log(root, run_id)):
+            return True
+    except Exception:
+        pass
+    ws = stages.get("WORKER_STARTED")
+    ic = stages.get("INFERENCE_COMPLETED")
+    vv = stages.get("VIDEO_VALIDATED")
+    if ws and ic and vv and ws[0] <= ic[0] <= vv[0]:
+        return True
+    return False
+
+
 def _evaluate_run_f(root: Path, manifest: dict) -> list[str]:
     """Failed F conditions (1-5, 7) for one run; empty = the run meets them."""
     failed: list[str] = []
@@ -275,7 +314,7 @@ def _evaluate_run_f(root: Path, manifest: dict) -> list[str]:
     artifacts = manifest.get("artifacts") or {}
     if not manifest.get("session_id") or "GPU_ALLOCATED" not in stages:
         failed.append("allocation: no session_id or no GPU_ALLOCATED stage")
-    if "MODELS_READY" not in stages:
+    if not _has_models_ready_evidence(root, run_id, stages):
         failed.append("models: no MODELS_READY stage")
     if ("VIDEO_VALIDATED" not in stages
             or not artifacts.get("local_sha256")
@@ -513,10 +552,12 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
     allocated = [m for m in terminal if m.get("session_id")]
     verified_shutdowns = sum(
         1 for m in allocated
-        if "GPU_STOP_CONFIRMED" in _audit_stages(root, m["run_id"]))
+        if m.get("session_state") == "STOPPED"
+        and "GPU_STOP_CONFIRMED" in _audit_stages(root, m["run_id"]))
     metric_d = _metric(
         verified_shutdowns, len(allocated),
-        "GPU_STOP_CONFIRMED in audit log / terminal runs with a session",
+        "GPU_STOP_CONFIRMED in audit log and session_state STOPPED / "
+        "terminal runs with a session",
         unknown_reason="no terminal run in scope allocated a GPU")
 
     e_numerator = 0
@@ -570,12 +611,59 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             f"{metric_b['denominator']} terminal runs; "
             f"the 95% target is not verified.")
 
+    # v0.2.0 F5: cold-start telemetry. A run counts when its manifest
+    # carries a validated coldstart_metrics report. Latencies are
+    # P50/P90 over the reported setup_seconds; the wheelhouse hit rate
+    # is a Wilson rate over the runs that reported wheelhouse_hit
+    # (None means pip was skipped, not a miss — those runs are excluded
+    # from the rate, never counted as failures).
+    cold_reports = [m.get("coldstart_metrics") for m in manifests
+                    if isinstance(m.get("coldstart_metrics"), dict)]
+    setup_seconds = sorted(
+        float(c["setup_seconds"]) for c in cold_reports
+        if isinstance(c.get("setup_seconds"), (int, float)))
+    wheel_hits = [c["wheelhouse_hit"] for c in cold_reports
+                  if isinstance(c.get("wheelhouse_hit"), bool)]
+    if cold_reports:
+        coldstart = {
+            "status": "MEASURED",
+            "runs_with_metrics": len(cold_reports),
+            "setup_seconds_p50": _percentile(setup_seconds, 0.5),
+            "setup_seconds_p90": _percentile(setup_seconds, 0.9),
+            "wheelhouse_hit_rate": _metric(
+                sum(1 for h in wheel_hits if h), len(wheel_hits),
+                "wheelhouse_hit == True / runs reporting wheelhouse_hit",
+                unknown_reason="no run in scope reported wheelhouse_hit"),
+        }
+    else:
+        coldstart = {
+            "status": "UNKNOWN",
+            "runs_with_metrics": 0,
+            "setup_seconds_p50": None,
+            "setup_seconds_p90": None,
+            "wheelhouse_hit_rate": _metric(
+                0, 0, "wheelhouse_hit == True / runs reporting wheelhouse_hit",
+                unknown_reason="no run in scope reported cold-start metrics"),
+        }
+
+    warm_session_hits = sum(
+        1 for m in manifests
+        if (m.get("coldstart_metrics") or {}).get("warm_session_reused") is True
+        or (m.get("artifacts") or {}).get("warm_session_reused") is True
+    )
+    warm_pooled_active_runs = sum(
+        1 for m in manifests
+        if m.get("session_state") == "WARM_POOLED"
+    )
+
     return {
         "root": str(root),
         "sample_scope": {"production_task_id": production_task_id,
                          "since": since, "until": until},
         "sample_size": len(terminal),
         "runs_sampled": len(manifests),
+        "warm_session_hits": warm_session_hits,
+        "warm_pooled_active_runs": warm_pooled_active_runs,
         "observation_dates": [created[0], created[-1]] if created else None,
         "breakdown": {"completed": len(completed), "failed": len(failed),
                       "awaiting_archive": len(awaiting),
@@ -589,6 +677,7 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             "budget_compliance_rate": metric_e,
             "deadline_bound_e2e_success_rate": metric_f,
         },
+        "coldstart": coldstart,
         "target_95_verified": target_verified,
         "target_95_evidence": target_evidence,
         "e_unknown_ledger_runs": sorted(e_unknown_runs),

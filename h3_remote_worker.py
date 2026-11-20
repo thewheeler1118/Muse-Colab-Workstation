@@ -6,7 +6,7 @@ cache manifest.
 Must NOT be considered production-verified until ComfyUI API workflow is exported/validated.
 """
 from __future__ import annotations
-import base64,hashlib,json,os,re,shutil,subprocess,sys,tarfile,tempfile,time,urllib.request,urllib.error,uuid
+import concurrent.futures,hashlib,json,os,re,shutil,subprocess,sys,tarfile,tempfile,threading,time,urllib.request,urllib.error,uuid
 from pathlib import Path
 
 ROOT=Path('/content/muse_h3')
@@ -55,7 +55,12 @@ _JOB_RUN_ID = ""
 _JOB_VARIANT = ""
 # Token id of the last renewal request sent to the controller, so a
 # long download asks once per token instead of on every chunk.
+# v0.2.0 F3: the dual-track setup runs two downloaders on two threads
+# against one provider, so the check-and-set below is serialized by
+# _TOKEN_REFRESH_LOCK — without it two threads expiring at once would
+# both see a stale id and send duplicate requests.
 _LAST_REFRESH_REQUEST_TOKEN_ID = None
+_TOKEN_REFRESH_LOCK = threading.Lock()
 
 
 def _request_token_refresh(provider, scope="drive.readonly") -> None:
@@ -69,9 +74,10 @@ def _request_token_refresh(provider, scope="drive.readonly") -> None:
     global _LAST_REFRESH_REQUEST_TOKEN_ID
     try:
         token_id = provider.token_id if provider is not None else None
-        if token_id is not None and token_id == _LAST_REFRESH_REQUEST_TOKEN_ID:
-            return
-        _LAST_REFRESH_REQUEST_TOKEN_ID = token_id
+        with _TOKEN_REFRESH_LOCK:
+            if token_id is not None and token_id == _LAST_REFRESH_REQUEST_TOKEN_ID:
+                return
+            _LAST_REFRESH_REQUEST_TOKEN_ID = token_id
         if _JOB_RUN_ID and _JOB_VARIANT:
             write_job_state(ROOT, _JOB_RUN_ID, _JOB_VARIANT,
                             WORKER_PHASE_TO_JOB_STAGE.get(_LAST_STAGE, _LAST_STAGE),
@@ -107,22 +113,153 @@ def _sanitize_text(text):
     return re.sub(r'(://[^/\s:]+:)[^/\s@]+@', r'\1***@', text)
 
 
-# Detail of the most recent run_cmd failure, if any. Cleared at the start
-# of every run_cmd call, so it only ever describes the failure that is
-# currently propagating. worker_failure_info merges it into the structured
-# WORKER_FAILED_JSON line, so a Git failure is recorded with its sanitized
-# stdout/stderr, exit code, command stage and exception type in one place.
-_LAST_CMD_FAILURE = None
+# Detail of the most recent run_cmd failure on THIS thread, if any.
+# Cleared at the start of every run_cmd call, so it only ever describes
+# the failure that is currently propagating. worker_failure_info merges
+# it into the structured WORKER_FAILED_JSON line, so a Git failure is
+# recorded with its sanitized stdout/stderr, exit code, command stage
+# and exception type in one place.
+#
+# v0.2.0 F3: this is thread-local, not a module global. The dual-track
+# setup runs two tracks concurrently; a global would let one track's
+# run_cmd clobber the other's record. The failing track's record is
+# snapshotted in its own thread at catch time and carried to the main
+# thread on SetupTrackFailed (see run_setup_parallel); worker_failure_info
+# prefers the record carried on the exception, then this thread's own.
+_CMD_FAILURE_STATE = threading.local()
+
+
+def _cmd_failure_get():
+    return getattr(_CMD_FAILURE_STATE, "record", None)
+
+
+def _cmd_failure_set(record):
+    _CMD_FAILURE_STATE.record = record
 
 
 def worker_failure_info(stage: str, exc: BaseException) -> dict:
     info = {"stage": stage, "error_type": type(exc).__name__, "error": str(exc)[:1500]}
-    if _LAST_CMD_FAILURE:
-        info["cmd_failure"] = _LAST_CMD_FAILURE
+    cmd_failure = getattr(exc, "cmd_failure", None) or _cmd_failure_get()
+    if cmd_failure:
+        info["cmd_failure"] = cmd_failure
     return info
+
+
+class SetupTrackFailed(RuntimeError):
+    """A dual-track setup stage failed (v0.2.0 F3). Carries the failing
+    stage name, the original exception, and that track's command-failure
+    record (snapshotted in the failing thread, so it survives the trip
+    back to the main thread where WORKER_FAILED_JSON is printed)."""
+
+    def __init__(self, stage: str, exc: BaseException, cmd_failure=None):
+        super().__init__(f"setup track failed: {stage}: {exc}")
+        self.stage = stage
+        self.exc = exc
+        self.cmd_failure = cmd_failure
+
+
+class _SetupAborted(RuntimeError):
+    """Raised by the abort-checking progress callback when the shared
+    setup abort event is set (v0.2.0 F3)."""
+
+
+def _abort_progress(on_progress, abort_event):
+    """Wrap a download progress callback so it aborts when the shared
+    setup event is set (v0.2.0 F3).
+
+    The downloader invokes the callback per chunk (single-stream) and
+    per shard report (concurrent path). A raise aborts the concurrent
+    path promptly — the callback error is re-raised after the pool —
+    and exhausts retries on the single-stream path; either way the
+    download stops and the earliest failure (the track that set the
+    event) is the one run_setup_parallel reports. This is deliberately
+    independent of the downloader's abort_event parameter (added on
+    the F1 branch, not yet on main): the callback mechanism works
+    against both downloader versions.
+    """
+    if abort_event is None:
+        return on_progress
+
+    def _checked(done, total_bytes):
+        if abort_event.is_set():
+            raise _SetupAborted("setup aborted: sibling track failed")
+        if on_progress is not None:
+            on_progress(done, total_bytes)
+
+    return _checked
+
+
+# v0.2.0 F5: cold-start metric state. run_setup_parallel records
+# each track's wall time here; _install_requirements records whether
+# the offline wheelhouse was used; restore_weights records per-file
+# reuse/download counts. main() reads them after setup to build the
+# COLDSTART_METRICS_JSON report. All values are timings/counts/flags.
+_SETUP_TRACK_TIMINGS: dict = {}
+_WHEELHOUSE_HIT: bool | None = None
+_RESTORE_COUNTS = {"reused": 0, "downloaded": 0}
+
+
+def run_setup_parallel(tracks, abort_event=None):
+    """Run the setup tracks concurrently (v0.2.0 F3).
+
+    ``tracks`` is a list of ``(stage_name, zero-arg callable)`` — the
+    two setup stages, ``ensure_comfy`` and ``restore_weights``. They run
+    on a ``ThreadPoolExecutor(max_workers=2)`` against the shared
+    ``abort_event``: the first failure sets the event so the surviving
+    track's in-flight Drive download aborts promptly, and the failure
+    is reported with the stage that actually failed.
+
+    Returns None when every track succeeds. Raises SetupTrackFailed for
+    the earliest failure (by catch time; ties break in track order).
+    Both tracks are always awaited before raising, so no track is left
+    running when the caller handles the failure. A surviving track
+    stuck in a step that cannot observe the abort event (pip install,
+    git clone) still runs to its own bounded timeout, exactly as it
+    would on the sequential path — the parallel path never extends a
+    per-operation timeout, it only overlaps the two tracks.
+    """
+    if abort_event is None:
+        abort_event = threading.Event()
+    results = {}
+
+    def _run_one(index, stage, fn):
+        started = time.monotonic()
+        try:
+            fn()
+            results[index] = (stage, None, None, None)
+        except BaseException as e:  # noqa: BLE001 — recorded, re-raised by caller
+            results[index] = (stage, e, _cmd_failure_get(), time.monotonic())
+            abort_event.set()
+        finally:
+            # v0.2.0 F5: per-track wall time for the cold-start report.
+            _SETUP_TRACK_TIMINGS[stage] = round(
+                time.monotonic() - started, 3)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_run_one, i, stage, fn) for i, (stage, fn) in enumerate(tracks)]
+        for f in futures:
+            f.result()
+    failures = [(i, r) for i, r in sorted(results.items()) if r[1] is not None]
+    if failures:
+        # Earliest failure wins (by catch time); ties break in track order.
+        failures.sort(key=lambda item: (item[1][3], item[0]))
+        _, (stage, exc, cmd_failure, _caught_at) = failures[0]
+        raise SetupTrackFailed(stage, exc, cmd_failure)
 
 def require_inside(path:Path, root:Path):
     if not path.resolve().is_relative_to(root.resolve()):raise ValueError('unsafe path')
+
+
+def _lexical_inside(path, root):
+    """Containment for a path whose final component may be a symlink:
+    resolve the parent, then append the name lexically, so an existing
+    link is judged by its own location, not by where it points.
+    (require_inside would follow the link: a correct link points into
+    the NVMe store, outside comfy/models, and would fail the check on
+    every re-link.)"""
+    resolved = Path(path).parent.resolve() / Path(path).name
+    if not resolved.is_relative_to(Path(root).resolve()):
+        raise ValueError('unsafe path')
 
 # 2026-11-11 (item 8): Drive -> Colab 40GB restore capacity detection.
 # The four weights total 40,073,842,159 bytes. The restore copies them from
@@ -188,10 +325,10 @@ def run_cmd(args,timeout=1200,cwd=None):
     of ComfyUI failed with exit 128 and git's own fatal message was lost
     (inherited stdio was not captured by the exec channel), leaving only
     the exit code to diagnose from. The failure detail is also stashed in
-    _LAST_CMD_FAILURE so worker_failure_info carries it in the structured
-    WORKER_FAILED_JSON line (sanitized, truncated)."""
-    global _LAST_CMD_FAILURE
-    _LAST_CMD_FAILURE = None
+    the calling thread's command-failure record so worker_failure_info
+    carries it in the structured WORKER_FAILED_JSON line (sanitized,
+    truncated)."""
+    _cmd_failure_set(None)
     print('STAGE_CMD',args[0],flush=True)
     try:
         proc = subprocess.run(args,cwd=cwd,check=True,timeout=timeout,
@@ -202,12 +339,12 @@ def run_cmd(args,timeout=1200,cwd=None):
             print(proc.stderr,flush=True)
         return proc
     except subprocess.CalledProcessError as e:
-        _LAST_CMD_FAILURE = {
+        _cmd_failure_set({
             "cmd": _sanitize_text(" ".join(str(a) for a in args)),
             "returncode": e.returncode,
             "stdout": _sanitize_text(e.stdout or "")[-2000:],
             "stderr": _sanitize_text(e.stderr or "")[-2000:],
-        }
+        })
         print('CMD_FAILED',args[0],'exit',e.returncode,flush=True)
         if e.stdout:
             print(_sanitize_text(e.stdout),flush=True)
@@ -278,18 +415,61 @@ def _spec_satisfied(version: str, spec: str) -> bool:
     return True
 
 
-def log_requirements_status(requirements_path):
+# v0.2.1 P2: headless-optional ComfyUI UI asset packages (same set as
+# h3_comfyui_cache.HEADLESS_OPTIONAL_*; the worker is self-contained
+# and does not import the cache module). Verified optional in headless
+# API mode by the upstream audit of pinned ComfyUI commit
+# 61e524bdba7a4e193b45c2697f1af83c1beb86d6.
+# comfyui-frontend-package is intentionally NOT excluded
+# (default_frontend_path calls sys.exit(-1) on ImportError).
+HEADLESS_EXCLUDED_PACKAGES = ("comfyui-workflow-templates",
+                              "comfyui-embedded-docs")
+HEADLESS_EXCLUDED_PREFIXES = ("comfyui-workflow-templates-",)
+
+
+def _normalize_pkg_name(name: str) -> str:
+    """PEP 503 normalization (same rule as h3_comfyui_cache)."""
+    return re.sub(r"[-_.]+", "-", str(name).strip()).lower()
+
+
+def _is_headless_optional(normalized_name: str,
+                          excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+                          excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES) -> bool:
+    """True for ComfyUI UI asset packages headless API mode never
+    needs (v0.2.1 P2)."""
+    excl_exact = {_normalize_pkg_name(p) for p in (excluded_packages or ())}
+    if normalized_name in excl_exact:
+        return True
+    return any(normalized_name.startswith(_normalize_pkg_name(p))
+               for p in (excluded_prefixes or ()) if str(p).strip())
+
+
+def log_requirements_status(
+    requirements_path,
+    excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+    excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES,
+):
     """Best-effort, no-network diagnostic: which requirements of the pinned
     ComfyUI tree are already satisfied in this runtime. Never blocks the
     install; on any doubt the entry is 'unknown' and pip runs as before.
-    Returns a dict {satisfied, missing, unknown} (lists of requirement lines)."""
+    Headless-optional packages (verified optional in ComfyUI API mode) are
+    recorded under 'excluded' rather than 'missing'.
+    Returns a dict {satisfied, missing, unknown, excluded} (lists of requirement lines)."""
     from importlib import metadata as _md
-    satisfied, missing, unknown = [], [], []
+    satisfied, missing, unknown, excluded = [], [], [], []
     try:
         for line in Path(requirements_path).read_text().splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
+            head = line.split('#', 1)[0].split(';', 1)[0].strip()
+            m_name = re.match(r'^([A-Za-z0-9][A-Za-z0-9_.\-]*)', head)
+            if m_name:
+                norm = _normalize_pkg_name(m_name.group(1))
+                if _is_headless_optional(norm, excluded_packages,
+                                         excluded_prefixes):
+                    excluded.append(line)
+                    continue
             m = re.match(r'^([A-Za-z0-9_.\-]+)\s*(.*)$', line)
             if not m:
                 unknown.append(line)
@@ -306,17 +486,26 @@ def log_requirements_status(requirements_path):
                 missing.append(line + ' (installed ' + installed + ')')
     except Exception as e:
         print('REQUIREMENTS_CHECK_UNAVAILABLE', type(e).__name__, str(e)[:200], flush=True)
-        return {"satisfied": [], "missing": [], "unknown": ["check failed"]}
-    status = {"satisfied": satisfied, "missing": missing, "unknown": unknown}
+        return {"satisfied": [], "missing": [], "unknown": ["check failed"], "excluded": []}
+    status = {"satisfied": satisfied, "missing": missing, "unknown": unknown, "excluded": excluded}
     print('REQUIREMENTS_STATUS', json.dumps(status, ensure_ascii=False), flush=True)
     return status
 
 
-def pip_install_needed(requirements_path):
+def pip_install_needed(
+    requirements_path,
+    excluded_packages=HEADLESS_EXCLUDED_PACKAGES,
+    excluded_prefixes=HEADLESS_EXCLUDED_PREFIXES,
+):
     """True unless the requirements check ran cleanly (no unknowns) and
-    nothing is missing. Skipping pip then is equivalent to running it:
-    pip would install nothing new. Any doubt -> run pip as before."""
-    status = log_requirements_status(requirements_path)
+    nothing is missing (excluding headless-optional packages). Skipping pip
+    then is equivalent to running it: pip would install nothing needed.
+    Any doubt -> run pip as before."""
+    status = log_requirements_status(
+        requirements_path,
+        excluded_packages=excluded_packages,
+        excluded_prefixes=excluded_prefixes,
+    )
     return bool(status["missing"] or status["unknown"])
 
 
@@ -529,7 +718,345 @@ def post_json(url,data,timeout=30):
         except Exception:body=''
         raise RuntimeError(f'POST {url} failed HTTP {e.code}: {body[:2000]}') from e
 
-def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_provider=None):
+# ---- v0.2.0 F3: offline wheelhouse install (worker side) ----
+# F2 (controller) publishes a deterministic wheelhouse bundle to Drive
+# and passes its descriptor through drive_download["wheelhouses"] as a
+# one-entry list {file_id, size, sha256, archive, commit, python_tag}.
+# This section consumes that entry: download the archive with the same
+# DriveDownloader transport as the model restore, extract it with
+# tar-member validation, verify WHEELHOUSE_META.json against the entry,
+# and install with pip --no-index --find-links. Any failure of the
+# offline path falls back to the plain PyPI install and emits the
+# structured WHEELHOUSE_FALLBACK_PYPI event; the fallback itself never
+# fails the run — a failed plain install still raises (fail closed).
+WHEELHOUSE_META_NAME = "WHEELHOUSE_META.json"
+WHEELHOUSE_DIR_IN_ARCHIVE = "wheelhouse"
+# Generous cap on total extracted bytes: a published bundle is a few
+# hundred MB; anything larger is not a wheelhouse.
+_WHEELHOUSE_MAX_EXTRACT_BYTES = 2 * 1024 ** 3
+
+
+def _runtime_python_tag() -> str:
+    return f"py{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _select_wheelhouse_entry(drive_download):
+    """Pick the wheelhouse entry for this runtime, or None.
+
+    Returns (entry, reason): entry is the first entry whose python_tag
+    matches this interpreter; reason explains a skip (None when an
+    entry was selected). An entry without a python_tag is treated as
+    unusable — the tag is the only guard against installing wheels
+    built for another interpreter."""
+    entries = (drive_download or {}).get("wheelhouses") or []
+    if not entries:
+        return None, "no wheelhouse entry"
+    tag = _runtime_python_tag()
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("python_tag") == tag:
+            return entry, None
+    return None, f"no wheelhouse entry for {tag}"
+
+
+def _safe_extract_tar(archive_path, dest_dir):
+    """Extract a .tar.gz into dest_dir, rejecting unsafe members.
+
+    Absolute paths, ``..`` components, symlinks, hardlinks, device
+    nodes and anything escaping dest_dir are refused. Total extracted
+    size is capped. Raises on the first bad member; nothing is left
+    half-extracted (the caller removes dest_dir on failure)."""
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with tarfile.open(archive_path, "r:gz") as tf:
+        members = tf.getmembers()
+        for m in members:
+            if m.issym() or m.islnk() or m.isdev():
+                raise ValueError(f"unsafe tar member (link/device): {m.name}")
+            name = m.name.replace("\\", "/")
+            if name.startswith("/") or name.startswith("~"):
+                raise ValueError(f"unsafe tar member (absolute path): {m.name}")
+            parts = [p for p in name.split("/") if p not in ("", ".")]
+            if ".." in parts:
+                raise ValueError(f"unsafe tar member (traversal): {m.name}")
+            target = (dest / "/".join(parts)).resolve()
+            if not str(target).startswith(str(dest.resolve()) + os.sep) and target != dest.resolve():
+                raise ValueError(f"unsafe tar member (escapes dest): {m.name}")
+            total += m.size
+            if total > _WHEELHOUSE_MAX_EXTRACT_BYTES:
+                raise ValueError("wheelhouse extraction exceeds size cap")
+        tf.extractall(dest)
+
+
+def _download_and_prepare_wheelhouse(entry, token_provider, abort_event=None):
+    """Download a wheelhouse archive from Drive, extract and verify it.
+
+    Returns the directory holding the wheels (the extracted
+    ``wheelhouse/`` subdir). Raises on any problem; the caller falls
+    back to PyPI. The archive's WHEELHOUSE_META.json must agree with
+    the entry on ``commit`` and ``python_tag``."""
+    if token_provider is None:
+        raise RuntimeError("wheelhouse download requested but no token provider supplied")
+    from h3_drive_download import DriveDownloader
+
+    archive = entry.get("archive") or "comfyui-wheelhouse.tar.gz"
+    dl_dir = ROOT / "drive_downloads"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = dl_dir / archive
+    downloader = DriveDownloader(token_provider)
+    downloader.download_file(
+        entry["file_id"], int(entry["size"]), entry["sha256"], archive_path,
+        on_progress=_abort_progress(None, abort_event),
+        on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
+    extract_dir = ROOT / "wheelhouse"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    try:
+        _safe_extract_tar(archive_path, extract_dir)
+    except Exception:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise
+    meta_path = extract_dir / WHEELHOUSE_DIR_IN_ARCHIVE / WHEELHOUSE_META_NAME
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError(f"wheelhouse META unreadable: {type(e).__name__}") from e
+    if not isinstance(meta, dict) or meta.get("commit") != entry.get("commit"):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError("wheelhouse META commit does not match the download entry")
+    if entry.get("python_tag") and meta.get("python_tag") != entry.get("python_tag"):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError("wheelhouse META python_tag does not match the download entry")
+    wheels_dir = extract_dir / WHEELHOUSE_DIR_IN_ARCHIVE
+    if not wheels_dir.is_dir():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError("wheelhouse archive has no wheel directory")
+    print("WHEELHOUSE_VERIFIED", entry.get("archive"), meta.get("python_tag"), flush=True)
+    return wheels_dir
+
+
+def _filter_requirements_for_wheelhouse(requirements) -> Path:
+    """Write the requirements minus headless-optional packages (v0.2.1
+    P2) next to the original file and return its path. The offline
+    wheelhouse install must not ask pip for packages that are neither
+    installed nor in the bundle, or --no-index fails and the install
+    silently falls back to PyPI. The plain-PyPI fallback always uses
+    the original file."""
+    requirements = Path(requirements)
+    filtered = requirements.with_name("wheelhouse_requirements.txt")
+    kept = []
+    for line in requirements.read_text(encoding="utf-8").splitlines():
+        text = line.split("#", 1)[0].strip()
+        if not text or text.startswith("-"):
+            continue
+        m_name = re.match(r"^([A-Za-z0-9][A-Za-z0-9_.\-]*)", text)
+        if m_name and _is_headless_optional(
+                _normalize_pkg_name(m_name.group(1))):
+            continue
+        kept.append(text)
+    filtered.write_text("\n".join(kept) + ("\n" if kept else ""),
+                        encoding="utf-8")
+    return filtered
+
+
+def _install_requirements(requirements, drive_download=None, token_provider=None, abort_event=None):
+    """Install requirements, preferring the offline wheelhouse (F3).
+
+    Plain PyPI install when there is no usable wheelhouse entry.
+    Offline install failure (download, extract, verify, or pip) falls
+    back to plain PyPI and emits WHEELHOUSE_FALLBACK_PYPI with the
+    reason; the plain install's own failure still raises. The offline
+    path installs a filtered requirements file (v0.2.1 P2) without the
+    headless-optional packages that are neither installed nor in the
+    bundle; the PyPI fallback uses the original file."""
+    global _WHEELHOUSE_HIT
+    entry, reason = _select_wheelhouse_entry(drive_download)
+    if entry is None:
+        if (drive_download or {}).get("wheelhouses"):
+            print("WHEELHOUSE_FALLBACK_PYPI",
+                  json.dumps({"reason": reason, "archive": None}, ensure_ascii=False), flush=True)
+        # v0.2.0 F5: no usable wheelhouse entry — plain PyPI.
+        _WHEELHOUSE_HIT = False
+        run_cmd([sys.executable, "-m", "pip", "install", "-r", str(requirements)], timeout=1200)
+        return
+    try:
+        wheels_dir = _download_and_prepare_wheelhouse(entry, token_provider, abort_event=abort_event)
+        filtered = _filter_requirements_for_wheelhouse(requirements)
+        run_cmd([sys.executable, "-m", "pip", "install", "--no-index",
+                 "--find-links", str(wheels_dir), "-r", str(filtered)], timeout=1200)
+    except Exception as e:
+        print("WHEELHOUSE_FALLBACK_PYPI",
+              json.dumps({"reason": f"{type(e).__name__}: {str(e)[:300]}",
+                          "archive": entry.get("archive")}, ensure_ascii=False), flush=True)
+        # v0.2.0 F5: offline path failed, fell back to plain PyPI.
+        _WHEELHOUSE_HIT = False
+        run_cmd([sys.executable, "-m", "pip", "install", "-r", str(requirements)], timeout=1200)
+        return
+    # v0.2.0 F5: the offline wheelhouse served this install.
+    _WHEELHOUSE_HIT = True
+    print("WHEELHOUSE_INSTALL_OK", entry.get("archive"), flush=True)
+
+
+# v0.2.0 F4: independent NVMe model store + high-VRAM flags.
+# The model store is the single home for verified weights; ComfyUI
+# only ever sees symlinks into it. A re-run reuses the store instead
+# of re-downloading, and a ComfyUI reinstall never touches the
+# weights. The link step is the only place that writes into
+# comfy/models for weights.
+NVME_MODELS_DIR_DEFAULT = Path('/content/nvme_models/h3')
+HIGH_VRAM_THRESHOLD_MIB = 76800
+HIGH_VRAM_FLAGS = ('--highvram', '--disable-mmap')
+
+
+def build_coldstart_metrics(setup_started: float, vram_mib=None, *,
+                            warm_session_reused: bool = False) -> dict:
+    """Assemble the v0.2.0 F5 cold-start report from the module-global
+    recordings (per-track wall times, wheelhouse hit, restore counts).
+    Only timings, counts, flags and the detected VRAM — never tokens,
+    paths, or credentials. ``setup_started`` is the monotonic time the
+    parallel setup began; per-track times come from
+    ``_SETUP_TRACK_TIMINGS`` (missing when a track never ran). When
+    ``warm_session_reused`` is True (v0.3.0 M4), the report carries
+    ``"warm_session_reused": True``; when False, the key set is the
+    exact v0.2.0 one."""
+    payload = {
+        "setup_seconds": round(time.monotonic() - setup_started, 3),
+        "comfy_install_seconds": _SETUP_TRACK_TIMINGS.get("ensure_comfy"),
+        "restore_seconds": _SETUP_TRACK_TIMINGS.get("restore_weights"),
+        "wheelhouse_hit": _WHEELHOUSE_HIT,
+        "models_reused": _RESTORE_COUNTS["reused"],
+        "models_downloaded": _RESTORE_COUNTS["downloaded"],
+        "vram_mib": vram_mib,
+    }
+    if warm_session_reused:
+        payload["warm_session_reused"] = True
+    return payload
+
+
+def emit_coldstart_metrics(setup_started: float, run_id: str, variant: str,
+                           vram_mib=None, *,
+                           warm_session_reused: bool = False) -> dict:
+    """Print ``COLDSTART_METRICS_JSON`` and persist the same report in
+    the job state, so the controller can read it on its next poll.
+    Returns the metrics dict. Never raises for a bookkeeping failure:
+    a metrics write must not kill a worker whose setup succeeded."""
+    metrics = build_coldstart_metrics(setup_started, vram_mib=vram_mib,
+                                      warm_session_reused=warm_session_reused)
+    try:
+        print("COLDSTART_METRICS_JSON", json.dumps(metrics, ensure_ascii=False), flush=True)
+        write_job_state(ROOT, run_id, variant, _LAST_STAGE or "restore_weights",
+                        extra={"coldstart_metrics": metrics})
+    except Exception as e:  # noqa: BLE001 — observability only
+        print("COLDSTART_METRICS_UNAVAILABLE", type(e).__name__, flush=True)
+    return metrics
+
+
+def nvme_models_dir() -> Path:
+    """The model store directory: H3_NVME_MODELS_DIR wins, else the
+    /content/nvme_models/h3 default. Never raises."""
+    override = os.environ.get('H3_NVME_MODELS_DIR', '').strip()
+    return Path(override) if override else NVME_MODELS_DIR_DEFAULT
+
+
+def detect_gpu_vram_mib() -> int | None:
+    """Total VRAM in MiB via nvidia-smi, or None when there is no GPU,
+    no nvidia-smi, or the output does not parse. A probe failure is
+    never a run failure: the caller falls back to no extra flags."""
+    try:
+        proc = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total',
+             '--format=csv,noheader,nounits'],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=30)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip().splitlines()[0].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+def comfy_vram_flags(vram_mib=None) -> list:
+    """ComfyUI launch flags for this GPU. H3_COMFY_VRAM_FLAGS wins
+    (split on whitespace; empty means no flags). Otherwise
+    --highvram --disable-mmap when VRAM >= 76800 MiB, else none."""
+    override = os.environ.get('H3_COMFY_VRAM_FLAGS')
+    if override is not None:
+        return override.split()
+    if vram_mib is None:
+        vram_mib = detect_gpu_vram_mib()
+    if vram_mib is not None and vram_mib >= HIGH_VRAM_THRESHOLD_MIB:
+        return list(HIGH_VRAM_FLAGS)
+    return []
+
+
+def link_models_into_comfy(nvme_dir, comfy, manifest, verify=True):
+    """Atomically symlink verified weights from the NVMe store into
+    comfy/models (v0.2.0 F4).
+
+    For each manifest file the store file is nvme_dir/relative. It
+    must resolve inside the store (require_inside), exist, be a
+    regular readable file, and match the pinned size — and the pinned
+    SHA-256 when verify=True. The link is created via a temp symlink
+    + os.replace, so a reader never sees a half-made link.
+
+    Policy for what is already at the destination: a link already
+    pointing at the right store file is left alone (idempotent); a
+    real file with the right size and SHA-256 is left alone too (an
+    earlier restore wrote real files); a stale link is atomically
+    replaced (the store is the source of truth); a real file with
+    wrong content fails closed instead of being silently replaced.
+
+    verify=False is only for callers that verified every store file
+    in this same run (restore_weights does: its reuse check hashes
+    the store file, and the downloader verifies what it writes).
+    Standalone callers must leave verify on.
+    """
+    validate_model_cache_manifest(manifest)
+    nvme_dir = Path(nvme_dir)
+    models_dir = Path(comfy) / 'models'
+    for item in manifest['files']:
+        relative = Path(item['path'])
+        store_file = nvme_dir / relative
+        require_inside(store_file, nvme_dir)
+        if not store_file.is_file():
+            raise RuntimeError('NVMe store missing model: ' + str(store_file))
+        if not os.access(store_file, os.R_OK):
+            raise RuntimeError('NVMe store model unreadable: ' + str(store_file))
+        if store_file.stat().st_size != int(item['size']):
+            raise RuntimeError('NVMe store model size mismatch: ' + str(store_file))
+        if verify and sha256_file(store_file) != item['sha256']:
+            raise RuntimeError('NVMe store model checksum mismatch: ' + str(store_file))
+        dst = models_dir / relative
+        _lexical_inside(dst, models_dir)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink():
+            if os.readlink(dst) == str(store_file):
+                print('NVME_LINK_REUSED', relative, flush=True)
+                continue
+            print('NVME_LINK_REPLACED', relative, flush=True)
+        elif dst.exists():
+            if dst.stat().st_size == int(item['size']) and sha256_file(dst) == item['sha256']:
+                print('NVME_LINK_REUSED', relative, flush=True)
+                continue
+            raise RuntimeError('comfy/models holds a real file with wrong content: ' + str(dst))
+        tmp_link = dst.with_name(dst.name + '.link-tmp')
+        try:
+            if tmp_link.is_symlink() or tmp_link.exists():
+                tmp_link.unlink()
+            os.symlink(str(store_file), tmp_link)
+            os.replace(tmp_link, dst)
+        except BaseException:
+            if tmp_link.is_symlink() or tmp_link.exists():
+                tmp_link.unlink()
+            raise
+        print('NVME_LINKED', relative, flush=True)
+
+
+def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_provider=None,abort_event=None):
     """Install the pinned ComfyUI source, then its Python dependencies.
 
     Order: (1) already-installed pinned commit -> reuse; (2) Drive source
@@ -548,7 +1075,11 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
     transport as the model restore) into a local directory first, and
     restore_comfyui_from_cache verifies it exactly as it verified the
     mounted-cache archive. A download failure is a cache failure and
-    falls through to git clone, as before."""
+    falls through to git clone, as before.
+
+    v0.2.0 F3: dependency install prefers the offline wheelhouse (see
+    _install_requirements) and the Drive download observes the shared
+    abort_event, so a failing sibling track stops this one promptly."""
     if not git_ref:
         raise RuntimeError('No pinned ComfyUI commit/ref in manifest; refuse moving main')
     if (comfy/'.git').exists() and verify_comfyui_commit(comfy, git_ref):
@@ -564,6 +1095,7 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
                 downloader.download_file(
                     entry['file_id'], int(entry['size']), entry['sha256'],
                     dl_dir / entry['archive'],
+                    on_progress=_abort_progress(None, abort_event),
                     on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
                 restore_comfyui_from_cache(
                     dl_dir, comfy, entry['sha256'], entry['commit'],
@@ -581,6 +1113,8 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
                 # Keep the original error on the record; fall through to git.
                 print('COMFYUI_CACHE_FAILED', type(e).__name__, str(e)[:500], flush=True)
         if not restored:
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError('setup aborted: sibling track failed before ComfyUI clone')
             clone_comfyui_atomic(comfy, git_ref)
     installed = comfyui_commit(comfy)
     if installed != git_ref:
@@ -588,12 +1122,18 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
     print('COMFY_REF', installed, flush=True)
     requirements = comfy / 'requirements.txt'
     if pip_install_needed(requirements):
-        run_cmd([sys.executable,'-m','pip','install','-r',str(requirements)],timeout=1200)
+        _install_requirements(requirements, drive_download=drive_download,
+                              token_provider=token_provider, abort_event=abort_event)
     else:
         print('PIP_INSTALL_SKIPPED', 'all requirements already satisfied', flush=True)
 
-def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu=None,drive_download=None,token_provider=None):
+def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu=None,drive_download=None,token_provider=None,abort_event=None,nvme_dir=None):
     validate_model_cache_manifest(manifest)
+    # v0.2.0 F3: a sibling track that already failed aborts this one
+    # before any expensive check runs, so its failure is not masked by
+    # a capacity or download error raised here.
+    if abort_event is not None and abort_event.is_set():
+        raise RuntimeError('setup aborted: sibling track failed before weight restore')
     # TASK-006 P0-B: noninteractive download path. Each model file is
     # downloaded straight to its NVMe destination with Range resume and
     # a full SHA-256 verify inside the downloader; the existing
@@ -609,12 +1149,19 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
         downloader = DriveDownloader(token_provider)
         files = drive_download.get('files') or []
         by_path = {entry['path']: entry for entry in files}
+        # v0.2.0 F4: weights live in the NVMe store; comfy/models only
+        # ever sees symlinks into it (link step below). nvme_dir is an
+        # explicit parameter so tests can isolate the store; None means
+        # the env/default store from nvme_models_dir().
+        store = Path(nvme_dir) if nvme_dir is not None else nvme_models_dir()
+        store.mkdir(parents=True, exist_ok=True)
         projected = [False]
         for item in manifest['files']:
             relative=Path(item['path'])
-            dst=comfy/'models'/relative
+            dst=store/relative
             dst.parent.mkdir(parents=True,exist_ok=True)
             if dst.exists() and dst.stat().st_size==item['size'] and sha256_file(dst)==item['sha256']:
+                _RESTORE_COUNTS["reused"] += 1
                 print('CACHE_REUSE',relative,flush=True);continue
             entry = by_path.get(item['path'])
             if not entry or not entry.get('file_id'):
@@ -628,25 +1175,39 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
             downloader.download_file(
                 entry['file_id'], int(item['size']), item['sha256'], dst,
                 expected_md5=item.get('server_md5'),
-                on_progress=lambda done, total_bytes, rel=relative: _download_progress(
-                    rel, done, total, copy_start, projected, rate_cu_h, budget_cu,
-                    next_milestone),
+                on_progress=_abort_progress(
+                    lambda done, total_bytes, rel=relative: _download_progress(
+                        rel, done, total, copy_start, projected, rate_cu_h, budget_cu,
+                        next_milestone),
+                    abort_event),
                 on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
+            _RESTORE_COUNTS["downloaded"] += 1
             print('CACHE_VERIFIED_NVME',relative,flush=True)
+        # Every store file was verified in this run (reuse-check hash
+        # or the downloader's streaming SHA-256), so the link step
+        # runs with verify=False under its documented contract.
+        link_models_into_comfy(store, comfy, manifest, verify=False)
         return
     if not cache.is_dir():raise RuntimeError('Drive cache not mounted. OAuth/mount MUST be handled interactively before worker.')
     total=int(sum(int(x['size']) for x in manifest['files']))
     check_restore_capacity(comfy,total,rate_cu_h=rate_cu_h,budget_cu=budget_cu)
+    # v0.2.0 F4: weights live in the NVMe store; comfy/models only
+    # ever sees symlinks into it (link step below).
+    store = Path(nvme_dir) if nvme_dir is not None else nvme_models_dir()
+    store.mkdir(parents=True, exist_ok=True)
     projected=False
     for item in manifest['files']:
+        if abort_event is not None and abort_event.is_set():
+            raise RuntimeError('setup aborted: sibling track failed during weight restore')
         relative=Path(item['path'])
         src=cache/relative
         require_inside(src,cache)
         if not src.is_file() or src.stat().st_size!=item['size']:
             raise RuntimeError('Drive cache absent/incomplete: '+str(src))
-        dst=comfy/'models'/relative
+        dst=store/relative
         dst.parent.mkdir(parents=True,exist_ok=True)
         if dst.exists() and dst.stat().st_size==item['size'] and sha256_file(dst)==item['sha256']:
+            _RESTORE_COUNTS["reused"] += 1
             print('CACHE_REUSE',relative,flush=True);continue
         tmp=dst.with_name(dst.name+'.part')
         try:
@@ -666,7 +1227,12 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
             tmp.replace(dst)
         finally:
             if tmp.exists():tmp.unlink()
+        _RESTORE_COUNTS["downloaded"] += 1
         print('CACHE_VERIFIED_NVME',relative,flush=True)
+    # Every store file was verified in this run (copy-time SHA-256),
+    # so the link step runs with verify=False under its documented
+    # contract.
+    link_models_into_comfy(store, comfy, manifest, verify=False)
 
 
 def _download_progress(relative, done, grand_total, copy_start, projected, rate_cu_h, budget_cu, next_milestone=None):
@@ -701,6 +1267,80 @@ def wait_health(server, proc,deadline):
         except (urllib.error.URLError,TimeoutError,ConnectionError):pass
         time.sleep(4)
     raise TimeoutError('ComfyUI /object_info start timeout')
+
+
+def check_warm_comfy_alive(server: str, timeout: float = 5.0) -> dict | None:
+    """Check whether a resident ComfyUI server on ``server`` is alive and
+    exposes all required MiniMax-H3 nodes (v0.3.0 M4). Returns the parsed
+    ``/object_info`` dict when healthy, or ``None`` otherwise."""
+    try:
+        info = get_json(server.rstrip("/") + "/object_info", timeout=timeout)
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    for typ in ("MiniMaxH3ReferenceToVideo", "SaveVideo", "UNETLoader", "CLIPLoader"):
+        if typ not in info:
+            return None
+    return info
+
+
+def _all_models_present_in_comfy(comfy: Path, manifest: dict) -> bool:
+    """True when all pinned model files from ``manifest`` are present and
+    match their expected byte size under ``comfy / 'models'`` (v0.3.0 M4).
+    Size-only: the files were SHA-256 verified when linked into the store
+    (F4); a size match here proves the resident tree is intact."""
+    files = manifest.get("files") or []
+    if len(files) < 4:
+        return False
+    models_dir = comfy / "models"
+    for item in files:
+        rel = item.get("path")
+        expected_size = item.get("size")
+        if not rel or expected_size is None:
+            return False
+        target = models_dir / rel
+        try:
+            if not target.is_file() or target.stat().st_size != int(expected_size):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _cleanup_ephemeral_tokens(root: Path) -> None:
+    """Best-effort delete ephemeral Drive token files after a warm run
+    (v0.3.0 M4): the pooled session must never keep a live token on disk
+    past the run that minted it."""
+    for pattern in ("drive_token*.json", "drive_upload_token.json"):
+        for tok in root.glob(pattern):
+            try:
+                tok.unlink()
+            except OSError:
+                pass
+
+
+def _terminate_comfy_pid(root: Path) -> None:
+    """Terminate a persisted ComfyUI PID from ``root / 'comfyui.pid'``
+    (v0.3.0 M4). Best-effort; the pid file is always unlinked."""
+    import signal
+
+    pid_file = root / "comfyui.pid"
+    if not pid_file.is_file():
+        return
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        pid = None
+    if pid is not None and pid > 1:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        pid_file.unlink()
+    except OSError:
+        pass
 
 # Control-after-generate modes, serialized by the frontend as extra input
 # keys on primitive nodes (e.g. PrimitiveInt {"value": 20, "fixed": "fixed"}).
@@ -1004,12 +1644,16 @@ def rescue_rendered_video(comfy, run_id, variant, remaining_budget_seconds, prob
     raise RuntimeError(f'Rescue found no verifiable video for run {run_id} variant {variant} '
                        f'(scanned {len(matches)} name-matching files)')
 
-def _md5_b64(path) -> str:
+def _md5_hex(path) -> str:
+    """Return 32-char lowercase hex MD5 matching Google Drive API v3
+    md5Checksum (v0.2.1 P1). The previous base64 form only ever
+    matched after the upload verifier's normalization; emitting hex
+    directly removes the mismatch class entirely."""
     h = hashlib.md5()
     with open(path, "rb") as fp:
         for chunk in iter(lambda: fp.read(4 * 1024 * 1024), b""):
             h.update(chunk)
-    return base64.b64encode(h.digest()).decode("ascii")
+    return h.hexdigest().lower()
 
 
 def validate_assembled_mp4(final, info, spec=None) -> dict:
@@ -1054,7 +1698,7 @@ def validate_assembled_mp4(final, info, spec=None) -> dict:
     sha = sha256_file(final)
     if info.get("sha256") and sha.lower() != str(info["sha256"]).lower():
         raise ValueError("assembled MP4 SHA-256 does not match assemble info")
-    return {"sha256": sha, "md5": _md5_b64(final), "frames": frames}
+    return {"sha256": sha, "md5": _md5_hex(final), "frames": frames}
 
 
 def upload_remote_archive(final, info, task, run_id, version, spec=None):
@@ -1153,24 +1797,80 @@ def main():
     proc=None
     object_info=None
     api=None
+    run_succeeded=False
+    keep_warm_ttl_sec=int(task.get('keep_warm_ttl_sec') or 0)
     try:
         # The whole body is inside the try now: 2026-11-12 the worker died
         # in ensure_comfy (git clone exit 128) BEFORE the old try block,
         # so no WORKER_FAILED_JSON was printed and the stage had to be
         # inferred from the persisted traceback instead.
-        set_stage('ensure_comfy')
-        ensure_comfy(comfy,task['comfy_ref'],task.get('comfyui_cache'),drive_download=drive_download,token_provider=token_provider)
-        set_stage('restore_weights')
-        restore_weights(comfy,cache,manifest,rate_cu_h=task.get('rate_cu_h'),budget_cu=task.get('session_budget_cu'),drive_download=drive_download,token_provider=token_provider)
-        (comfy/'input').mkdir(exist_ok=True)
-        shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
-        shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
-        set_stage('comfyui_start')
-        proc=subprocess.Popen([sys.executable,'main.py','--listen','127.0.0.1','--port','8188'],cwd=comfy,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
-        set_stage('object_info_validation')
-        object_info=wait_health(server,proc,time.monotonic()+180)
-        info=object_info
-        print('COMFYUI_HEALTH_OK',flush=True)
+        # v0.2.0 F3: the two setup stages run concurrently on two
+        # threads against one shared token provider and abort event.
+        # A failure names its own stage: run_setup_parallel raises
+        # SetupTrackFailed, the stage is recorded, and the outer
+        # handler prints WORKER_FAILED_JSON with that stage plus the
+        # failing track's command record.
+        set_stage('setup_parallel')
+        setup_started = time.monotonic()
+        setup_abort = threading.Event()
+        # v0.3.0 M4: check whether a warm resident ComfyUI server is already
+        # running with the exact pinned commit and all 4 model files intact.
+        warm_object_info = check_warm_comfy_alive(server)
+        warm_reused = (
+            warm_object_info is not None
+            and comfyui_commit(comfy) == task['comfy_ref']
+            and _all_models_present_in_comfy(comfy, manifest)
+        )
+        if warm_reused:
+            print('WARM_SESSION_REUSED', task['comfy_ref'], flush=True)
+            (comfy/'input').mkdir(exist_ok=True)
+            shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
+            shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
+            set_stage('object_info_validation')
+            object_info=warm_object_info
+            info=object_info
+            vram_mib = detect_gpu_vram_mib()
+            vram_flags = comfy_vram_flags(vram_mib)
+            print('COMFY_VRAM_FLAGS', ' '.join(vram_flags) or '(none)', flush=True)
+            emit_coldstart_metrics(setup_started, _JOB_RUN_ID, _JOB_VARIANT,
+                                   vram_mib=vram_mib, warm_session_reused=True)
+            print('COMFYUI_HEALTH_OK',flush=True)
+        else:
+            try:
+                run_setup_parallel([
+                    ('ensure_comfy', lambda: ensure_comfy(
+                        comfy, task['comfy_ref'], task.get('comfyui_cache'),
+                        drive_download=drive_download, token_provider=token_provider,
+                        abort_event=setup_abort)),
+                    ('restore_weights', lambda: restore_weights(
+                        comfy, cache, manifest, rate_cu_h=task.get('rate_cu_h'),
+                        budget_cu=task.get('session_budget_cu'),
+                        drive_download=drive_download, token_provider=token_provider,
+                        abort_event=setup_abort)),
+                ], abort_event=setup_abort)
+            except SetupTrackFailed as e:
+                set_stage(e.stage)
+                raise
+            set_stage('restore_weights')
+            (comfy/'input').mkdir(exist_ok=True)
+            shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
+            shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
+            set_stage('comfyui_start')
+            # v0.2.0 F5: detect VRAM once — the flags and the cold-start
+            # report share the same reading.
+            vram_mib = detect_gpu_vram_mib()
+            vram_flags = comfy_vram_flags(vram_mib)
+            print('COMFY_VRAM_FLAGS', ' '.join(vram_flags) or '(none)', flush=True)
+            emit_coldstart_metrics(setup_started, _JOB_RUN_ID, _JOB_VARIANT, vram_mib=vram_mib)
+            proc=subprocess.Popen([sys.executable,'main.py','--listen','127.0.0.1','--port','8188']+vram_flags,cwd=comfy,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
+            try:
+                (ROOT/'comfyui.pid').write_text(str(proc.pid),encoding='utf-8')
+            except OSError:
+                pass
+            set_stage('object_info_validation')
+            object_info=wait_health(server,proc,time.monotonic()+180)
+            info=object_info
+            print('COMFYUI_HEALTH_OK',flush=True)
         raw=json.loads((ROOT/'workflow_api.json').read_text())
         api=patch_api_workflow_for_spec(raw,spec,'muse_ref_1.jpg','muse_ref_2.jpg',run_id=run_id)
         validate_api_against_object_info(api,info)
@@ -1241,6 +1941,7 @@ def main():
         try:write_job_state(ROOT,run_id,version,'VIDEO_READY',output=info,extra={'remote_upload':remote_upload} if remote_upload is not None else None)
         except Exception:pass
         print('MUSE_H3_DONE_JSON:'+json.dumps(info,ensure_ascii=False),flush=True)
+        run_succeeded=True
     except Exception as e:
         try:write_job_state(ROOT,run_id,version,'FAILED',error=worker_failure_info(_LAST_STAGE,e))
         except Exception:pass
@@ -1257,9 +1958,15 @@ def main():
                 pass
         raise
     finally:
-        if proc is not None:
-            proc.terminate()
-            try:proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:proc.kill()
+        if run_succeeded and keep_warm_ttl_sec > 0:
+            # v0.3.0 M4: keep resident ComfyUI :8188 alive for the warm TTL
+            # window, but scrub ephemeral Drive tokens from disk.
+            _cleanup_ephemeral_tokens(ROOT)
+        else:
+            if proc is not None:
+                proc.terminate()
+                try:proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:proc.kill()
+            _terminate_comfy_pid(ROOT)
         logfile.close()
 if __name__=='__main__':main()

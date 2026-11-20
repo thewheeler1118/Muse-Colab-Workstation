@@ -32,6 +32,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -150,6 +151,93 @@ def is_transient_transport_error(message: str) -> bool:
             "http 411", "status 411",
         )
     )
+
+
+# v0.3.0 M1: elastic backoff schedule across allocation rounds
+# (15s -> 45s -> 90s, ±20% jitter). Rounds beyond the schedule reuse
+# the last delay; the rounds cap (5) keeps the total bounded.
+ALLOCATION_BACKOFF_BASE_SEC = (15.0, 45.0, 90.0)
+ALLOCATION_BACKOFF_JITTER = 0.20
+
+
+def classify_allocation_error(message: str) -> str:
+    """Classify a Colab GPU allocation error into a deterministic action class.
+
+    Returns one of:
+    - ``"AUTH_FATAL"``: 401/403/invalid credentials/unauthorized/forbidden
+    - ``"QUOTA_EXCEEDED"``: quota/usage limit/insufficient CU/billing disabled
+    - ``"CAPACITY_TRANSIENT"``: 503/429/502/504/412/unavailable/stockout/capacity/too many assignments
+    - ``"TRANSPORT_TRANSIENT"``: TLS/SSL/proxy/connection/timeout/411
+    - ``"UNKNOWN_FATAL"``: anything else (fail-fast, never retry blindly)
+
+    AUTH_FATAL, QUOTA_EXCEEDED and UNKNOWN_FATAL never retry; only
+    CAPACITY_TRANSIENT (next round, after backoff) and
+    TRANSPORT_TRANSIENT (same GPU once) retry. This subsumes
+    is_capacity_failure / is_transient_transport_error for the
+    allocation loop; those helpers stay for their other callers.
+    """
+    text = (message or "").lower()
+    if any(
+        x in text
+        for x in (
+            "401", "403", "invalid credentials", "unauthorized",
+            "permission denied", "forbidden",
+        )
+    ):
+        return "AUTH_FATAL"
+    if any(
+        x in text
+        for x in (
+            "quota exceeded", "usage limit", "compute units exhausted",
+            "insufficient cu", "billing disabled", "quota",
+        )
+    ):
+        return "QUOTA_EXCEEDED"
+    if any(
+        x in text
+        for x in (
+            "http 503", "status 503", "503", "service unavailable", "unavailable",
+            "http 429", "status 429", "429",
+            "http 502", "status 502", "502",
+            "http 504", "status 504", "504",
+            "http 412", "status 412", "allocation refused",
+            "precondition failed", "capacity", "resource exhausted",
+            "no available", "not available", "no backend", "stockout",
+            "too many assignments",
+        )
+    ):
+        return "CAPACITY_TRANSIENT"
+    if any(
+        x in text
+        for x in (
+            "proxyerror", "remotedisconnected", "incompleteread",
+            "chunkedencodingerror", "connection broken", "connection aborted",
+            "max retries exceeded", "ssl eof", "ssleof", "ssl", "tls",
+            "length required", "http 411", "status 411",
+            "read timed out", "timed out", "timeout", "connection reset",
+            "connectionerror", "connection refused",
+        )
+    ):
+        return "TRANSPORT_TRANSIENT"
+    return "UNKNOWN_FATAL"
+
+
+def compute_backoff_delay(round_idx: int, *, jitter_fn=None) -> float:
+    """Compute the elastic backoff sleep for a 0-based round index.
+
+    Base delays 15s / 45s / 90s for rounds 0 / 1 / 2, later rounds reuse
+    90s; jitter multiplies by 1 ± 20% (``jitter_fn`` returns the factor
+    and is injectable for deterministic tests)."""
+    idx = min(max(0, int(round_idx)), len(ALLOCATION_BACKOFF_BASE_SEC) - 1)
+    base = ALLOCATION_BACKOFF_BASE_SEC[idx]
+    if jitter_fn is not None:
+        factor = float(jitter_fn())
+    else:
+        factor = random.uniform(
+            1.0 - ALLOCATION_BACKOFF_JITTER,
+            1.0 + ALLOCATION_BACKOFF_JITTER,
+        )
+    return round(max(0.0, base * factor), 3)
 
 
 def initial_session_wall_seconds(max_rate_cu_h: float) -> int:

@@ -243,13 +243,69 @@ def manifest_schema_version(manifest: dict) -> int:
         return 1
 
 
+def validate_coldstart_metrics(metrics) -> dict:
+    """Validate a v0.2.0 F5 cold-start report (worker or controller
+    input). Returns a normalised copy with only the known fields, or
+    raises ValueError. Fail closed: a corrupt report is never persisted
+    as if it were a measurement.
+
+    Known fields: setup_seconds (number >= 0, required),
+    comfy_install_seconds / restore_seconds (number >= 0 or None),
+    wheelhouse_hit (bool or None), models_reused / models_downloaded
+    (int >= 0), vram_mib (int >= 0 or None), warm_session_reused
+    (bool, v0.3.0 M4 — only present when a warm session was reused).
+    Unknown fields are dropped (a newer worker may report more; the
+    manifest keeps what it knows).
+    """
+    if not isinstance(metrics, dict):
+        raise ValueError("coldstart_metrics must be a JSON object")
+    setup = metrics.get("setup_seconds")
+    if isinstance(setup, bool) or not isinstance(setup, (int, float)) or setup < 0:
+        raise ValueError("coldstart_metrics.setup_seconds must be a number >= 0")
+    out = {"setup_seconds": round(float(setup), 3)}
+    for key in ("comfy_install_seconds", "restore_seconds"):
+        value = metrics.get(key)
+        if value is None:
+            out[key] = None
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"coldstart_metrics.{key} must be a number >= 0 or null")
+        else:
+            out[key] = round(float(value), 3)
+    hit = metrics.get("wheelhouse_hit")
+    if hit is not None and not isinstance(hit, bool):
+        raise ValueError("coldstart_metrics.wheelhouse_hit must be a boolean or null")
+    out["wheelhouse_hit"] = hit
+    for key in ("models_reused", "models_downloaded"):
+        value = metrics.get(key)
+        if value is None:
+            out[key] = 0
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"coldstart_metrics.{key} must be an integer >= 0")
+        else:
+            out[key] = value
+    vram = metrics.get("vram_mib")
+    if vram is None:
+        out["vram_mib"] = None
+    elif isinstance(vram, bool) or not isinstance(vram, int) or vram < 0:
+        raise ValueError("coldstart_metrics.vram_mib must be an integer >= 0 or null")
+    else:
+        out["vram_mib"] = vram
+    warm = metrics.get("warm_session_reused")
+    if warm is not None and not isinstance(warm, bool):
+        raise ValueError("coldstart_metrics.warm_session_reused must be a boolean or null")
+    if warm is True:
+        out["warm_session_reused"] = True
+    return out
+
+
 def update_run(root: Path, run_id: str, task_state: str | None = None,
                session_state=None, session_id: str | None = None,
                last_verified_stage: str | None = None,
                last_error: str | None = None, artifacts: dict | None = None,
                budget: dict | None = None, heartbeat: bool = False,
                reopen: bool = False, bootstrap: dict | None = None,
-               transient_error: str | None = None) -> tuple[dict, bool, str | None]:
+               transient_error: str | None = None,
+               coldstart_metrics: dict | None = None) -> tuple[dict, bool, str | None]:
     """Idempotent update. Returns (manifest, applied, anomaly).
 
     - task_state moves forward only (by stage index); a backward move is
@@ -271,6 +327,10 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
     - `transient_error` records manifest["last_transient_error"]
       (error + timestamp + count). It never moves task_state and never
       sets last_error: a network timeout is not a task failure.
+    - `coldstart_metrics` (v0.2.0 F5) stores the worker's validated
+      cold-start report at manifest["coldstart_metrics"]; it never
+      moves task_state. A later report replaces an earlier one (the
+      newest setup is the measurement that counts).
     - Re-applying the same values is a no-op (applied=False, no anomaly).
     """
     path = _manifest_path(root, run_id)
@@ -289,17 +349,23 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
                        "resume with reopen instead")
             record_audit_event(root, run_id, "ANOMALY", {"detail": anomaly})
         elif task_state == "TASK_COMPLETED" and not reopen:
-            # Effective session state: the session_state argument of
-            # this call counts, so a combined stop+complete update works.
+            # Effective session state & artifacts: arguments of this call
+            # count, so a combined stop/warm+complete update works.
             if session_state is not None:
                 effective_session = getattr(session_state, "value", session_state)
             else:
                 effective_session = manifest.get("session_state")
+            effective_artifacts = {**(manifest.get("artifacts") or {}),
+                                   **(artifacts or {})}
+            warm_pooled_armed = (
+                effective_session == "WARM_POOLED"
+                and effective_artifacts.get("warm_lease_armed") is True
+            )
             if current != "DRIVE_VERIFIED":
                 anomaly = (f"refused move {current} -> TASK_COMPLETED: Drive must be "
                            "verified first")
                 record_audit_event(root, run_id, "ANOMALY", {"detail": anomaly})
-            elif effective_session != "STOPPED":
+            elif effective_session != "STOPPED" and not warm_pooled_armed:
                 anomaly = (f"refused move {current} -> TASK_COMPLETED: GPU session "
                            f"is {effective_session}, not STOPPED")
                 record_audit_event(root, run_id, "ANOMALY", {"detail": anomaly})
@@ -325,7 +391,8 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
 
     if session_state is not None:
         value = getattr(session_state, "value", session_state)
-        if value in ("ACTIVE", "STOPPED", "UNKNOWN") and value != manifest.get("session_state"):
+        if value in ("ACTIVE", "WARM_POOLED", "STOPPED", "UNKNOWN") \
+                and value != manifest.get("session_state"):
             manifest["session_state"] = value
             changed = True
 
@@ -389,6 +456,15 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
             manifest["bootstrap"] = merged_boot
             changed = True
 
+    if coldstart_metrics is not None:
+        # v0.2.0 F5: the worker's cold-start report. Validated before
+        # it is stored; a corrupt report raises instead of persisting
+        # a fake measurement. A re-run replaces the previous report.
+        validated = validate_coldstart_metrics(coldstart_metrics)
+        if validated != manifest.get("coldstart_metrics"):
+            manifest["coldstart_metrics"] = validated
+            changed = True
+
     if transient_error is not None:
         # TASK-006 P1-B: a transient error is recorded with a count;
         # it never moves task_state and never sets last_error.
@@ -430,8 +506,13 @@ def recovery_view(root: Path, run_id: str) -> dict:
     elif state == "COMPLETED_AWAITING_ARCHIVE":
         reason = "video is durable locally; resume means archive-only retry, never re-inference"
     elif state == "DRIVE_VERIFIED" and manifest.get("session_state") != "STOPPED":
-        reason = ("Drive verified before GPU stop confirmed; complete the "
-                  "stop before marking TASK_COMPLETED")
+        if manifest.get("session_state") == "WARM_POOLED" \
+                and (manifest.get("artifacts") or {}).get("warm_lease_armed") is True:
+            reason = ("Drive verified with armed warm-pooled GPU; ready for "
+                      "TASK_COMPLETED")
+        else:
+            reason = ("Drive verified before GPU stop confirmed; complete the "
+                      "stop before marking TASK_COMPLETED")
     artifacts = manifest.get("artifacts", {})
     return {"manifest": manifest, "resumable": resumable, "reason": reason,
             "completed_stages": done, "current_stage": state, "next_stage": nxt,
@@ -464,3 +545,50 @@ def resume_run(root: Path, run_id: str) -> dict:
     record_audit_event(root, run_id, "RESUMED",
                        {"recovery_generation": manifest["recovery_generation"]})
     return recovery_view(root, run_id)
+
+
+def record_warm_session_stopped(root: Path, run_id: str,
+                                session_id: str | None = None) -> dict | None:
+    """Idempotently record that a WARM_POOLED run's GPU session has been
+    confirmed STOPPED (e.g. by TTL expiry, --stop-warm, or guardian)
+    (v0.3.0 M4).
+
+    Works even when `task_state == "TASK_COMPLETED"`. Updates
+    `session_state = "STOPPED"`, sets `artifacts["warm_lease_armed"] = False`,
+    and appends a `STAGE` audit event `{"from": "WARM_POOLED",
+    "to": "GPU_STOP_CONFIRMED"}`.
+
+    Returns the updated manifest dict, or None when the manifest does not
+    exist, belongs to a different `session_id`, or is neither WARM_POOLED
+    nor already STOPPED. Re-calling on an already-STOPPED manifest is an
+    idempotent no-op that returns the manifest without duplicating the
+    audit event.
+    """
+    path = _manifest_path(root, run_id)
+    if not path.exists():
+        return None
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if session_id is not None and manifest.get("session_id") \
+            and manifest.get("session_id") != session_id:
+        return None
+    current_session = manifest.get("session_state")
+    if current_session == "STOPPED":
+        return manifest
+    if current_session != "WARM_POOLED":
+        return None
+    now = _utc_now()
+    manifest["session_state"] = "STOPPED"
+    artifacts = dict(manifest.get("artifacts") or {})
+    artifacts["warm_lease_armed"] = False
+    artifacts["warm_stopped_at_utc"] = now
+    manifest["artifacts"] = artifacts
+    manifest["last_heartbeat_utc"] = now
+    manifest["updated_at_utc"] = now
+    _atomic_write_json(path, manifest)
+    record_audit_event(
+        root,
+        run_id,
+        "STAGE",
+        {"from": "WARM_POOLED", "to": "GPU_STOP_CONFIRMED"},
+    )
+    return manifest

@@ -20,8 +20,11 @@ import functools
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import uuid
@@ -34,11 +37,14 @@ from h3_budget import (
     MAX_SESSION_SECONDS,
     DEFAULT_PRODUCTION_TASK_ID,
     GPU_CHOICES,
+    GPU_ATTEMPT_PLAN,
     initial_session_wall_seconds,
     ledger_path_for_task,
     effective_hard_stop_cu,
     allocation_command,
     choose_gpu_candidate,
+    classify_allocation_error,
+    compute_backoff_delay,
     estimate_unbilled_cu,
     effective_balance_cu,
     is_capacity_failure,
@@ -139,6 +145,34 @@ def _comfyui_download_task():
     }
 
 
+def _wheelhouse_download_task():
+    """Offline wheelhouse bundle descriptor for the NONINTERACTIVE
+    download path (v0.2.0 F2): Drive file ids from the local
+    wheelhouse manifest built by h3_comfyui_cache.py
+    publish-wheelhouse, so the worker can download the bundle instead
+    of installing from PyPI (worker-side install is F3). None when
+    the wheelhouse manifest is missing or has no Drive ids: the
+    worker then installs from PyPI exactly as before, and the
+    drive_download block carries no ``wheelhouses`` key at all."""
+    manifest_path = ROOT / "model_cache" / "comfyui_wheelhouse_manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    files = manifest.get("drive_files") or {}
+    archive = manifest.get("archive_name")
+    entry = files.get(archive) if archive else None
+    if not entry or not entry.get("id"):
+        return None
+    return {
+        "file_id": entry["id"],
+        "size": int(entry["size"]),
+        "sha256": entry["sha256"],
+        "archive": archive,
+        "commit": manifest["commit"],
+        "python_tag": manifest.get("python_tag"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # TASK-007: the generic task engine. One TaskSpec drives a run; --variant
 # A|B is only the built-in fixture adapter. These helpers resolve the
@@ -227,6 +261,72 @@ def _download_drive_file(file_id: str, dest: Path, drive=None) -> Path:
     return dest
 
 
+def _file_sha256(path: Path) -> str:
+    """SHA-256 hex of a local file (v0.3.0 M4: warm-lease identity —
+    the cache manifest's digest must match the lease's)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fp:
+        for chunk in iter(lambda: fp.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """True for retryable network/TLS failures only (v0.3.0 M3).
+
+    Type-based: ConnectionError (reset/aborted/broken pipe, including
+    http.client.RemoteDisconnected) and TimeoutError / ssl.SSLError.
+    Message-based: the h3_budget transport classifier (ProxyError,
+    SSL EOF, connection reset/refused, HTTP 411, ...) plus the TLS /
+    timeout phrases from the upstream M3 spec. Auth, quota, permission
+    and input errors are NOT transient and are never retried.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError, ssl.SSLError)):
+        return True
+    text = str(exc).lower()
+    if any(x in text for x in ("401", "403", "invalid credentials",
+                               "unauthorized", "permission denied", "forbidden")):
+        return False
+    if is_transient_transport_error(str(exc)):
+        return True
+    return any(x in text for x in (
+        "tls eof", "ssl eof", "eof occurred in violation of protocol",
+        "read timed out", "timed out", "connection reset",
+        "remotedisconnected", "connection aborted", "connection broken",
+    ))
+
+
+def _call_with_transient_retry(fn, *, max_attempts: int = 5,
+                               delays: tuple[float, ...] = (5, 10, 20, 30),
+                               sleep_fn=None, on_retry=None):
+    """Execute ``fn()`` with bounded backoff retries on transient
+    network/TLS errors only (v0.3.0 M3). ``max_attempts`` counts the
+    first try plus retries; ``delays`` is the sleep before each retry
+    (the last delay repeats when attempts outrun the tuple). A fatal
+    error raises on the first attempt; exhaustion raises the last
+    error. ``sleep_fn`` / ``on_retry(attempt_num, delay, exc)`` are
+    injectable for offline tests."""
+    sleeper = sleep_fn if sleep_fn is not None else time.sleep
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - classification decides
+            if attempt + 1 >= attempts or not _is_transient_network_error(exc):
+                raise
+            delay = delays[min(attempt, len(delays) - 1)] if delays else 0
+            if on_retry is not None:
+                try:
+                    on_retry(attempt + 1, delay, exc)
+                except Exception:
+                    pass
+            if delay > 0:
+                sleeper(delay)
+    raise RuntimeError("_call_with_transient_retry reached unreachable state")
+
+
 def _materialize_ref_images(spec: TaskSpec, dest_dir: Path, drive=None) -> dict:
     """Make both reference images available as local files, verified
     against the spec SHA-256s, BEFORE any GPU exists.
@@ -299,13 +399,22 @@ def _build_drive_download_block(cache_manifest):
                       "size": int(x["size"]), "sha256": x["sha256"],
                       "md5": x.get("server_md5")})
     probe_file = min(files, key=lambda f: f["size"])
-    return {
+    block = {
         "files": files,
         "comfyui": _comfyui_download_task(),
         "dest_dir": REMOTE + "/drive_downloads",
         "token_file": REMOTE + "/drive_token.json",
         "probe": {"file_id": probe_file["file_id"]},
     }
+    # v0.2.0 F2: optional wheelhouse bundle. Absent when no wheelhouse
+    # manifest exists (worker installs from PyPI as before); present
+    # as a one-entry list when a bundle was published. The worker
+    # ignores unknown keys until F3 teaches it to install from the
+    # bundle, so adding the key never changes a run that has none.
+    wheelhouse = _wheelhouse_download_task()
+    if wheelhouse is not None:
+        block["wheelhouses"] = [wheelhouse]
+    return block
 
 
 def verify_drive_download_preflight(args) -> dict:
@@ -397,6 +506,21 @@ def _upload_drive_token(session: str, run_dir, token_doc: dict, remote_name: str
     return {"token_id": token_doc["token_id"], "remote_path": REMOTE + "/" + remote_name}
 
 
+def _mint_drive_token_doc(mint_fn=None) -> dict:
+    """Mint a short-lived Drive token document (no upload).
+
+    The bundled bootstrap (v0.3.0 M2) delivers tokens inside the
+    Stage-1 tar instead of uploading them one by one, so minting is a
+    separate seam from uploading. The chain harness stubs this the same
+    way it stubs _mint_and_upload_drive_token. The token value is never
+    logged; only token_id may appear in diagnostics.
+    """
+    import h3_drive_token
+
+    mint = mint_fn or h3_drive_token.mint_readonly_token
+    return mint()
+
+
 def _mint_and_upload_drive_token(session: str, run_dir, remote_name: str, mint_fn=None) -> dict:
     """Mint a fresh token and upload it as a 0600 file.
     One helper so the token branches have a single boundary (the
@@ -404,10 +528,68 @@ def _mint_and_upload_drive_token(session: str, run_dir, remote_name: str, mint_f
     upload are covered by tests/test_drive_download.py. `mint_fn`
     selects the scope: read-only by default, `mint_file_token` for
     the P1-A worker upload token (TASK-006 P1-A)."""
-    import h3_drive_token
+    return _upload_drive_token(session, run_dir, _mint_drive_token_doc(mint_fn), remote_name)
 
-    mint = mint_fn or h3_drive_token.mint_readonly_token
-    return _upload_drive_token(session, run_dir, mint(), remote_name)
+
+# v0.3.0 M2: bundled bootstrap modes. `bundled` (default) uploads the
+# Stage-1 / Stage-2 tars; `legacy` keeps the current one-file-at-a-time
+# uploads. Bundled applies to the noninteractive download source only;
+# the mount source always uses legacy (it needs the interactive mount).
+BOOTSTRAP_MODES = ("bundled", "legacy")
+BOOTSTRAP_MODE_DEFAULT = "bundled"
+
+
+def resolve_bootstrap_mode(args) -> str:
+    """Resolve --bootstrap-mode for one run (v0.3.0 M2)."""
+    raw = getattr(args, "bootstrap_mode", None) or BOOTSTRAP_MODE_DEFAULT
+    mode = str(raw).strip().lower()
+    if mode not in BOOTSTRAP_MODES:
+        raise ValueError(f"--bootstrap-mode must be one of {BOOTSTRAP_MODES}, got {raw!r}")
+    return mode
+
+
+def build_bootstrap_tar(tar_path, entries, forbidden=frozenset()) -> Path:
+    """Build a deterministic Stage-1/Stage-2 bootstrap tar.gz (v0.3.0 M2).
+
+    ``entries`` is a list of ``(local_path, arcname, mode_or_None)``
+    (mode defaults to 0o644; token files pass 0o600). The archive is
+    deterministic (mtime=0, uid/gid=0, empty uname/gname) so a rebuild
+    of the same inputs is byte-identical. Fail-closed: an absolute
+    arcname, a ``..`` component, or a forbidden arcname (Stage 1
+    refuses ``h3_remote_worker.py``) raises before anything is written.
+    Never logs entry contents — token bytes pass through here.
+    """
+    tar_path = Path(tar_path)
+    for _local, arcname, _mode in entries:
+        if not arcname or arcname.startswith("/") or Path(arcname).is_absolute():
+            raise ValueError(f"Unsafe bootstrap entry (absolute path): {arcname!r}")
+        parts = Path(arcname).parts
+        if any(part == ".." for part in parts):
+            raise ValueError(f"Unsafe bootstrap entry (path traversal): {arcname!r}")
+        if arcname in forbidden:
+            raise ValueError(f"Forbidden bootstrap entry: {arcname!r}")
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+    # Deterministic gzip wrapper: empty filename + mtime 0, so a rebuild
+    # of the same inputs is byte-identical regardless of the output path.
+    import gzip
+    import io
+
+    with open(tar_path, "wb") as raw, \
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for local_path, arcname, mode in entries:
+            local_path = Path(local_path)
+            data = local_path.read_bytes()
+            info = tarfile.TarInfo(arcname)
+            info.size = len(data)
+            info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mode = mode if mode is not None else 0o644
+            tf.addfile(info, io.BytesIO(data))
+    return tar_path
 
 
 def _build_drive_upload_block(run_id: str, variant: str) -> dict:
@@ -593,6 +775,28 @@ def check_worker_done_marker(exec_result: dict, variant: str) -> dict:
     raise RuntimeError(
         f"Remote worker for variant {variant} did not print MUSE_H3_DONE_JSON; "
         f"the output file was never produced. Worker output tail:\n{tail}")
+
+
+def parse_coldstart_metrics(text: str) -> dict | None:
+    """Extract the worker's ``COLDSTART_METRICS_JSON`` report from exec
+    or log text (v0.2.0 F5). The last such line wins. Returns the
+    validated report, or None when no line exists or the line is not a
+    valid report — a missing or corrupt report is never an error here:
+    the run proceeds without cold-start telemetry and the manifest
+    simply has no coldstart_metrics. The validator is the manifest's
+    own (h3_run_manifest.validate_coldstart_metrics), so the parser
+    and the persister can never disagree about what a report is."""
+    from h3_run_manifest import validate_coldstart_metrics
+
+    metrics = None
+    for line in (text or "").splitlines():
+        if line.startswith("COLDSTART_METRICS_JSON"):
+            try:
+                candidate = json.loads(line.split("COLDSTART_METRICS_JSON", 1)[1].strip())
+                metrics = validate_coldstart_metrics(candidate)
+            except Exception:  # noqa: BLE001 - corrupt line is skipped
+                continue
+    return metrics
 
 
 def check_remote_output(exec_result: dict, variant: str, spec=None) -> dict:
@@ -824,6 +1028,23 @@ def preflight(args) -> dict:
 
     check("comfyui_source_cache", _comfyui_cache)
     check("adc_valid", lambda: audit_user_adc_file())
+
+    def _token_freshness():
+        import unittest.mock
+        import h3_drive_token
+
+        fn = h3_drive_token.ensure_token_freshness
+        # Offline unit tests that stub audit_user_adc_file to a string
+        # ("adc ok") without mocking ensure_token_freshness must never
+        # touch live host ADC.
+        if (
+            not isinstance(fn, unittest.mock.Base)
+            and checks.get("adc_valid", {}).get("detail") == "adc ok"
+        ):
+            return {"refreshed": False, "remaining_sec": 900, "expires_at_utc": "stubbed"}
+        return fn(min_remaining_sec=900)
+
+    check("token_freshness", _token_freshness)
     # 2-4. same account + Drive READY (live)
     def _drive_ready():
         from drive_depot import drive_service, account_matches, verify_ready
@@ -1650,11 +1871,84 @@ def _record_remote_upload(run_id: str, state: dict) -> dict | None:
     return None
 
 
+def _record_coldstart_metrics(run_id: str, state: dict) -> dict | None:
+    """Persist the worker's cold-start report from a polled job state
+    (v0.2.0 F5). The worker writes it via write_job_state's ``extra``
+    when setup succeeds, so it appears in the state dict the
+    controller polls. Returns the validated report or None (absent or
+    invalid). Best-effort: never raises — telemetry must not break a
+    run. A corrupt report is logged, never persisted."""
+    try:
+        metrics = (state or {}).get("coldstart_metrics")
+        if metrics is None:
+            return None
+        from h3_run_manifest import validate_coldstart_metrics
+
+        validated = validate_coldstart_metrics(metrics)
+        # v0.2.1 P3: a cold-start report proves setup completed, so
+        # MODELS_READY was crossed even if no poll caught it.
+        _backfill_models_ready_if_needed(run_id)
+        _manifest_update(run_id, coldstart_metrics=validated)
+        try:
+            from h3_run_manifest import record_audit_event
+
+            record_audit_event(ROOT, run_id, "COLDSTART_METRICS",
+                               {"setup_seconds": validated.get("setup_seconds")})
+        except Exception:
+            pass
+        return validated
+    except Exception as e:  # noqa: BLE001 - telemetry only
+        try:
+            record({"event": "coldstart_metrics_invalid", "run_id": run_id,
+                    "error": str(e)[:200]})
+        except Exception:
+            pass
+        return None
+
+
+# Remote worker stages that can only be reached after ComfyUI models
+# and /object_info validation have succeeded. Because the worker moves
+# from MODELS_READY -> INFERENCE_RUNNING in milliseconds while the
+# controller polls every 60s, seeing any of these stages (or
+# coldstart_metrics) proves MODELS_READY was crossed and triggers a
+# monotonic backfill (v0.2.1 P3).
+_STAGES_IMPLYING_MODELS_READY = {
+    "INFERENCE_RUNNING",
+    "INFERENCE_COMPLETED",
+    "VIDEO_READY",
+}
+
+
+def _backfill_models_ready_if_needed(run_id: str) -> bool:
+    """Monotonically backfill MODELS_READY if the run manifest is still
+    prior to MODELS_READY in TASK_STAGES (v0.2.1 P3). Never attempts a
+    backward move and never raises."""
+    try:
+        from h3_run_manifest import TASK_STAGES, load_run_manifest
+
+        manifest = load_run_manifest(ROOT, run_id)
+        if not manifest:
+            return False
+        current = manifest.get("task_state", "")
+        if current in TASK_STAGES and TASK_STAGES.index(current) < TASK_STAGES.index("MODELS_READY"):
+            _manifest_update(run_id, task_state="MODELS_READY",
+                             last_verified_stage="MODELS_READY")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _manifest_worker_state(run_id: str, state: dict) -> None:
     """Record a polled worker state in the durable manifest (best-effort).
     Forward-only enforcement lives in update_run: a stale or out-of-order
     poll is refused and logged as an anomaly, never applied."""
     stage = (state or {}).get("stage")
+    has_coldstart = isinstance((state or {}).get("coldstart_metrics"), dict) and bool(
+        (state or {}).get("coldstart_metrics")
+    )
+    if stage in _STAGES_IMPLYING_MODELS_READY or has_coldstart:
+        _backfill_models_ready_if_needed(run_id)
     manifest_stage = JOB_STAGE_TO_MANIFEST_STAGE.get(stage)
     if manifest_stage:
         _manifest_update(run_id, task_state=manifest_stage,
@@ -1665,6 +1959,8 @@ def _manifest_worker_state(run_id: str, state: dict) -> None:
     # records it immediately, so a controller restart after VIDEO_READY
     # still finds the Drive id in the manifest.
     _record_remote_upload(run_id, state)
+    # v0.2.0 F5: the same poll catches the cold-start report.
+    _record_coldstart_metrics(run_id, state)
 
 
 def _handle_token_refresh_request(session: str, run_id: str, run_dir,
@@ -1733,12 +2029,19 @@ def _make_worker_state_handler(run_id: str, session: str, run_dir,
     return _handler
 
 
-def launch_worker(session: str) -> dict:
+def launch_worker(session: str, bundled: bool = False) -> dict:
     """Short-start the detached worker. Returns the launch record
     (run_id, variant, pid, state_file, log_file). Raises on any launch
     failure: a launch that cannot be observed fails fast here instead of
-    leaving an untracked worker behind on a paid GPU."""
-    result = exec_script(session, ROOT / "h3_worker_launcher.py", timeout=180)
+    leaving an untracked worker behind on a paid GPU.
+
+    With ``bundled=True`` (v0.3.0 M2) the launch execs
+    ``h3_bootstrap_stage2.py``, which extracts the Stage-2 tar and then
+    invokes the same ``h3_worker_launcher.main()``; the launch JSON it
+    prints is parsed the same way.
+    """
+    script = ROOT / ("h3_bootstrap_stage2.py" if bundled else "h3_worker_launcher.py")
+    result = exec_script(session, script, timeout=180)
     text = (result or {}).get("stdout", "") or ""
     for line in text.splitlines():
         if line.startswith("MUSE_H3_LAUNCH_JSON:"):
@@ -1754,7 +2057,11 @@ def poll_worker(session: str) -> dict:
     missing/corrupt state file, or an incomplete record — never a silent
     'no worker' answer."""
     try:
-        result = exec_script(session, ROOT / "h3_job_probe.py", timeout=90)
+        result = _call_with_transient_retry(
+            lambda: exec_script(session, ROOT / "h3_job_probe.py", timeout=90),
+            max_attempts=5,
+            delays=(5, 10, 20, 30),
+        )
     except Exception as e:  # noqa: BLE001 - any exec failure is a poll failure
         raise WorkerPollError(f"probe exec failed: {e}") from e
     text = (result or {}).get("stdout", "") or ""
@@ -1799,25 +2106,47 @@ def check_job_done_info(done_info, variant: str, spec=None) -> dict:
 
 
 def _inspect_live(run_id: str | None = None, retries: int = 3) -> dict:
-    """inspect() with bounded retries for transient CLI failures
-    (TASK-006 P1-B). A transient failure is recorded on the manifest
+    """inspect() with bounded retries for transient CLI/network failures
+    (TASK-006 P1-B + v0.3.0 M3). A transient failure is recorded on the manifest
     (never a task failure by itself); only a failure on every attempt
     raises. Pre-allocation callers do NOT use this: before any GPU
     exists, an unverifiable balance still refuses outright."""
-    last = None
-    for attempt in range(retries):
-        try:
-            return inspect()
-        except Exception as e:  # noqa: BLE001 - retried, then raised
-            last = e
-            if run_id is not None:
-                _manifest_update(
-                    run_id,
-                    transient_error=f"inspect() transient failure "
-                                    f"(attempt {attempt + 1}/{retries}): {e}"[:500])
-            if attempt < retries - 1:
-                time.sleep(2)
-    raise last
+    max_attempts = max(int(retries), 5)
+
+    def _on_retry(attempt_num: int, delay: float, exc: BaseException) -> None:
+        if run_id is not None:
+            _manifest_update(
+                run_id,
+                transient_error=f"inspect() transient failure "
+                                f"(attempt {attempt_num}/{max_attempts}, retry in {delay}s): {exc}"[:500])
+
+    try:
+        return _call_with_transient_retry(
+            inspect,
+            max_attempts=max_attempts,
+            delays=(5, 10, 20, 30),
+            on_retry=_on_retry,
+        )
+    except Exception as first_exc:  # noqa: BLE001
+        if _is_transient_network_error(first_exc) or retries <= 1:
+            raise
+        # Preserve the legacy bounded retry for non-network CLI errors
+        # when retries > 1: a CLI parsing failure is not a network
+        # failure, but it used to get `retries` attempts with 2 s sleeps.
+        last = first_exc
+        for attempt in range(retries):
+            try:
+                return inspect()
+            except Exception as e:  # noqa: BLE001 - retried, then raised
+                last = e
+                if run_id is not None:
+                    _manifest_update(
+                        run_id,
+                        transient_error=f"inspect() transient failure "
+                                        f"(attempt {attempt + 1}/{retries}): {e}"[:500])
+                if attempt < retries - 1:
+                    time.sleep(2)
+        raise last
 
 
 def wait_for_worker(session: str, run_id: str, variant: str,
@@ -1918,11 +2247,184 @@ def _resume_archive_only(args, manifest: dict) -> dict:
             "outcome": "archive-only retry succeeded", "delivery": delivery}
 
 
+def recover_from_drive_archive(
+    run_id: str,
+    variant: str,
+    manifest: dict,
+    spec=None,
+    drive=None,
+) -> dict | None:
+    """0-GPU recovery from Drive archive when GPU is STOPPED and local MP4 is
+    missing or invalid (v0.3.0 M3).
+
+    Resolves the candidate Drive file from either
+    ``manifest["artifacts"]["drive_file_id"]`` or
+    ``Muse-H3-Video-Outputs/<run_id>/<variant>.mp4`` (via ``list_named``,
+    not trashed), downloads to a temp file, atomically moves it to
+    ``OUTPUT_ROOT/<run_id>/<variant>.mp4``, validates via
+    ``validate_final_video``, and advances the manifest to
+    ``TASK_COMPLETED``. Returns ``None`` on missing/corrupt/unrecoverable
+    archive (never allocates a GPU). A failed validation never leaves a
+    partial file at the destination.
+    """
+    from drive_depot import drive_service, list_named
+    from h3_video_qa import validate_final_video
+
+    artifacts = manifest.get("artifacts") or {}
+    try:
+        svc = drive or _call_with_transient_retry(drive_service)
+    except Exception:  # noqa: BLE001
+        return None
+    file_id = artifacts.get("drive_file_id")
+    folder_id = artifacts.get("drive_output_folder_id")
+
+    if file_id:
+        try:
+            meta = _call_with_transient_retry(
+                lambda: svc.files().get(
+                    fileId=file_id,
+                    fields="id,name,size,trashed,md5Checksum,parents",
+                ).execute()
+            )
+            if not meta or meta.get("id") != file_id or meta.get("trashed"):
+                file_id = None
+            else:
+                remote = artifacts.get("remote_upload") or {}
+                if remote.get("size") is not None and int(meta.get("size", -1)) != int(remote["size"]):
+                    file_id = None
+                if file_id and remote.get("md5"):
+                    if (meta.get("md5Checksum") or "").lower() != str(remote["md5"]).lower():
+                        file_id = None
+                if file_id and not folder_id:
+                    parents = meta.get("parents") or []
+                    if parents:
+                        folder_id = parents[0]
+        except Exception:  # noqa: BLE001
+            file_id = None
+
+    if not file_id:
+        try:
+            roots = _call_with_transient_retry(
+                lambda: list_named(svc, "root", "Muse-H3-Video-Outputs")
+            )
+            root_folders = [
+                r for r in (roots or [])
+                if not r.get("trashed")
+                and r.get("mimeType") == "application/vnd.google-apps.folder"
+            ]
+            if root_folders:
+                run_folders = _call_with_transient_retry(
+                    lambda: list_named(svc, root_folders[0]["id"], run_id)
+                )
+                run_folders = [
+                    r for r in (run_folders or [])
+                    if not r.get("trashed")
+                    and r.get("mimeType") == "application/vnd.google-apps.folder"
+                ]
+                if run_folders:
+                    folder_id = run_folders[0]["id"]
+                    files = _call_with_transient_retry(
+                        lambda: list_named(svc, folder_id, f"{variant}.mp4")
+                    )
+                    valid_files = [f for f in (files or []) if not f.get("trashed")]
+                    if valid_files:
+                        file_id = valid_files[0].get("id")
+        except Exception:  # noqa: BLE001
+            return None
+
+    if not file_id:
+        return None
+
+    dest_dir = OUTPUT_ROOT / run_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"{variant}.mp4"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".recover_{variant}_", suffix=".mp4", dir=str(dest_dir))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        _call_with_transient_retry(lambda: _download_drive_file(file_id, tmp_path, drive=svc))
+        info = validate_final_video(
+            tmp_path,
+            expected_frames=spec.total_frames if spec is not None else 274,
+            expected_fps=spec.fps if spec is not None else 24,
+            expected_width=spec.output_width if spec is not None else 1080,
+            expected_height=spec.output_height if spec is not None else 1920,
+        )
+        os.replace(tmp_path, dest_path)
+    except Exception as exc:  # noqa: BLE001
+        record({
+            "event": "drive_archive_recovery_failed",
+            "run_id": run_id,
+            "variant": variant,
+            "drive_file_id": file_id,
+            "error": str(exc)[:300],
+        })
+        return None
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    _manifest_update(
+        run_id,
+        task_state="VIDEO_VALIDATED",
+        last_verified_stage="VIDEO_VALIDATED",
+        session_state="STOPPED",
+        artifacts={
+            "local_sha256": info.get("sha256"),
+            "local_frames": info.get("frame_count"),
+            "delivery_state": "COMPLETE_LOCAL",
+        },
+    )
+    _manifest_update(run_id, task_state="ARTIFACT_DURABLE", session_state="STOPPED")
+    _manifest_update(
+        run_id,
+        task_state="DRIVE_VERIFIED",
+        last_verified_stage="DRIVE_VERIFIED",
+        session_state="STOPPED",
+        artifacts={
+            "drive_file_id": file_id,
+            "drive_output_folder_id": folder_id,
+            "local_sha256": info.get("sha256"),
+            "local_frames": info.get("frame_count"),
+            "delivery_state": "DELIVERED",
+        },
+    )
+    _manifest_update(run_id, task_state="TASK_COMPLETED", session_state="STOPPED")
+    delivery = {
+        "state": "DELIVERED",
+        "variant": variant,
+        "run_id": run_id,
+        "drive_file_id": file_id,
+        "drive_output_folder_id": folder_id,
+        "local_sha256": info.get("sha256"),
+        "local_frames": info.get("frame_count"),
+        "recovered_from_drive_archive": True,
+    }
+    record({
+        "event": "drive_archive_recovered_0gpu",
+        "run_id": run_id,
+        "variant": variant,
+        "drive_file_id": file_id,
+        "sha256": info.get("sha256"),
+    })
+    return {
+        "resumed": True,
+        "outcome": "recovered_from_drive_archive_0gpu",
+        "run_id": run_id,
+        "variant": variant,
+        "drive_file_id": file_id,
+        "delivery": delivery,
+    }
+
+
 def _resume_stopped_session(args, manifest: dict) -> dict:
     """The session is gone, so the remote temp disk is gone with it.
     Recover only from durable copies: a validated local MP4 (archive it),
-    or a Drive file id the manifest already recorded (verify it
-    server-side first). Never re-infer, never allocate a new GPU here."""
+    or a Drive archive (0-GPU download + validate, or server-side verify).
+    Never re-infer, never allocate a new GPU here."""
     from h3_run_manifest import update_run
 
     run_id = manifest["run_id"]
@@ -1932,7 +2434,10 @@ def _resume_stopped_session(args, manifest: dict) -> dict:
     if local_mp4.is_file():
         try:
             delivery = _archive_local_mp4(variant, run_id, spec)
-        except Exception as e:  # noqa: BLE001 - local copy unusable
+        except Exception as e:  # noqa: BLE001 - local copy unusable; try Drive 0-GPU recovery
+            recovered = recover_from_drive_archive(run_id, variant, manifest, spec=spec)
+            if recovered is not None:
+                return recovered
             return {"resumed": False, "run_id": run_id,
                     "reason": f"session stopped and the local MP4 cannot be archived: {e}"}
         # TASK-006 P1-A: the session is known STOPPED here (the tristate
@@ -1948,6 +2453,10 @@ def _resume_stopped_session(args, manifest: dict) -> dict:
         return {"resumed": True, "run_id": run_id, "variant": variant,
                 "outcome": "session stopped; validated local MP4 archived",
                 "delivery": delivery}
+    # v0.3.0 M3: 0-GPU Drive archive fast-path recovery when local MP4 is missing.
+    recovered = recover_from_drive_archive(run_id, variant, manifest, spec=spec)
+    if recovered is not None:
+        return recovered
     drive_file_id = (manifest.get("artifacts") or {}).get("drive_file_id")
     if drive_file_id:
         try:
@@ -2178,7 +2687,7 @@ def _resume_bootstrap(args, manifest: dict) -> dict:
         args._ref_image_2_path = refs["ref_image_2"]
     start = time.monotonic()
     boot = _run_bootstrap(args, session_id, run_dir, budget_sec, live["rate"], start)
-    launch = launch_worker(session_id)
+    launch = launch_worker(session_id, bundled=bool(boot.get("bundled")))
     record({"event": "worker_launched", "variant": variant, "session": session_id, "launch": launch})
     _manifest_update(run_id, bootstrap={
         "steps": {"launch_worker": {"state": "done", "at_utc": _utc_now_iso()}}})
@@ -2266,7 +2775,11 @@ def _resume_run_inner(args) -> dict:
     from h3_session_watchdog import SessionState
 
     try:
-        session_state = query_session_state(session_id, colab_auth=_COLAB_AUTH)
+        session_state = _call_with_transient_retry(
+            lambda: query_session_state(session_id, colab_auth=_COLAB_AUTH),
+            max_attempts=5,
+            delays=(5, 10, 20, 30),
+        )
     except SessionQueryError as e:
         return {"resumed": False, "run_id": run_id,
                 "reason": f"session state UNKNOWN ({e}); refusing to allocate "
@@ -2455,6 +2968,14 @@ def _run_bootstrap(args, session: str, run_dir: Path, budget_sec: int,
         ref1_path, ref2_path = refs["ref_image_1"], refs["ref_image_2"]
         args._ref_image_1_path, args._ref_image_2_path = ref1_path, ref2_path
     drive_source = getattr(args, "drive_source", "download")
+    # v0.3.0 M2: the bundled bootstrap replaces the one-file-at-a-time
+    # uploads for the noninteractive download source. The mount source
+    # always uses the legacy path (it needs the interactive mount).
+    if drive_source == "download" and resolve_bootstrap_mode(args) == "bundled":
+        return _run_bootstrap_bundled(args, session, run_dir, budget_sec,
+                                      live_rate, start, spec,
+                                      ref1_path, ref2_path)
+    legacy_t0 = time.monotonic()
     bootstrap = _bootstrap_state(run_id)
     done_steps = dict(bootstrap.get("steps") or {})
 
@@ -2608,7 +3129,8 @@ def _run_bootstrap(args, session: str, run_dir: Path, budget_sec: int,
             "rate_cu_h": live_rate,
             "session_budget_cu": round(budget_sec * float(live_rate) / 3600.0, 3),
             "comfyui_cache": _comfyui_cache_task(),
-            "drive_source": drive_source}
+            "drive_source": drive_source,
+            "keep_warm_ttl_sec": _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))}
     if drive_source == "download":
         # The worker downloads from Drive with the delivered
         # short-lived token; drive_cache_dir is kept as the
@@ -2624,9 +3146,186 @@ def _run_bootstrap(args, session: str, run_dir: Path, budget_sec: int,
     task_path.write_text(json.dumps(task))
     run_cli(["upload", "-s", session, str(task_path), REMOTE + "/task.json"], timeout=120)
     _finish("upload_task")
-    _manifest_update(run_id, task_state="WORKER_STARTED", heartbeat=True)
+    _manifest_update(run_id, task_state="WORKER_STARTED", heartbeat=True,
+                     bootstrap={"mode": "legacy",
+                                "bootstrap_wall_sec": round(time.monotonic() - legacy_t0, 3)})
     return {"drive_download": drive_download, "drive_upload": drive_upload,
             "task": task, "renewal_state": renewal_state}
+
+
+def _run_bootstrap_bundled(args, session: str, run_dir: Path, budget_sec: int,
+                           live_rate: float, start: float, spec,
+                           ref1_path, ref2_path) -> dict:
+    """Two-stage bundled bootstrap for the noninteractive download source
+    (v0.3.0 M2). Stage 1 uploads ONE tar (contract files, refs, manifest,
+    workflow, probe spec + scripts, and 0600 downscoped tokens — NEVER
+    ``h3_remote_worker.py``) plus the Stage-1 extractor, then runs the
+    Drive download probe: it must print ``MUSE_DRIVE_DOWNLOAD_PROBE_OK``
+    before Stage 2 is built or uploaded. Stage 2 uploads ONE tar
+    (``h3_job_state.py``, ``h3_remote_worker.py``,
+    ``h3_worker_launcher.py``, ``task.json``); the actual launch happens
+    in ``launch_worker(session, bundled=True)``. Both stages always
+    re-run (fresh tokens each time; the task is rebuilt with a fresh
+    budget/rate), so a resume re-proves the remote from scratch.
+    Local token files and tars are unlinked after use. Returns the same
+    dict as the legacy path plus ``"bundled": True`` and
+    ``"cli_round_trips"`` (the 4 bundled calls: stage-1 upload + exec,
+    stage-2 upload + launch exec).
+    """
+    import h3_drive_token
+
+    run_id = args.run_id
+    variant = spec.output_prefix
+    boot_t0 = time.monotonic()
+    cli_round_trips = 0
+    renewal_state = {"count": 0, "last_token_id": None}
+
+    def _begin(step: str) -> None:
+        _manifest_update(run_id, bootstrap={"current_step": step})
+
+    def _finish(step: str, state: str = "done") -> None:
+        _manifest_update(run_id, bootstrap={
+            "current_step": None,
+            "steps": {step: {"state": state, "at_utc": _utc_now_iso()}}})
+
+    _begin("bundled_stage1")
+    drive_download = _build_drive_download_block(args.cache_manifest)
+    api = validate_comfy_workflow(args.workflow_api, spec)
+    submitted_path = run_dir / f"workflow_{variant}_submitted.json"
+    submitted_path.write_text(json.dumps(api, ensure_ascii=False, indent=2))
+    probe_spec_path = run_dir / "drive_download_probe.json"
+    probe_spec_path.write_text(json.dumps(drive_download["probe"]))
+
+    # Mint the ephemeral tokens locally (0600) and unlink in finally.
+    # The worker token and the probe token are read-only; the upload
+    # token is drive.file (TASK-006 P1-A) and only joins the bundle
+    # when the upload block builds (fail-soft, as in the legacy path).
+    local_token_paths: list[Path] = []
+    stage1_tar = run_dir / "bootstrap_stage1.tar.gz"
+    drive_upload = None
+    try:
+        tok_worker_doc = _mint_drive_token_doc()
+        tok_worker_path = run_dir / "drive_token.json"
+        h3_drive_token.write_token_file(tok_worker_path, tok_worker_doc)
+        local_token_paths.append(tok_worker_path)
+
+        tok_probe_doc = _mint_drive_token_doc()
+        tok_probe_path = run_dir / "drive_token_probe.json"
+        h3_drive_token.write_token_file(tok_probe_path, tok_probe_doc)
+        local_token_paths.append(tok_probe_path)
+
+        stage1_entries = [
+            (ROOT / "h3_contract.py", "h3_contract.py", None),
+            (ROOT / "h3_task_spec.py", "h3_task_spec.py", None),
+            (ROOT / "assemble.py", "assemble.py", None),
+            (ROOT / "h3_drive_download.py", "h3_drive_download.py", None),
+            (ROOT / "h3_drive_download_probe.py", "h3_drive_download_probe.py", None),
+            (Path(ref1_path), "poster.jpg", None),
+            (Path(ref1_path), "ref_image_1.jpg", None),
+            (Path(ref2_path), "ref_image_2.jpg", None),
+            (Path(args.cache_manifest), "model_manifest.json", None),
+            (Path(args.workflow_api), "workflow_api.json", None),
+            (submitted_path, "workflow_submitted.json", None),
+            (probe_spec_path, "drive_download_probe.json", None),
+            (tok_worker_path, "drive_token.json", 0o600),
+            (tok_probe_path, "drive_token_probe.json", 0o600),
+        ]
+        try:
+            drive_upload = _build_drive_upload_block(run_id, variant)
+            tok_upload_doc = _mint_drive_token_doc(mint_fn=h3_drive_token.mint_file_token)
+            tok_upload_path = run_dir / "drive_upload_token.json"
+            h3_drive_token.write_token_file(tok_upload_path, tok_upload_doc)
+            local_token_paths.append(tok_upload_path)
+            stage1_entries.append((ROOT / "h3_drive_upload.py", "h3_drive_upload.py", None))
+            stage1_entries.append((tok_upload_path, "drive_upload_token.json", 0o600))
+            record({"event": "drive_upload_block_ready", "session": session,
+                    "run_id": run_id, "folder_id": drive_upload["folder_id"]})
+        except Exception as e:  # noqa: BLE001 - fail-soft to controller delivery
+            drive_upload = None
+            record({"event": "drive_upload_block_failed", "session": session,
+                    "run_id": run_id, "error_type": type(e).__name__,
+                    "error": str(e)[:300]})
+
+        build_bootstrap_tar(stage1_tar, stage1_entries,
+                            forbidden=frozenset({"h3_remote_worker.py"}))
+        run_cli(["upload", "-s", session, str(stage1_tar),
+                 "/content/bootstrap_stage1.tar.gz"], timeout=300)
+        cli_round_trips += 1
+    finally:
+        if stage1_tar.exists():
+            try:
+                stage1_tar.unlink()
+            except OSError:
+                pass
+        for tp in local_token_paths:
+            if tp.exists():
+                try:
+                    tp.unlink()
+                except OSError:
+                    pass
+
+    download_probe = exec_script(session, ROOT / "h3_bootstrap_stage1.py", timeout=180)
+    cli_round_trips += 1
+    persist_exec_result(run_dir, f"drive_download_probe_{variant}", download_probe)
+    if "MUSE_DRIVE_DOWNLOAD_PROBE_OK" not in (download_probe or {}).get("stdout", ""):
+        raise RuntimeError("Remote Drive download probe failed; release GPU")
+    record({"event": "drive_download_probe_ok", "session": session,
+            "run_id": run_id,
+            "probe_file_id": drive_download["probe"]["file_id"]})
+    _finish("bundled_stage1")
+    _finish("drive_download_probe")
+
+    # Stage 2: ONLY built and uploaded AFTER Stage 1 probe passes.
+    _begin("bundled_stage2")
+    elapsed = time.monotonic() - start
+    if elapsed > budget_sec:
+        raise TimeoutError("Budget wall time reached before " + variant)
+    task = {"variant": variant, "run_id": run_id, "drive_cache_dir": drive_download["dest_dir"],
+            "comfy_ref": args.comfy_ref,
+            "production_task_id": getattr(args, "production_task_id", PRODUCTION_TASK_ID),
+            "task_spec": spec.to_dict(),
+            "inference_timeout_sec": min(1800, max(100, int(budget_sec - elapsed - 120))),
+            "rate_cu_h": live_rate,
+            "session_budget_cu": round(budget_sec * float(live_rate) / 3600.0, 3),
+            "comfyui_cache": _comfyui_cache_task(),
+            "drive_source": "download",
+            "drive_download": drive_download,
+            "keep_warm_ttl_sec": _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))}
+    if drive_upload is not None:
+        task["drive_upload"] = drive_upload
+    task_path = RUNS / f"task_{session}.json"
+    task_path.write_text(json.dumps(task))
+
+    stage2_tar = run_dir / "bootstrap_stage2.tar.gz"
+    try:
+        stage2_entries = [
+            (ROOT / "h3_job_state.py", "h3_job_state.py", None),
+            (ROOT / "h3_remote_worker.py", "h3_remote_worker.py", None),
+            (ROOT / "h3_worker_launcher.py", "h3_worker_launcher.py", None),
+            (task_path, "task.json", None),
+        ]
+        build_bootstrap_tar(stage2_tar, stage2_entries)
+        run_cli(["upload", "-s", session, str(stage2_tar),
+                 REMOTE + "/bootstrap_stage2.tar.gz"], timeout=300)
+        cli_round_trips += 1
+    finally:
+        if stage2_tar.exists():
+            try:
+                stage2_tar.unlink()
+            except OSError:
+                pass
+
+    _finish("bundled_stage2")
+    _finish("upload_task")
+    boot_wall = round(time.monotonic() - boot_t0, 3)
+    # +1 round trip accounts for launch_worker(session, bundled=True).
+    _manifest_update(run_id, task_state="WORKER_STARTED", heartbeat=True,
+                     bootstrap={"mode": "bundled",
+                                "bootstrap_wall_sec": boot_wall,
+                                "cli_round_trips": cli_round_trips + 1})
+    return {"drive_download": drive_download, "drive_upload": drive_upload,
+            "task": task, "renewal_state": renewal_state,
+            "bundled": True, "cli_round_trips": cli_round_trips + 1}
 
 
 @_with_task_lock
@@ -2653,6 +3352,36 @@ def run_variant(args) -> dict:
 
 DEFAULT_MAX_TASK_ATTEMPTS = 2
 MAX_TASK_ATTEMPTS_LIMIT = 3
+# v0.3.0 M1: elastic backoff rounds for GPU allocation. A deliver /
+# --auto-recover run retries capacity failures across rounds (default 3);
+# a raw single run does not (default 1). --allocation-rounds overrides
+# either (1..5).
+DEFAULT_ALLOCATION_ROUNDS_DELIVER = 3
+DEFAULT_ALLOCATION_ROUNDS_RUN = 1
+MAX_ALLOCATION_ROUNDS = 5
+# Backoff sleep indirection: tests patch hc.sleep_fn instead of sleeping.
+sleep_fn = time.sleep
+
+
+def resolve_allocation_rounds(args) -> int:
+    """Resolve --allocation-rounds for one run (v0.3.0 M1).
+
+    An explicit value must be an integer 1..MAX_ALLOCATION_ROUNDS.
+    Otherwise deliver / --auto-recover default to
+    DEFAULT_ALLOCATION_ROUNDS_DELIVER and a raw run to
+    DEFAULT_ALLOCATION_ROUNDS_RUN."""
+    raw = getattr(args, "allocation_rounds", None)
+    if raw is None:
+        if getattr(args, "action", None) == "deliver" or getattr(args, "auto_recover", False):
+            return DEFAULT_ALLOCATION_ROUNDS_DELIVER
+        return DEFAULT_ALLOCATION_ROUNDS_RUN
+    try:
+        rounds = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"--allocation-rounds must be an integer 1..{MAX_ALLOCATION_ROUNDS}, got {raw!r}") from None
+    if not 1 <= rounds <= MAX_ALLOCATION_ROUNDS:
+        raise ValueError(f"--allocation-rounds must be 1..{MAX_ALLOCATION_ROUNDS}, got {rounds}")
+    return rounds
 # Minimum viable wall time for a fresh attempt (40 min): model restore
 # plus ~22 min inference plus download/stop margin. The actual wall is
 # whatever allowed_runtime_seconds() grants from the live rate and the
@@ -2661,6 +3390,23 @@ MIN_ATTEMPT_WALL_SEC = 2400
 DEADLINE_MARGIN_SEC = 300
 SESSION_STOP_WAIT_ATTEMPTS = 3
 SESSION_STOP_WAIT_INTERVAL_SEC = 10
+
+# v0.3.0 M4: warm-pool TTL bounds (seconds). 0 disables the pool;
+# a live TTL is 60..900 s. The session's 14400 s lifetime cap and the
+# 25.0 CU per-session budget always bound the actual expiry.
+WARM_TTL_MIN_SEC = 60
+WARM_TTL_MAX_SEC = 900
+
+
+def _validate_keep_warm_ttl(value) -> int:
+    """Validate --keep-warm-ttl: 0 (pool disabled) or 60..900 seconds."""
+    try:
+        ttl = int(0 if value is None else value)
+    except (TypeError, ValueError):
+        raise ValueError(f"--keep-warm-ttl must be an integer (0 or {WARM_TTL_MIN_SEC}..{WARM_TTL_MAX_SEC}), got {value!r}") from None
+    if ttl == 0 or WARM_TTL_MIN_SEC <= ttl <= WARM_TTL_MAX_SEC:
+        return ttl
+    raise ValueError(f"--keep-warm-ttl must be 0 or {WARM_TTL_MIN_SEC}..{WARM_TTL_MAX_SEC}, got {ttl}")
 
 # Substrings that mark an error as deterministic — retrying it would
 # only burn CU: account/permission problems, reference/model SHA-256
@@ -2902,7 +3648,11 @@ def deliver_task(args) -> dict:
         # 1. Reuse an already-delivered run (0 CU).
         completed = [m for m in runs if m.get("task_state") == "TASK_COMPLETED"]
         for manifest in sorted(completed, key=lambda m: m.get("created_at_utc", ""), reverse=True):
-            status, payload = _verify_completed_delivery(manifest)
+            status, payload = _call_with_transient_retry(
+                lambda m=manifest: _verify_completed_delivery(m),
+                max_attempts=5,
+                delays=(5, 10, 20, 30),
+            )
             if status == "verified":
                 steps.append({"step": "reused_completed", "run_id": manifest.get("run_id")})
                 return _deliver_result(True, "reused_completed", task_id, manifest.get("run_id"),
@@ -2982,7 +3732,7 @@ def deliver_task(args) -> dict:
                                        f"refusing a second GPU")
             steps.append({"step": "previous_session_stopped", "run_id": latest.get("run_id")})
         try:
-            live = inspect()
+            live = _call_with_transient_retry(inspect, max_attempts=5, delays=(5, 10, 20, 30))
         except Exception as e:  # noqa: BLE001 - live data is the gate input
             return _deliver_result(False, "live_unreadable", task_id,
                                    latest.get("run_id") if latest else None, None,
@@ -3074,6 +3824,269 @@ def deliver_task(args) -> dict:
         return _deliver_result(True, "new_attempt_succeeded", task_id, run_id,
                                (result or {}).get("delivery"), attempts_used + 1,
                                max_attempts, steps)
+
+
+def _try_claim_warm_session(
+    args,
+    spec: TaskSpec,
+    ledger: dict,
+    run_dir: Path,
+    pre: dict,
+    start: float,
+) -> dict | None:
+    """Look up and claim a healthy warm-pooled GPU session (v0.3.0 M4).
+
+    Enforces all 5 gates:
+    (a) comfy_ref and model_manifest_sha256 match
+    (b) query_session_state(sid) == ACTIVE
+    (c) elapsed_lifetime + MIN_ATTEMPT_WALL_SEC <= MAX_SESSION_SECONDS (14400s)
+    (d) session_budget_spent_cu + est_new_task_cu + CLEANUP_RESERVE_CU (0.75) <= PER_SESSION_BUDGET_CU (25.0)
+    (e) remote h3_warm_health_probe.py prints MUSE_WARM_HEALTH_OK
+
+    Any failure returns None (never raises): the caller falls back to
+    the cold allocation path, or fails closed when a session is still
+    active and unclaimed.
+    """
+    from h3_gpu_lease_registry import current_owner_id
+    from h3_session_watchdog import SessionState, query_session_state, update_session_deadline
+
+    registry = _lease_registry()
+    if not hasattr(registry, "find_warm_leases"):
+        return None
+    try:
+        # Fast path: pure local check before invoking `colab whoami`.
+        if not registry.find_warm_leases():
+            return None
+        owner = current_owner_id(_COLAB_AUTH)
+        candidates = registry.find_warm_leases(owner_id=owner)
+    except Exception:  # noqa: BLE001
+        return None
+    if not candidates:
+        return None
+
+    manifest_sha = _file_sha256(Path(args.cache_manifest)) if Path(args.cache_manifest).is_file() else None
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    for lease in candidates:
+        sid = lease.get("session_id")
+        if not sid:
+            continue
+        # Gate (a): comfy_ref & model_manifest_sha256 match
+        if lease.get("comfy_ref") != args.comfy_ref:
+            continue
+        if manifest_sha and lease.get("model_manifest_sha256") != manifest_sha:
+            continue
+        # Gate (c): elapsed_lifetime + MIN_ATTEMPT_WALL_SEC <= MAX_SESSION_SECONDS
+        created_raw = lease.get("created_at_utc") or lease.get("started_at_utc")
+        elapsed_sec = 0.0
+        if created_raw:
+            try:
+                created_dt = datetime.datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=datetime.timezone.utc)
+                elapsed_sec = max(0.0, (now - created_dt).total_seconds())
+            except ValueError:
+                continue
+        if elapsed_sec + MIN_ATTEMPT_WALL_SEC > MAX_SESSION_SECONDS:
+            continue
+        # Gate (d): session_budget_spent_cu + est_new_task_cu + CLEANUP_RESERVE_CU <= 25.0 CU
+        rate = float(lease.get("rate_cu_h") or pre.get("rate") or getattr(args, "max_rate_cu_h", 14.0))
+        if rate <= 0:
+            rate = float(getattr(args, "max_rate_cu_h", 14.0))
+        spent_cu = float(lease.get("session_budget_spent_cu") or 0.0)
+        est_new_task_cu = round(MIN_ATTEMPT_WALL_SEC / 3600.0 * rate, 4)
+        if spent_cu + est_new_task_cu + CLEANUP_RESERVE_CU > PER_SESSION_BUDGET_CU:
+            continue
+        # Gate (b): live session state == ACTIVE
+        try:
+            state = _call_with_transient_retry(
+                lambda s=sid: query_session_state(s, colab_auth=_COLAB_AUTH),
+                max_attempts=3,
+                delays=(2, 5),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if state != SessionState.ACTIVE:
+            continue
+        # Gate (e): remote :8188/object_info health probe
+        try:
+            probe = exec_script(sid, ROOT / "h3_warm_health_probe.py", timeout=60)
+        except Exception:  # noqa: BLE001
+            continue
+        if "MUSE_WARM_HEALTH_OK" not in (probe or {}).get("stdout", ""):
+            continue
+        # Compute remaining allowed wall time for this session
+        try:
+            budget_sec = allowed_runtime_seconds(
+                rate, pre["cu_balance"], ledger,
+                session_spent_cu=spent_cu, unbilled_cu=0.0,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        remaining_lifetime = max(0, int(MAX_SESSION_SECONDS - elapsed_sec))
+        budget_sec = min(budget_sec, remaining_lifetime, getattr(args, "max_wall_sec", MAX_SESSION_SECONDS))
+        if budget_sec < 300:
+            continue
+        new_deadline = (now + datetime.timedelta(seconds=budget_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        claimed = registry.claim_warm_lease(
+            sid,
+            args.run_id,
+            args.production_task_id,
+            new_deadline,
+        )
+        if claimed is None:
+            continue
+        try:
+            update_session_deadline(sid, new_deadline)
+        except Exception:  # noqa: BLE001
+            pass
+        record({
+            "event": "warm_session_claimed",
+            "session": sid,
+            "run_id": args.run_id,
+            "production_task_id": args.production_task_id,
+            "budget_sec": budget_sec,
+            "rate_cu_h": rate,
+            "session_budget_spent_cu": spent_cu,
+        })
+        return {
+            "session": sid,
+            "lease": claimed,
+            "budget_sec": budget_sec,
+            "rate_cu_h": rate,
+            "deadline_utc": new_deadline,
+            "session_spent_cu": spent_cu,
+            "gpu_model": claimed.get("gpu_model") or lease.get("gpu_model") or "G4",
+            "started_at_utc": created_raw or now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    return None
+
+
+def _dispatch_warm_stage2(
+    args,
+    session: str,
+    spec: TaskSpec,
+    run_dir: Path,
+    budget_sec: int,
+    live_rate: float,
+    start: float,
+) -> dict:
+    """Lightweight Stage-2 bundle dispatch for a reused warm session
+    (v0.3.0 M4). No Stage-1 probe: the models are already in the NVMe
+    store and the health probe (gate (e)) already proved the resident
+    ComfyUI is alive. The bundle carries the task, the worker, the
+    launcher, the refs and the submitted workflow — plus the Drive
+    upload block (fail-soft) when it can be built."""
+    import h3_drive_token
+
+    run_id = args.run_id
+    variant = spec.output_prefix
+    boot_t0 = time.monotonic()
+    ref1_path = getattr(args, "_ref_image_1_path", None)
+    ref2_path = getattr(args, "_ref_image_2_path", None)
+    if ref1_path is None or ref2_path is None:
+        refs = _materialize_ref_images(spec, run_dir)
+        ref1_path, ref2_path = refs["ref_image_1"], refs["ref_image_2"]
+        args._ref_image_1_path, args._ref_image_2_path = ref1_path, ref2_path
+
+    api = validate_comfy_workflow(args.workflow_api, spec)
+    submitted_path = run_dir / f"workflow_{variant}_submitted.json"
+    submitted_path.write_text(json.dumps(api, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    drive_upload = None
+    tok_upload_path = None
+    try:
+        drive_upload = _build_drive_upload_block(run_id, variant)
+        tok_upload_doc = h3_drive_token.mint_file_token()
+        tok_upload_path = run_dir / "drive_upload_token.json"
+        h3_drive_token.write_token_file(tok_upload_path, tok_upload_doc)
+    except Exception as e:  # noqa: BLE001 - fail-soft
+        drive_upload = None
+        tok_upload_path = None
+        record({"event": "drive_upload_block_failed", "session": session,
+                "run_id": run_id, "error_type": type(e).__name__,
+                "error": str(e)[:300]})
+
+    elapsed = time.monotonic() - start
+    keep_warm_ttl = _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))
+    task = {
+        "variant": variant,
+        "run_id": run_id,
+        "drive_cache_dir": "/content/nvme_models/h3",
+        "comfy_ref": args.comfy_ref,
+        "production_task_id": getattr(args, "production_task_id", PRODUCTION_TASK_ID),
+        "task_spec": spec.to_dict(),
+        "inference_timeout_sec": min(1800, max(100, int(budget_sec - elapsed - 120))),
+        "rate_cu_h": live_rate,
+        "session_budget_cu": round(budget_sec * float(live_rate) / 3600.0, 3),
+        "comfyui_cache": _comfyui_cache_task(),
+        "drive_source": "download",
+        "drive_download": None,
+        "warm_session_reused": True,
+        "keep_warm_ttl_sec": keep_warm_ttl,
+    }
+    if drive_upload is not None:
+        task["drive_upload"] = drive_upload
+    task_path = RUNS / f"task_{session}.json"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+
+    stage2_tar = run_dir / "bootstrap_stage2.tar.gz"
+    try:
+        entries: list[tuple[Path, str, int | None]] = [
+            (ROOT / "h3_job_state.py", "h3_job_state.py", None),
+            (ROOT / "h3_remote_worker.py", "h3_remote_worker.py", None),
+            (ROOT / "h3_worker_launcher.py", "h3_worker_launcher.py", None),
+            (task_path, "task.json", None),
+            (Path(ref1_path), "poster.jpg", None),
+            (Path(ref1_path), "ref_image_1.jpg", None),
+            (Path(ref2_path), "ref_image_2.jpg", None),
+            (submitted_path, "workflow_submitted.json", None),
+        ]
+        if drive_upload is not None and tok_upload_path is not None:
+            entries.append((ROOT / "h3_drive_upload.py", "h3_drive_upload.py", None))
+            entries.append((tok_upload_path, "drive_upload_token.json", 0o600))
+        build_bootstrap_tar(stage2_tar, entries)
+        run_cli(["upload", "-s", session, str(stage2_tar), REMOTE + "/bootstrap_stage2.tar.gz"], timeout=300)
+    finally:
+        if stage2_tar.exists():
+            try:
+                stage2_tar.unlink()
+            except OSError:
+                pass
+        if tok_upload_path is not None and tok_upload_path.exists():
+            try:
+                tok_upload_path.unlink()
+            except OSError:
+                pass
+
+    boot_wall = round(time.monotonic() - boot_t0, 3)
+    _manifest_update(
+        run_id,
+        task_state="WORKER_STARTED",
+        heartbeat=True,
+        artifacts={"warm_session_reused": True},
+        bootstrap={
+            "mode": "warm_reuse",
+            "bootstrap_wall_sec": boot_wall,
+            "cli_round_trips": 2,
+        },
+    )
+    record({
+        "event": "warm_session_reused",
+        "session": session,
+        "run_id": run_id,
+        "bootstrap_wall_sec": boot_wall,
+    })
+    return {
+        "drive_download": None,
+        "drive_upload": drive_upload,
+        "task": task,
+        "renewal_state": {"count": 0, "last_token_id": None},
+        "bundled": True,
+        "cli_round_trips": 2,
+        "bootstrap_wall_sec": boot_wall,
+    }
 
 
 def _run_variant_inner(args) -> dict:
@@ -3173,46 +4186,84 @@ def _run_variant_inner(args) -> dict:
     pre = inspect()
     if pre["cu_balance"] is None:
         raise RuntimeError("Cannot parse CU balance; abort")
-    ensure_no_foreign_sessions(pre)
-    # Watchdog reconciliation: any managed session still active blocks a
-    # new allocation. An unconfirmable leftover is a hard stop, never a
-    # reason to run a second GPU in parallel — and never a reason to stop
-    # a session that is not one of ours.
-    from h3_session_watchdog import reconcile_on_startup
+    # v0.3.0 M4: warm-pool reuse is allowed ONLY when every active
+    # session in pre["sessions"] is our own valid warm-idle lease. Any
+    # foreign or non-warm-owned active session fails closed immediately.
+    run_dir = RUNS / args.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    start = time.monotonic()
+    warm_claim = None
+    pre_sessions = pre.get("sessions") or []
+    if pre_sessions:
+        owned_warm_ids: set[str] = set()
+        if drive_source == "download":
+            try:
+                from h3_gpu_lease_registry import current_owner_id
 
-    rec = reconcile_on_startup(_COLAB_AUTH)
-    if rec.get("managed_active_sessions"):
-        detail = rec.get("managed_active_detail") or [
-            {"session_id": s} for s in rec["managed_active_sessions"]]
-        lines = []
-        for d in detail:
-            est = d.get("unbilled_estimate_cu")
-            # TASK-006 P1-B: name an allocating record explicitly — its
-            # controller died mid-allocation, so the operator stops it
-            # or resumes its run; it is never silently adopted.
-            allocating = " [ALLOCATING — controller died mid-allocation]" \
-                if d.get("allocating") else ""
-            lines.append(
-                f"{d.get('session_id')} (run {d.get('run_id')}, task {d.get('production_task_id')}, "
-                f"deadline {d.get('deadline_utc')}, unbilled estimate "
-                f"{est if est is not None else 'unconfirmable'} CU){allocating}")
-        raise RuntimeError(
-            "CRITICAL_ORPHAN_GPU_SESSION: managed GPU session(s) still active; refusing to allocate "
-            "another GPU in parallel. Stop them first (never stop non-project sessions): "
-            + "; ".join(lines))
+                reg = _lease_registry()
+                if hasattr(reg, "find_warm_leases") and reg.find_warm_leases():
+                    owner = current_owner_id(_COLAB_AUTH)
+                    owned_warm_ids = {
+                        l["session_id"]
+                        for l in reg.find_warm_leases(owner_id=owner)
+                        if l.get("session_id")
+                    }
+            except Exception:  # noqa: BLE001 - fail closed on any registry/owner error
+                owned_warm_ids = set()
+
+        def _pre_sess_name(s) -> str:
+            return s.get("name", "") if isinstance(s, dict) else str(s)
+
+        if any(_pre_sess_name(s) not in owned_warm_ids for s in pre_sessions):
+            ensure_no_foreign_sessions(pre)
+        if drive_source == "download":
+            warm_claim = _try_claim_warm_session(args, spec, ledger, run_dir, pre, start)
+        if warm_claim is None:
+            # Warm claim declined (budget >= 25 CU, manifest mismatch, or
+            # unhealthy :8188): never allocate a 2nd GPU while an active
+            # session is still running.
+            ensure_no_foreign_sessions(pre)
+    else:
+        ensure_no_foreign_sessions(pre)
+
+    if warm_claim is None:
+        # Watchdog reconciliation: any managed session still active blocks a
+        # new allocation. An unconfirmable leftover is a hard stop, never a
+        # reason to run a second GPU in parallel — and never a reason to stop
+        # a session that is not one of ours.
+        from h3_session_watchdog import reconcile_on_startup
+
+        rec = reconcile_on_startup(_COLAB_AUTH)
+        if rec.get("managed_active_sessions"):
+            detail = rec.get("managed_active_detail") or [
+                {"session_id": s} for s in rec["managed_active_sessions"]]
+            lines = []
+            for d in detail:
+                est = d.get("unbilled_estimate_cu")
+                # TASK-006 P1-B: name an allocating record explicitly — its
+                # controller died mid-allocation, so the operator stops it
+                # or resumes its run; it is never silently adopted.
+                allocating = " [ALLOCATING — controller died mid-allocation]" \
+                    if d.get("allocating") else ""
+                lines.append(
+                    f"{d.get('session_id')} (run {d.get('run_id')}, task {d.get('production_task_id')}, "
+                    f"deadline {d.get('deadline_utc')}, unbilled estimate "
+                    f"{est if est is not None else 'unconfirmable'} CU){allocating}")
+            raise RuntimeError(
+                "CRITICAL_ORPHAN_GPU_SESSION: managed GPU session(s) still active; refusing to allocate "
+                "another GPU in parallel. Stop them first (never stop non-project sessions): "
+                + "; ".join(lines))
     if drive_source == "mount":
         probe = run_cli(['drivemount', '--help'], timeout=20, check=False)
         if probe["returncode"] != 0:
             raise RuntimeError("Official Colab drivemount unavailable")
         if not sys.stdin.isatty():
             raise RuntimeError("Official drivemount requires interactive terminal; no TTY, abort BEFORE GPU allocation")
-    else:
+    elif warm_claim is None:
         # Noninteractive path: prove the download chain (mint + metadata
         # read with the minted token) BEFORE any paid GPU exists.
         verify_drive_download_preflight(args)
 
-    run_dir = RUNS / args.run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
     # From here on, every remote exec result is persisted to this run dir.
     _EXEC_LOG_DIR = run_dir
     out_dir = OUTPUT_ROOT / args.run_id
@@ -3233,11 +4284,35 @@ def _run_variant_inner(args) -> dict:
     gpu_info = None
     chosen_key = None
     attempts = []
-    start = time.monotonic()
+    warm_pooled = False
+    warm_expires_at_utc = None
+    session_started_at_utc = None
+    session_budget_deadline_utc = None
+    live_rate_observed = None
+    session_spent_prior_cu = 0.0
     session_spent_start = float(ledger.get("max_observed_spent_cu", 0.0))
     try:
-        # Allocation loop: G4, G4 retry, A100_HIGH_MEM (only on capacity failure).
-        # Transport errors retry the same G4 once and never trigger A100 fallback.
+        if warm_claim is not None:
+            session = warm_claim["session"]
+            chosen_key = warm_claim["gpu_model"]
+            created = True
+            allocation_attempted = True
+            session_started_at_utc = warm_claim["started_at_utc"]
+            session_budget_deadline_utc = warm_claim["deadline_utc"]
+            live_rate_observed = warm_claim["rate_cu_h"]
+            session_spent_prior_cu = float(warm_claim.get("session_spent_cu") or 0.0)
+            budget_sec = int(warm_claim["budget_sec"])
+            gpu_info = {"gpu": chosen_key, "warm_reused": True}
+            _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
+                             session_id=session, session_state="ACTIVE")
+        # Allocation loop (v0.3.0 M1): outer elastic backoff rounds
+        # wrapping the inner GPU_ATTEMPT_PLAN = (G4, G4 retry,
+        # A100_HIGH_MEM). Capacity failures exhaust the inner plan, then
+        # back off (15s / 45s / 90s ±20%) before the next round; fatal,
+        # quota and unknown errors fail fast with no retry. Transport
+        # errors retry the same G4 once and never trigger A100 fallback.
+        # (Skipped entirely when a warm session was claimed: the loop
+        # below runs zero rounds, and the guard after it is warm-aware.)
         # Empty POSTs carry data=b'{}' via the vendored CLI patch (see
         # cli_post_body_patch_present / V3_CLI_PROXY_PATCH.md); without it
         # the egress proxy strips Content-Length: 0 and Google returns 411.
@@ -3249,60 +4324,146 @@ def _run_variant_inner(args) -> dict:
         # a record reconcile can resolve, not an invisible billing GPU.
         # The post-probe update replaces this deadline with the
         # budget-derived value at the actual live rate.
+        allocation_rounds = 0 if warm_claim is not None else resolve_allocation_rounds(args)
+        # Sleep injection for offline tests: args may carry sleep_fn /
+        # jitter_fn (the fault-injection harness passes them); production
+        # uses the module-level sleep_fn (time.sleep) and random jitter.
+        _sleep = getattr(args, "sleep_fn", None) or sleep_fn
+        _jitter = getattr(args, "jitter_fn", None)
+        alloc_started_utc = datetime.datetime.now(datetime.timezone.utc)
         pre_max_rate = max(c["max_rate_cu_h"] for c in GPU_CHOICES.values())
-        pre_deadline = (datetime.datetime.now(datetime.timezone.utc)
+        pre_deadline = (alloc_started_utc
                         + datetime.timedelta(
                             seconds=initial_session_wall_seconds(pre_max_rate)))
-        for attempt in range(3):
-            choice = choose_gpu_candidate(attempt)
-            chosen_key = choice["key"]
-            session = allocate_managed_session(choice, args.run_id)
-            allocation_attempted = True
-            record({"event": "allocation_attempt", "session": session, "gpu": chosen_key, "variant": variant, "run_id": args.run_id})
-            # TASK-006 P1-B: pre-register the session as `allocating`
-            # and the lease as non-final BEFORE the CLI `new` call.
-            # A lease-registration failure here raises before any GPU
-            # exists; the outer finally stops nothing (the session was
-            # never created) and the run fails closed.
-            from h3_session_watchdog import record_session
-
-            record_session(session, chosen_key, args.run_id, pre_deadline.isoformat(),
-                           production_task_id=args.production_task_id, status="allocating")
-            _register_gpu_lease(session, chosen_key, args.run_id,
-                                args.production_task_id, pre_deadline.isoformat(),
-                                args.per_session_budget_cu,
-                                max_wall_sec=args.max_wall_sec)
+        explicit_deadline = parse_task_deadline(getattr(args, "task_deadline_utc", "") or "")
+        ledger_deadline = ledger.get("deadline_utc") if isinstance(ledger, dict) else None
+        effective_deadline = explicit_deadline
+        if effective_deadline is None and ledger_deadline:
             try:
-                cmd = allocation_command(session, chosen_key, allow_g4=args.allow_g4, allow_a100_highmem=args.allow_a100_highmem)
-                # 420s: with the POST-body patch a G4 503 is retried inside
-                # the CLI (up to 3 retries, 30s each + 10/20/40s backoff).
-                run_cli(cmd, timeout=420)
-            except Exception as e:
-                attempts.append({"session": session, "gpu": chosen_key, "status": "allocation_failed", "error": str(e)[:500]})
-                # Reconcile late allocation before deciding on fallback.
-                time.sleep(5)
+                ledger_dt = datetime.datetime.strptime(
+                    str(ledger_deadline), "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=datetime.timezone.utc)
+                if ledger_dt <= alloc_started_utc:
+                    record({
+                        "event": "stale_ledger_deadline_ignored",
+                        "run_id": args.run_id,
+                        "stale_deadline_utc": ledger_deadline,
+                    })
+                else:
+                    effective_deadline = ledger_deadline
+            except ValueError:
+                effective_deadline = None
+        for round_idx in range(allocation_rounds):
+            round_last_capacity_err = None
+            for attempt in range(len(GPU_ATTEMPT_PLAN)):
+                choice = choose_gpu_candidate(attempt)
+                chosen_key = choice["key"]
+                session = allocate_managed_session(choice, args.run_id)
+                allocation_attempted = True
+                record({"event": "allocation_attempt", "session": session, "gpu": chosen_key, "variant": variant, "run_id": args.run_id,
+                        "round": round_idx + 1, "total_rounds": allocation_rounds})
+                # TASK-006 P1-B: pre-register the session as `allocating`
+                # and the lease as non-final BEFORE the CLI `new` call.
+                # A lease-registration failure here raises before any GPU
+                # exists; the outer finally stops nothing (the session was
+                # never created) and the run fails closed.
+                from h3_session_watchdog import record_session
+
+                record_session(session, chosen_key, args.run_id, pre_deadline.isoformat(),
+                               production_task_id=args.production_task_id, status="allocating")
+                _register_gpu_lease(session, chosen_key, args.run_id,
+                                    args.production_task_id, pre_deadline.isoformat(),
+                                    args.per_session_budget_cu,
+                                    max_wall_sec=args.max_wall_sec)
                 try:
-                    live_sessions = inspect()["sessions"]
-                    if any(s["name"] == session for s in live_sessions):
-                        raise RuntimeError(f"Late allocation appeared for {session} after a failed `new`; stop it and abort")
-                except RuntimeError:
-                    raise
+                    cmd = allocation_command(session, chosen_key, allow_g4=args.allow_g4, allow_a100_highmem=args.allow_a100_highmem)
+                    # 420s: with the POST-body patch a G4 503 is retried inside
+                    # the CLI (up to 3 retries, 30s each + 10/20/40s backoff).
+                    run_cli(cmd, timeout=420)
+                except Exception as e:
+                    attempts.append({"session": session, "gpu": chosen_key, "round": round_idx + 1,
+                                     "status": "allocation_failed", "error": str(e)[:500]})
+                    # Reconcile late allocation before deciding on fallback.
+                    _sleep(5)
+                    try:
+                        live_sessions = inspect()["sessions"]
+                        if any(s["name"] == session for s in live_sessions):
+                            raise RuntimeError(f"Late allocation appeared for {session} after a failed `new`; stop it and abort")
+                        # Confirmed no live session was created for this
+                        # failed attempt: mark its pre-registered lease
+                        # and allocating watchdog record stopped so it
+                        # never lingers as phantom `not_yet_due` in the
+                        # LeaseRegistry.
+                        _confirm_gpu_lease_stopped(session)
+                        try:
+                            from h3_session_watchdog import mark_session_stopped
+
+                            mark_session_stopped(session)
+                        except Exception:
+                            pass
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass
+                    err_class = classify_allocation_error(str(e))
+                    if err_class in ("AUTH_FATAL", "QUOTA_EXCEEDED", "UNKNOWN_FATAL"):
+                        raise RuntimeError(
+                            f"GPU allocation failed ({chosen_key}, {err_class}): {str(e)[:500]}; no fallback unless capacity failure"
+                        )
+                    if err_class == "CAPACITY_TRANSIENT":
+                        round_last_capacity_err = (err_class, str(e))
+                        if attempt < len(GPU_ATTEMPT_PLAN) - 1:
+                            continue
+                        break  # inner round exhausted on CAPACITY_TRANSIENT
+                    # TRANSPORT_TRANSIENT: retry the SAME GPU once
+                    # (attempt 0 -> 1, both G4). Never fall back to A100.
+                    if err_class == "TRANSPORT_TRANSIENT" and chosen_key == "G4" and attempt == 0:
+                        record({"event": "allocation_transport_retry", "session": session, "gpu": chosen_key, "error": str(e)[:300]})
+                        continue
+                    raise RuntimeError(f"GPU allocation failed ({chosen_key}): {str(e)[:500]}; no fallback unless capacity failure")
+                created = True
+                record({"event": "allocated", "session": session, "gpu": chosen_key,
+                        "round": round_idx + 1})
+                _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
+                                 session_id=session, session_state="ACTIVE")
+                break
+            if created:
+                break
+            if round_last_capacity_err is not None and round_idx + 1 < allocation_rounds:
+                err_class, err_msg = round_last_capacity_err
+                delay = compute_backoff_delay(round_idx, jitter_fn=_jitter)
+                if effective_deadline:
+                    deadline_dt = datetime.datetime.strptime(
+                        effective_deadline, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=datetime.timezone.utc)
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                    if (deadline_dt - now_dt).total_seconds() - delay < MIN_ATTEMPT_WALL_SEC + DEADLINE_MARGIN_SEC:
+                        raise RuntimeError(
+                            f"GPU allocation backoff aborted before round {round_idx + 2}: "
+                            f"task deadline {effective_deadline} too close"
+                        )
+                backoff_payload = {
+                    "round": round_idx + 1,
+                    "total_rounds": allocation_rounds,
+                    "sleep_sec": round(delay, 2),
+                    "error_class": err_class,
+                    "last_gpu": chosen_key,
+                }
+                record({"event": "GPU_ALLOCATION_BACKOFF", "run_id": args.run_id, **backoff_payload})
+                try:
+                    from h3_run_manifest import record_audit_event
+
+                    record_audit_event(ROOT, args.run_id, "GPU_ALLOCATION_BACKOFF", backoff_payload)
                 except Exception:
                     pass
-                if is_capacity_failure(str(e)) and attempt < 2:
-                    continue
-                # Transport errors retry the SAME GPU once (attempt 0 -> 1,
-                # both G4). They never justify falling back to A100.
-                if is_transient_transport_error(str(e)) and chosen_key == "G4" and attempt == 0:
-                    record({"event": "allocation_transport_retry", "session": session, "gpu": chosen_key, "error": str(e)[:300]})
-                    continue
-                raise RuntimeError(f"GPU allocation failed ({chosen_key}): {str(e)[:500]}; no fallback unless capacity failure")
-            created = True
-            record({"event": "allocated", "session": session, "gpu": chosen_key})
-            _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
-                             session_id=session, session_state="ACTIVE")
-            break
-        if not created or session is None:
+                _sleep(delay)
+                continue
+            if round_last_capacity_err is not None:
+                raise RuntimeError(
+                    f"GPU allocation failed ({chosen_key}): {round_last_capacity_err[1][:500]}; "
+                    f"exhausted {allocation_rounds} round(s)"
+                )
+        if warm_claim is None and (not created or session is None):
             raise RuntimeError("GPU allocation did not complete")
         # TASK-006 P1-B: confirm the pre-registered record. The CLI
         # returned, so the session is live and billable from here; the
@@ -3316,6 +4477,12 @@ def _run_variant_inner(args) -> dict:
             raise RuntimeError(
                 f"pre-registered session record for {session} vanished; "
                 "refusing to proceed with an unregistered GPU")
+        if warm_claim is None:
+            # Cold path: the session's true start comes from the
+            # pre-registered record. (Warm path: the claim already
+            # carries the original start, which the arm tail needs
+            # for the 14400 s lifetime cap.)
+            session_started_at_utc = session_rec.get("started_at_utc")
         # Watchdog record + background watcher. The pre-registration
         # deadline (most conservative, from the highest max rate) stands
         # until the GPU probe below, when it is replaced with the
@@ -3350,51 +4517,60 @@ def _run_variant_inner(args) -> dict:
                 raise
             raise RuntimeError(f"WATCHDOG_NOT_RUNNING: watchdog failed to start: {e}") from e
         try:
-            # GPU hardware probe before any expensive work.
-            gpu_info = probe_actual_gpu(session, chosen_key)
-            record({"event": "gpu_probed", "session": session, **gpu_info})
-            live = _inspect_live(args.run_id)
-            if live["rate"] is None or live["rate"] <= 0 or live["rate"] > args.max_rate_cu_h:
-                raise RuntimeError("Unknown/excessive live CU/hr rate")
-            # Reconcile ledger with the live balance after allocation.
-            ledger = reconcile_budget(ledger, live["cu_balance"], LEDGER_PATH)
-            # Unbilled-session estimate: the posted balance lags the real
-            # burn, so gate on the effective balance too (item 7). At this
-            # point only ~1-2 min have elapsed, so the estimate is small;
-            # the watchdog applies the same estimate on every poll.
-            unbilled = estimate_unbilled_cu(session_rec.get("started_at_utc"), live["rate"])
-            record({"event": "unbilled_estimate", "session": session, "unbilled_cu": unbilled,
-                    "rate_cu_h": live["rate"], "posted_balance_cu": live["cu_balance"]})
-            budget_sec = allowed_runtime_seconds(live["rate"], live["cu_balance"], ledger,
-                                                 session_spent_cu=unbilled, unbilled_cu=unbilled)
-            budget_sec = min(budget_sec, args.max_wall_sec)
-            if budget_sec < 300:
-                raise RuntimeError("Budget cannot cover minimal task + cleanup reserve")
-            # Replace the conservative initial watchdog deadline with the
-            # budget-derived wall time at the actual live rate.
-            from h3_session_watchdog import update_session_deadline
+            if warm_claim is None:
+                # GPU hardware probe before any expensive work.
+                gpu_info = probe_actual_gpu(session, chosen_key)
+                record({"event": "gpu_probed", "session": session, **gpu_info})
+                live = _inspect_live(args.run_id)
+                if live["rate"] is None or live["rate"] <= 0 or live["rate"] > args.max_rate_cu_h:
+                    raise RuntimeError("Unknown/excessive live CU/hr rate")
+                live_rate_observed = live["rate"]
+                # Reconcile ledger with the live balance after allocation.
+                ledger = reconcile_budget(ledger, live["cu_balance"], LEDGER_PATH)
+                # Unbilled-session estimate: the posted balance lags the real
+                # burn, so gate on the effective balance too (item 7). At this
+                # point only ~1-2 min have elapsed, so the estimate is small;
+                # the watchdog applies the same estimate on every poll.
+                unbilled = estimate_unbilled_cu(session_rec.get("started_at_utc"), live["rate"])
+                record({"event": "unbilled_estimate", "session": session, "unbilled_cu": unbilled,
+                        "rate_cu_h": live["rate"], "posted_balance_cu": live["cu_balance"]})
+                budget_sec = allowed_runtime_seconds(live["rate"], live["cu_balance"], ledger,
+                                                     session_spent_cu=unbilled, unbilled_cu=unbilled)
+                budget_sec = min(budget_sec, args.max_wall_sec)
+                if budget_sec < 300:
+                    raise RuntimeError("Budget cannot cover minimal task + cleanup reserve")
+                # Replace the conservative initial watchdog deadline with the
+                # budget-derived wall time at the actual live rate.
+                from h3_session_watchdog import update_session_deadline
 
-            new_deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=budget_sec)
-            update_session_deadline(session, new_deadline.isoformat())
-            # TASK-006 P0-C: finalise the lease deadline for the backup
-            # executor (fail-closed since TASK-007: a local write failure
-            # raises into the outer finally, which stops the session;
-            # only a Drive mirror failure degrades to a warning).
-            _update_gpu_lease_deadline(session, new_deadline.isoformat())
-            record({"event": "watchdog_deadline_updated", "session": session,
-                    "budget_sec": budget_sec, "rate_cu_h": live["rate"],
-                    "deadline_utc": new_deadline.isoformat()})
-            # TASK-006 P1-B: the bootstrap sequence lives in
-            # _run_bootstrap (durable per-step state, resumable).
-            boot = _run_bootstrap(args, session, run_dir, budget_sec,
-                                live["rate"], start)
+                new_deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=budget_sec)
+                session_budget_deadline_utc = new_deadline.isoformat()
+                update_session_deadline(session, session_budget_deadline_utc)
+                # TASK-006 P0-C: finalise the lease deadline for the backup
+                # executor (fail-closed since TASK-007: a local write failure
+                # raises into the outer finally, which stops the session;
+                # only a Drive mirror failure degrades to a warning).
+                _update_gpu_lease_deadline(session, session_budget_deadline_utc)
+                record({"event": "watchdog_deadline_updated", "session": session,
+                        "budget_sec": budget_sec, "rate_cu_h": live["rate"],
+                        "deadline_utc": session_budget_deadline_utc})
+                # TASK-006 P1-B: the bootstrap sequence lives in
+                # _run_bootstrap (durable per-step state, resumable).
+                boot = _run_bootstrap(args, session, run_dir, budget_sec,
+                                    live["rate"], start)
+            else:
+                # Warm reuse: no probe, no bootstrap — the health probe
+                # already proved the resident ComfyUI, and the models are
+                # in the NVMe store. Dispatch the light Stage-2 bundle.
+                boot = _dispatch_warm_stage2(args, session, spec, run_dir, budget_sec,
+                                             live_rate_observed, start)
             renewal_state = boot["renewal_state"]
             # Recoverable control plane (TASK-005 §4.2): short-start the
             # detached worker, then poll its durable state file. The old
             # single long blocking exec is gone: a controller restart no
             # longer loses the worker's progress, and `resume` can pick
             # the run back up from the manifest + state file.
-            launch = launch_worker(session)
+            launch = launch_worker(session, bundled=bool(boot.get("bundled")))
             record({"event": "worker_launched", "variant": variant, "session": session, "launch": launch})
             # TASK-006 P1-B: record the launch durably. Resume uses it
             # to tell "worker launched but unobservable" (refuse, never
@@ -3487,46 +4663,116 @@ def _run_variant_inner(args) -> dict:
         # own errors internally).
         _exc = sys.exc_info()
         if allocation_attempted and session is not None:
-            stop_result = stop_and_verify_session(session)
-            stop_ok = stop_result["stopped_confirmed"]
-            if watchdog_proc is not None:
-                if stop_ok:
-                    try:
-                        watchdog_proc.terminate()
-                    except Exception:
-                        pass
+            # v0.3.0 M4: on healthy completion with --keep-warm-ttl > 0, arm
+            # a bounded warm lease instead of stopping immediately. Fail-closed:
+            # ANY error falls back to stop_and_verify_session(session).
+            keep_warm_ttl = _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))
+            if _exc[0] is None and production_result is not None and keep_warm_ttl > 0:
+                try:
+                    from h3_session_watchdog import update_session_deadline
+
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                    candidates_dt = [now_dt + datetime.timedelta(seconds=keep_warm_ttl)]
+                    if session_started_at_utc:
+                        st_dt = datetime.datetime.fromisoformat(str(session_started_at_utc).replace("Z", "+00:00"))
+                        if st_dt.tzinfo is None:
+                            st_dt = st_dt.replace(tzinfo=datetime.timezone.utc)
+                        candidates_dt.append(st_dt + datetime.timedelta(seconds=MAX_SESSION_SECONDS))
+                    if session_budget_deadline_utc:
+                        bd_dt = datetime.datetime.fromisoformat(str(session_budget_deadline_utc).replace("Z", "+00:00"))
+                        if bd_dt.tzinfo is None:
+                            bd_dt = bd_dt.replace(tzinfo=datetime.timezone.utc)
+                        candidates_dt.append(bd_dt)
+                    exp_dt = min(candidates_dt)
+                    if exp_dt <= now_dt:
+                        raise RuntimeError("Warm TTL deadline already exhausted by session lifetime/budget")
+                    warm_expires_at_utc = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    update_session_deadline(session, warm_expires_at_utc)
+                    elapsed_run_cu = estimate_unbilled_cu(session_started_at_utc, live_rate_observed, now=now_dt)
+                    total_session_spent_cu = round(max(session_spent_prior_cu, elapsed_run_cu), 4)
+                    manifest_sha = _file_sha256(Path(args.cache_manifest)) if Path(args.cache_manifest).is_file() else None
+                    registry = _lease_registry()
+                    marked = registry.mark_warm_idle(
+                        session,
+                        warm_ttl_sec=keep_warm_ttl,
+                        warm_expires_at_utc=warm_expires_at_utc,
+                        session_budget_spent_cu=total_session_spent_cu,
+                        run_id=args.run_id,
+                        comfy_ref=args.comfy_ref,
+                        model_manifest_sha256=manifest_sha,
+                        rate_cu_h=live_rate_observed,
+                    )
+                    if marked is None:
+                        raise RuntimeError(f"LeaseRegistry.mark_warm_idle returned None for {session}")
+                    warm_pooled = True
+                    stop_ok = True
+                    record({
+                        "event": "warm_session_pooled",
+                        "session": session,
+                        "run_id": args.run_id,
+                        "production_task_id": args.production_task_id,
+                        "warm_ttl_sec": keep_warm_ttl,
+                        "warm_expires_at_utc": warm_expires_at_utc,
+                        "session_budget_spent_cu": total_session_spent_cu,
+                    })
+                    _manifest_update(
+                        args.run_id,
+                        session_state="WARM_POOLED",
+                        artifacts={
+                            "warm_lease_armed": True,
+                            "warm_expires_at_utc": warm_expires_at_utc,
+                        },
+                    )
+                except Exception as warm_exc:  # noqa: BLE001 - fail-closed to immediate stop
+                    warm_pooled = False
+                    record({
+                        "event": "warm_pool_arm_failed_stopping",
+                        "session": session,
+                        "run_id": args.run_id,
+                        "error": str(warm_exc)[:300],
+                    })
+
+            if not warm_pooled:
+                stop_result = stop_and_verify_session(session)
+                stop_ok = stop_result["stopped_confirmed"]
+                if watchdog_proc is not None:
+                    if stop_ok:
+                        try:
+                            watchdog_proc.terminate()
+                        except Exception:
+                            pass
+                    else:
+                        # Leave the watchdog alive: it still enforces the
+                        # deadline/hard-stop for a session whose stop could
+                        # not be confirmed. The managed record stays `active`
+                        # (stop_and_verify_session marks it only on a
+                        # confirmed STOPPED), so reconcile/resume keep seeing
+                        # this session as a live, billable GPU.
+                        record({"event": "watchdog_left_running",
+                                "session": session, "run_id": args.run_id,
+                                "production_task_id": args.production_task_id,
+                                "stop_state": stop_result.get("state"),
+                                "reason": "stop not confirmed; watchdog keeps deadline protection"})
+                record({"event": "finished", "session": session, "variant": variant, "stop_verified": stop_ok,
+                        "run_id": args.run_id, "production_task_id": args.production_task_id,
+                        "stop_state": stop_result.get("state"),
+                        "record_marked": stop_result.get("record_marked", False),
+                        "allocation_attempted": allocation_attempted, "elapsed_sec": round(time.monotonic() - start, 1)})
+                # Durable manifest terminal update for the GPU phase (TASK-005
+                # §4.1): on the success path this records GPU_STOP_CONFIRMED;
+                # on any failure path it records FAILED with the real error.
+                # The Drive tail below runs only after this finally.
+                if _exc[0] is not None:
+                    _manifest_update(args.run_id, task_state="FAILED",
+                                     session_state="STOPPED" if stop_ok else "UNKNOWN",
+                                     last_error=f"{_exc[0].__name__}: {_exc[1]}"[:500])
+                elif stop_ok:
+                    _manifest_update(args.run_id, task_state="GPU_STOP_CONFIRMED",
+                                     session_state="STOPPED")
                 else:
-                    # Leave the watchdog alive: it still enforces the
-                    # deadline/hard-stop for a session whose stop could
-                    # not be confirmed. The managed record stays `active`
-                    # (stop_and_verify_session marks it only on a
-                    # confirmed STOPPED), so reconcile/resume keep seeing
-                    # this session as a live, billable GPU.
-                    record({"event": "watchdog_left_running",
-                            "session": session, "run_id": args.run_id,
-                            "production_task_id": args.production_task_id,
-                            "stop_state": stop_result.get("state"),
-                            "reason": "stop not confirmed; watchdog keeps deadline protection"})
-            record({"event": "finished", "session": session, "variant": variant, "stop_verified": stop_ok,
-                    "run_id": args.run_id, "production_task_id": args.production_task_id,
-                    "stop_state": stop_result.get("state"),
-                    "record_marked": stop_result.get("record_marked", False),
-                    "allocation_attempted": allocation_attempted, "elapsed_sec": round(time.monotonic() - start, 1)})
-            # Durable manifest terminal update for the GPU phase (TASK-005
-            # §4.1): on the success path this records GPU_STOP_CONFIRMED;
-            # on any failure path it records FAILED with the real error.
-            # The Drive tail below runs only after this finally.
-            if _exc[0] is not None:
-                _manifest_update(args.run_id, task_state="FAILED",
-                                 session_state="STOPPED" if stop_ok else "UNKNOWN",
-                                 last_error=f"{_exc[0].__name__}: {_exc[1]}"[:500])
-            elif stop_ok:
-                _manifest_update(args.run_id, task_state="GPU_STOP_CONFIRMED",
-                                 session_state="STOPPED")
-            else:
-                _manifest_update(args.run_id, task_state="FAILED",
-                                 session_state="UNKNOWN",
-                                 last_error="Stop not verified; run FAILED regardless of generated files")
+                    _manifest_update(args.run_id, task_state="FAILED",
+                                     session_state="UNKNOWN",
+                                     last_error="Stop not verified; run FAILED regardless of generated files")
     if allocation_attempted and not created:
         raise RuntimeError("GPU allocation did not complete; repeated session checks found no allocation, but delayed assignment remains possible. Recheck sessions later.")
     if not stop_ok:
@@ -3714,6 +4960,18 @@ def main():
     parser.add_argument("--max-task-attempts", type=int, default=DEFAULT_MAX_TASK_ATTEMPTS,
                         help="TASK-008: deliver / run --auto-recover: maximum GPU "
                              "attempts for the whole task (1..3, default 2).")
+    parser.add_argument("--allocation-rounds", type=int, default=None,
+                        help="v0.3.0 M1: elastic backoff rounds on transient GPU capacity "
+                             "failure (1..5). Default 3 for deliver / --auto-recover, "
+                             "1 for a raw run.")
+    parser.add_argument("--bootstrap-mode", choices=("bundled", "legacy"), default="bundled",
+                        help="v0.3.0 M2: bundled uploads the Stage-1/Stage-2 tars; "
+                             "legacy uploads one file at a time. Bundled applies "
+                             "to the download source only; the mount source "
+                             "always uses legacy.")
+    parser.add_argument("--keep-warm-ttl", type=int, default=0,
+                        help="v0.3.0 M4: keep GPU session warm after healthy completion for N seconds "
+                             "(0 disables; valid 0 or 60..900).")
     parser.add_argument("--max-rate-cu-h", type=float, default=14.0)
     parser.add_argument("--max-wall-sec", type=int, default=MAX_SESSION_SECONDS)
     parser.add_argument("--poll-interval-sec", type=int, default=60,
@@ -3730,6 +4988,18 @@ def main():
         parser.add_argument("--" + flag, action="store_true")
     a = parser.parse_args()
     _COLAB_AUTH = a.colab_auth
+    try:
+        a.keep_warm_ttl = _validate_keep_warm_ttl(a.keep_warm_ttl)
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        a.allocation_rounds = resolve_allocation_rounds(a)
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        a.bootstrap_mode = resolve_bootstrap_mode(a)
+    except ValueError as e:
+        parser.error(str(e))
     if a.action == "run" and not a.production_task_id:
         parser.error("--production-task-id is required for run; the historical default is never reused silently")
     # TASK-007: preflight/plan with --task-spec and no --production-task-id

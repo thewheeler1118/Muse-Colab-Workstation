@@ -160,7 +160,7 @@ class FakeDrive:
             if range_h.startswith("bytes="):
                 # Honour a bounded end ("bytes=0-1023") as well as an
                 # open end ("bytes=4-"); the concurrent downloader
-                # always asks for bounded shard ranges.
+                # always asks for bounded block ranges.
                 spec = range_h.split("=", 1)[1]
                 start_s, end_s = spec.split("-", 1)
                 start = int(start_s or 0)
@@ -352,16 +352,27 @@ class FullDownloadTests(DownloadTestBase):
 
 
 class DownloadConstantsTest(unittest.TestCase):
-    """TASK-007: concurrent-download tuning constants."""
+    """TASK-007 + v0.2.0 F1: concurrent-download tuning constants."""
 
     def test_defaults(self):
         self.assertEqual(dd.DEFAULT_CHUNK_SIZE, 8 * 1024 * 1024)
         self.assertEqual(dd.CONCURRENT_MIN_SIZE, 256 * 1024 * 1024)
-        self.assertEqual(dd.DEFAULT_CONCURRENT_WORKERS, 4)
+        # v0.2.0 F1 raised the default from 4 to 12 workers and added
+        # the process-wide connection cap (16).
+        self.assertEqual(dd.DEFAULT_CONCURRENT_WORKERS, 12)
+        self.assertEqual(dd.DEFAULT_MAX_GLOBAL_CONNECTIONS, 16)
 
 
 class ConcurrentDownloadTest(DownloadTestBase):
-    """TASK-007: sharded concurrent download of large fresh files."""
+    """TASK-007 + v0.2.0 F1: concurrent download of large fresh files.
+
+    v0.2.0 F1 replaced the shard-temp-file + merge implementation
+    with a preallocated single .part file filled by os.pwrite; the
+    shard-merge test that pinned the old implementation was retired
+    (see test_drive_download_v2.py for the pwrite equivalents).
+    The range-partitioning contract (one bounded Range per worker)
+    and all fallback / fail-closed behaviours are unchanged.
+    """
 
     BIG_ID = "fid-big"
     BIG_CONTENT = bytes(range(256)) * 16  # 4096 bytes
@@ -392,7 +403,7 @@ class ConcurrentDownloadTest(DownloadTestBase):
             self.BIG_ID, len(self.BIG_CONTENT), sha(self.BIG_CONTENT),
             self._dest("big.bin"), on_progress=progress)
 
-    def test_concurrent_success_four_shards(self):
+    def test_concurrent_success_four_blocks(self):
         seen = []
         out = self._download_big(
             on_progress=lambda done, total: seen.append(done))
@@ -406,43 +417,14 @@ class ConcurrentDownloadTest(DownloadTestBase):
         self.assertEqual(seen[-1], len(self.BIG_CONTENT))
         self.assertEqual(seen, sorted(seen))
 
-    def test_concurrent_merge_releases_shards_one_by_one(self):
-        """TASK-007.1: the merge moves shard 0 into place (zero-copy
-        os.replace) and unlinks each later shard right after appending
-        it — no second full copy, so the extra disk peak is one shard,
-        not the whole file. Final bytes + SHA-256 must be identical,
-        and no shard file may survive."""
-        dest = self._dest("big.bin")
-        part = Path(str(dest) + ".part")
-        shard_paths = [Path(str(part) + f".shard{i}") for i in range(4)]
-        replaces = []
-        unlinks = []
-        real_replace = os.replace
-        real_unlink = Path.unlink
-
-        def _recording_replace(src, dst, *a, **k):
-            replaces.append((str(src), str(dst)))
-            return real_replace(src, dst, *a, **k)
-
-        def _recording_unlink(self, missing_ok=False):
-            if ".shard" in str(self):
-                unlinks.append(str(self))
-            return real_unlink(self, missing_ok=missing_ok)
-
-        with patch.object(os, "replace", _recording_replace), \
-                patch.object(Path, "unlink", _recording_unlink):
-            out = self._download_big()
-        self.assertEqual(Path(out["path"]).read_bytes(), self.BIG_CONTENT)
-        self.assertEqual(out["sha256"], sha(self.BIG_CONTENT))
-        self.assertFalse(part.exists())
-        for p in shard_paths:
-            self.assertFalse(p.exists())
-        # Zero-copy first shard: shard0 was moved into .part, not copied.
-        self.assertIn((str(shard_paths[0]), str(part)), replaces)
-        # Shards 1..3 unlinked by the merge itself (3 calls), then the
-        # finally re-tries all four (4 more): the merge released them
-        # one by one instead of relying on the finally.
-        self.assertGreaterEqual(len(unlinks), 7)
+    # NOTE (v0.2.0 F1): test_concurrent_merge_releases_shards_one_by_one
+    # was retired here. It pinned the TASK-007.1 shard-temp-file +
+    # merge implementation (os.replace of shard 0, per-shard unlinks),
+    # which F1 removed: the concurrent path now preallocates one
+    # .part file and fills it with os.pwrite, so no shard file ever
+    # exists. Its coverage moved to tests/test_drive_download_v2.py
+    # (test_pwrite_no_shard_files, test_pwrite_preallocated_part).
+    # This is an intended behaviour change, not a deleted failing test.
 
     def test_concurrent_range_ignored_falls_back(self):
         self.drive.media_plan[self.BIG_ID] = [
@@ -454,7 +436,7 @@ class ConcurrentDownloadTest(DownloadTestBase):
         # The fallback single-stream request carries no Range header.
         self.assertIn(None, ranges)
 
-    def test_concurrent_shard_failure_falls_back(self):
+    def test_concurrent_block_failure_falls_back(self):
         err = urllib.error.HTTPError("http://x", 503, "unavailable", {}, None)
         self.drive.media_plan[self.BIG_ID] = [("raise", err)] * 8
         out = self._big_downloader(max_attempts=2).download_file(
@@ -901,6 +883,13 @@ class WorkerDownloadTests(unittest.TestCase):
         (comfy / "models").mkdir(parents=True, exist_ok=True)
         return comfy
 
+    def _nvme(self):
+        # v0.2.0 F4: the restore writes weights to the NVMe store, so
+        # each test gets its own tmp store instead of the global
+        # /content/nvme_models/h3 (which would leak fixtures across
+        # tests and make later tests hit CACHE_REUSE).
+        return Path(self.td) / "nvme"
+
     def test_restore_weights_download_failure_fails_closed(self):
         """Download failure propagates: the worker never claims the
         model is restored, so MODELS_READY is never reached."""
@@ -920,7 +909,8 @@ class WorkerDownloadTests(unittest.TestCase):
                 self.hrw.restore_weights(
                     self._comfy(), Path("/nonexistent"), self.manifest,
                     drive_download=self.drive_download,
-                    token_provider=FakeProvider())
+                    token_provider=FakeProvider(),
+                    nvme_dir=self._nvme())
         self.assertFalse((self._comfy() / "models" / "vae" / "minimax_h3_video_vae_int8_convrot.safetensors").exists())
 
     def test_restore_weights_download_success_writes_verified_file(self):
@@ -943,8 +933,15 @@ class WorkerDownloadTests(unittest.TestCase):
             self.hrw.restore_weights(
                 self._comfy(), Path("/nonexistent"), self.manifest,
                 drive_download=self.drive_download,
-                token_provider=FakeProvider())
+                token_provider=FakeProvider(),
+                nvme_dir=self._nvme())
+        # v0.2.0 F4: the real file lives in the store; comfy/models
+        # holds a symlink to it, and reads follow the link.
+        store_file = (self._nvme() / "vae"
+                      / "minimax_h3_video_vae_int8_convrot.safetensors")
+        self.assertEqual(store_file.read_bytes(), self.content)
         dst = self._comfy() / "models" / "vae" / "minimax_h3_video_vae_int8_convrot.safetensors"
+        self.assertTrue(dst.is_symlink())
         self.assertEqual(dst.read_bytes(), self.content)
 
     def test_restore_weights_real_downloader_end_to_end(self):
@@ -977,9 +974,14 @@ class WorkerDownloadTests(unittest.TestCase):
             self.hrw.restore_weights(
                 self._comfy(), Path("/nonexistent"), manifest,
                 drive_download=self.drive_download,
-                token_provider=FakeProvider())
+                token_provider=FakeProvider(),
+                nvme_dir=self._nvme())
         for p in self.paths:
+            # v0.2.0 F4: real file in the store, symlink in comfy/models.
+            self.assertEqual((self._nvme() / p).read_bytes(),
+                             self.content, p)
             dst = self._comfy() / "models" / p
+            self.assertTrue(dst.is_symlink(), p)
             self.assertEqual(dst.read_bytes(), self.content, p)
         self.assertEqual(drive.meta_calls, len(self.paths) * 2)
 
