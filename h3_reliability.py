@@ -282,6 +282,30 @@ def _expected_frames(manifest: dict) -> int:
     return TOTAL_FRAMES
 
 
+def _has_models_ready_evidence(root: Path, run_id: str,
+                               stages: dict[str, list[str]]) -> bool:
+    """True when durable audit evidence proves models were restored and loaded
+    (v0.2.1 P3): explicit MODELS_READY stage, OR a COLDSTART_METRICS audit
+    event (emitted after ComfyUI /object_info passes), OR monotonic stage
+    progression WORKER_STARTED -> INFERENCE_COMPLETED -> VIDEO_VALIDATED
+    (which can only occur when a fast worker crossed MODELS_READY between
+    60s controller polls)."""
+    if "MODELS_READY" in stages:
+        return True
+    try:
+        if any(e.get("event") == "COLDSTART_METRICS"
+               for e in rm.read_audit_log(root, run_id)):
+            return True
+    except Exception:
+        pass
+    ws = stages.get("WORKER_STARTED")
+    ic = stages.get("INFERENCE_COMPLETED")
+    vv = stages.get("VIDEO_VALIDATED")
+    if ws and ic and vv and ws[0] <= ic[0] <= vv[0]:
+        return True
+    return False
+
+
 def _evaluate_run_f(root: Path, manifest: dict) -> list[str]:
     """Failed F conditions (1-5, 7) for one run; empty = the run meets them."""
     failed: list[str] = []
@@ -290,7 +314,7 @@ def _evaluate_run_f(root: Path, manifest: dict) -> list[str]:
     artifacts = manifest.get("artifacts") or {}
     if not manifest.get("session_id") or "GPU_ALLOCATED" not in stages:
         failed.append("allocation: no session_id or no GPU_ALLOCATED stage")
-    if "MODELS_READY" not in stages:
+    if not _has_models_ready_evidence(root, run_id, stages):
         failed.append("models: no MODELS_READY stage")
     if ("VIDEO_VALIDATED" not in stages
             or not artifacts.get("local_sha256")

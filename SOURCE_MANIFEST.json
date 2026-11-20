@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 23049,
-      "sha256": "42ba77ecb527101645ddb58f3e0e55aefc68538009b3f2241c42982350098939",
+      "size_bytes": 24796,
+      "sha256": "db3021e63ee028c4b8819d72535b9dc24c068d14e1f8d6b923eeb54eb1dc46dd",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 58612,
-      "sha256": "dad2db3fc1f64f6328fdb9dff63f36c29d1d088aaff5f53effd92acf41bef08a",
+      "size_bytes": 59161,
+      "sha256": "2c5dc4a4fdfb2d8ebb03ab35aa75ccb800bc1ed5797f8d1656b159c0fbb19174",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 18499,
-      "sha256": "3a56b6c91caf345cff510e01ef45040a7e781c9bbcb9afb7f411ac320ee4f6bd",
+      "size_bytes": 19448,
+      "sha256": "4c69c175d0d4a46ca1a73f58078442b5d18934e9d88b0328e196b0b642fb5a89",
       "role": "Documentation / evidence"
     },
     {
@@ -653,8 +653,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 202809,
-      "sha256": "22034a947ecfc654811b261ec98112d05188541dfbaff333d952a838598577d4",
+      "size_bytes": 204761,
+      "sha256": "9d55c27c1b03f3026799baaaf7d2be39a955fca20afdc128386ebc9dedbe641c",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -755,8 +755,8 @@
     },
     {
       "path": "h3_reliability.py",
-      "size_bytes": 29306,
-      "sha256": "920cb060bd147a3eab58706f9dcf8f410cf934c982cdc1effdafc5d2ecb688af",
+      "size_bytes": 30305,
+      "sha256": "4821e8730fd5537acbf5e92a51771284e633ddaa98c68aa2814070dbc1bbc163",
       "role": "Supporting file"
     },
     {
@@ -1061,8 +1061,8 @@
     },
     {
       "path": "tests/test_controller_wheelhouse_telemetry.py",
-      "size_bytes": 5606,
-      "sha256": "46d2d8e3a455dc9cebbe9d412f12513c8ed19d043fbed0b0b854e265b3aafa96",
+      "size_bytes": 7929,
+      "sha256": "4d51b4a71695e738527e2d50129d3210e04707100c0acc5cfddc021b8a953ba1",
       "role": "Tests"
     },
     {
@@ -1139,8 +1139,8 @@
     },
     {
       "path": "tests/test_fault_injection.py",
-      "size_bytes": 56914,
-      "sha256": "829ec2f392833984bc8872db75e2608f0ba833ac4774ca2572356df518ab5c83",
+      "size_bytes": 56991,
+      "sha256": "6f180867b3440991612645bf012a571795842fde1fb15519306267fe99c5bc1d",
       "role": "Tests"
     },
     {
@@ -1207,6 +1207,12 @@
       "path": "tests/test_reliability_metrics.py",
       "size_bytes": 9961,
       "sha256": "01d67e9657dc0862fbafeee22ccc2c575cdd5c0a43c38c2ddae1cf184d4b0d3f",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_reliability_p3.py",
+      "size_bytes": 5024,
+      "sha256": "ba950b0a781e63faa79ca6a0cb2f938e3b086b2ddbff02af04fe9072be38ee96",
       "role": "Tests"
     },
     {

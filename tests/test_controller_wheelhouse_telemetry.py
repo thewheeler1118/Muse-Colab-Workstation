@@ -131,5 +131,60 @@ class ControllerPollWiringTest(unittest.TestCase):
         self.assertNotIn("coldstart_metrics", loaded)
 
 
+class ModelsReadyBackfillTest(unittest.TestCase):
+    """v0.2.1 P3: MODELS_READY is backfilled monotonically when a poll
+    observes a later stage or coldstart_metrics first."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        rm.create_run_manifest(self.root, "h3-p3-task", "h3-p3-run-1")
+
+    def _backfill(self):
+        with mock.patch.object(hc, "ROOT", self.root), \
+                mock.patch.object(hc, "record", return_value=None):
+            return hc._backfill_models_ready_if_needed("h3-p3-run-1")
+
+    def _poll(self, state):
+        with mock.patch.object(hc, "ROOT", self.root), \
+                mock.patch.object(hc, "record", return_value=None):
+            hc._manifest_worker_state("h3-p3-run-1", state)
+
+    def _stage(self):
+        return rm.load_run_manifest(self.root, "h3-p3-run-1")["task_state"]
+
+    def test_backfill_from_early_stage(self):
+        self.assertTrue(self._backfill())
+        self.assertEqual(self._stage(), "MODELS_READY")
+
+    def test_backfill_skips_when_already_past(self):
+        rm.update_run(self.root, "h3-p3-run-1",
+                      task_state="INFERENCE_COMPLETED")
+        self.assertFalse(self._backfill())
+        self.assertEqual(self._stage(), "INFERENCE_COMPLETED")
+
+    def test_backfill_missing_manifest_is_quiet(self):
+        with mock.patch.object(hc, "ROOT", self.root), \
+                mock.patch.object(hc, "record", return_value=None):
+            self.assertFalse(hc._backfill_models_ready_if_needed("no-such-run"))
+
+    def test_poll_with_later_stage_backfills(self):
+        self._poll({"stage": "INFERENCE_RUNNING"})
+        self.assertEqual(self._stage(), "MODELS_READY")
+
+    def test_poll_with_coldstart_backfills_and_records_audit_event(self):
+        self._poll({"stage": "restore_weights",
+                    "coldstart_metrics": dict(REPORT)})
+        self.assertEqual(self._stage(), "MODELS_READY")
+        events = [e.get("event")
+                  for e in rm.read_audit_log(self.root, "h3-p3-run-1")]
+        self.assertIn("COLDSTART_METRICS", events)
+
+    def test_poll_with_models_ready_stage_is_direct(self):
+        self._poll({"stage": "MODELS_READY"})
+        self.assertEqual(self._stage(), "MODELS_READY")
+
+
 if __name__ == "__main__":
     unittest.main()

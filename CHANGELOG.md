@@ -69,6 +69,41 @@ offline suite: 934 tests, 0 failures. The actual `py313` wheelhouse
 bundle was NOT built or published (live network + Drive write, needs
 separate authorization). Live GPU verification: NOT_VERIFIED.
 
+### P3 — Monotonic MODELS_READY backfill + reliability calibration (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.1 P3 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `h3_controller.py`:
+
+- `_backfill_models_ready_if_needed` backfills `MODELS_READY`
+  monotonically (Muse's own `TASK_STAGES` order from
+  `h3_run_manifest.py`; never a backward move, never raises) when a
+  poll observes `INFERENCE_RUNNING` / `INFERENCE_COMPLETED` /
+  `VIDEO_READY` or `coldstart_metrics` before a separate
+  `MODELS_READY` poll arrived — the worker crosses
+  MODELS_READY → INFERENCE_RUNNING in milliseconds while the
+  controller polls every 60s.
+- `_record_coldstart_metrics` backfills before persisting and records
+  a `COLDSTART_METRICS` audit event in the run's audit log (via
+  `record_audit_event` — the controller's `record()` writes a
+  different log and does not count).
+
+`h3_reliability.py`: `_evaluate_run_f` condition (2) now uses
+`_has_models_ready_evidence` — an explicit `MODELS_READY` stage, a
+`COLDSTART_METRICS` audit event, or the monotonic
+`WORKER_STARTED -> INFERENCE_COMPLETED -> VIDEO_VALIDATED` chain
+(first timestamps in order); incomplete or out-of-order chains still
+fail closed.
+
+Tests: `ModelsReadyBackfillTest` (6) in
+`tests/test_controller_wheelhouse_telemetry.py`;
+`tests/test_reliability_p3.py` (7: evidence legs, incomplete and
+out-of-order chains, metric-F integration for a backfilled run);
+`tests/test_fault_injection.py` baseline updated — the full chain
+now records the backfilled `MODELS_READY` (intended behaviour
+change, documented in Issue #13). Full offline suite: 947 tests,
+0 failures. Live GPU verification: NOT_VERIFIED.
+
 ## Unreleased — v0.2.0 development (TASK-VERSION-ROADMAP-011)
 
 ### F1 — Zero-copy high-concurrency Drive download (2026-11-20)

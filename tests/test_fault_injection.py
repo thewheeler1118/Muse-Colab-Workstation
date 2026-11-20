@@ -524,14 +524,15 @@ class BaselineChainTest(unittest.TestCase):
         self.assertEqual(artifacts.get("drive_file_id"), "drive-file-1")
         self.assertEqual(artifacts.get("delivery_state"), "DELIVERED")
         # The first poll already returns VIDEO_READY, so MODELS_READY is
-        # never *observed* as a worker state here — the manifest records
-        # observed stages, not assumed ones. The explicit poll sequence
+        # never *observed* as a worker state here — but v0.2.1 P3
+        # backfills it monotonically, because VIDEO_READY can only be
+        # reached after models were ready. The explicit poll sequence
         # in test_savevideo_alternate_shape proves MODELS_READY is
         # recorded when a poll does observe it.
         stages = [e.get("detail", {}).get("to") for e in h.audit_events()
                   if e.get("event") == "STAGE"]
         self.assertEqual(stages, ["GPU_ALLOCATED", "WORKER_STARTED",
-                                  "INFERENCE_COMPLETED",
+                                  "MODELS_READY", "INFERENCE_COMPLETED",
                                   "VIDEO_VALIDATED", "ARTIFACT_DURABLE",
                                   "GPU_STOP_CONFIRMED", "DRIVE_VERIFIED",
                                   "TASK_COMPLETED"])

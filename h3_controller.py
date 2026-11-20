@@ -1723,7 +1723,17 @@ def _record_coldstart_metrics(run_id: str, state: dict) -> dict | None:
         from h3_run_manifest import validate_coldstart_metrics
 
         validated = validate_coldstart_metrics(metrics)
+        # v0.2.1 P3: a cold-start report proves setup completed, so
+        # MODELS_READY was crossed even if no poll caught it.
+        _backfill_models_ready_if_needed(run_id)
         _manifest_update(run_id, coldstart_metrics=validated)
+        try:
+            from h3_run_manifest import record_audit_event
+
+            record_audit_event(ROOT, run_id, "COLDSTART_METRICS",
+                               {"setup_seconds": validated.get("setup_seconds")})
+        except Exception:
+            pass
         return validated
     except Exception as e:  # noqa: BLE001 - telemetry only
         try:
@@ -1734,11 +1744,49 @@ def _record_coldstart_metrics(run_id: str, state: dict) -> dict | None:
         return None
 
 
+# Remote worker stages that can only be reached after ComfyUI models
+# and /object_info validation have succeeded. Because the worker moves
+# from MODELS_READY -> INFERENCE_RUNNING in milliseconds while the
+# controller polls every 60s, seeing any of these stages (or
+# coldstart_metrics) proves MODELS_READY was crossed and triggers a
+# monotonic backfill (v0.2.1 P3).
+_STAGES_IMPLYING_MODELS_READY = {
+    "INFERENCE_RUNNING",
+    "INFERENCE_COMPLETED",
+    "VIDEO_READY",
+}
+
+
+def _backfill_models_ready_if_needed(run_id: str) -> bool:
+    """Monotonically backfill MODELS_READY if the run manifest is still
+    prior to MODELS_READY in TASK_STAGES (v0.2.1 P3). Never attempts a
+    backward move and never raises."""
+    try:
+        from h3_run_manifest import TASK_STAGES, load_run_manifest
+
+        manifest = load_run_manifest(ROOT, run_id)
+        if not manifest:
+            return False
+        current = manifest.get("task_state", "")
+        if current in TASK_STAGES and TASK_STAGES.index(current) < TASK_STAGES.index("MODELS_READY"):
+            _manifest_update(run_id, task_state="MODELS_READY",
+                             last_verified_stage="MODELS_READY")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _manifest_worker_state(run_id: str, state: dict) -> None:
     """Record a polled worker state in the durable manifest (best-effort).
     Forward-only enforcement lives in update_run: a stale or out-of-order
     poll is refused and logged as an anomaly, never applied."""
     stage = (state or {}).get("stage")
+    has_coldstart = isinstance((state or {}).get("coldstart_metrics"), dict) and bool(
+        (state or {}).get("coldstart_metrics")
+    )
+    if stage in _STAGES_IMPLYING_MODELS_READY or has_coldstart:
+        _backfill_models_ready_if_needed(run_id)
     manifest_stage = JOB_STAGE_TO_MANIFEST_STAGE.get(stage)
     if manifest_stage:
         _manifest_update(run_id, task_state=manifest_stage,
