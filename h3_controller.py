@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import uuid
@@ -437,6 +438,21 @@ def _upload_drive_token(session: str, run_dir, token_doc: dict, remote_name: str
     return {"token_id": token_doc["token_id"], "remote_path": REMOTE + "/" + remote_name}
 
 
+def _mint_drive_token_doc(mint_fn=None) -> dict:
+    """Mint a short-lived Drive token document (no upload).
+
+    The bundled bootstrap (v0.3.0 M2) delivers tokens inside the
+    Stage-1 tar instead of uploading them one by one, so minting is a
+    separate seam from uploading. The chain harness stubs this the same
+    way it stubs _mint_and_upload_drive_token. The token value is never
+    logged; only token_id may appear in diagnostics.
+    """
+    import h3_drive_token
+
+    mint = mint_fn or h3_drive_token.mint_readonly_token
+    return mint()
+
+
 def _mint_and_upload_drive_token(session: str, run_dir, remote_name: str, mint_fn=None) -> dict:
     """Mint a fresh token and upload it as a 0600 file.
     One helper so the token branches have a single boundary (the
@@ -444,10 +460,68 @@ def _mint_and_upload_drive_token(session: str, run_dir, remote_name: str, mint_f
     upload are covered by tests/test_drive_download.py. `mint_fn`
     selects the scope: read-only by default, `mint_file_token` for
     the P1-A worker upload token (TASK-006 P1-A)."""
-    import h3_drive_token
+    return _upload_drive_token(session, run_dir, _mint_drive_token_doc(mint_fn), remote_name)
 
-    mint = mint_fn or h3_drive_token.mint_readonly_token
-    return _upload_drive_token(session, run_dir, mint(), remote_name)
+
+# v0.3.0 M2: bundled bootstrap modes. `bundled` (default) uploads the
+# Stage-1 / Stage-2 tars; `legacy` keeps the current one-file-at-a-time
+# uploads. Bundled applies to the noninteractive download source only;
+# the mount source always uses legacy (it needs the interactive mount).
+BOOTSTRAP_MODES = ("bundled", "legacy")
+BOOTSTRAP_MODE_DEFAULT = "bundled"
+
+
+def resolve_bootstrap_mode(args) -> str:
+    """Resolve --bootstrap-mode for one run (v0.3.0 M2)."""
+    raw = getattr(args, "bootstrap_mode", None) or BOOTSTRAP_MODE_DEFAULT
+    mode = str(raw).strip().lower()
+    if mode not in BOOTSTRAP_MODES:
+        raise ValueError(f"--bootstrap-mode must be one of {BOOTSTRAP_MODES}, got {raw!r}")
+    return mode
+
+
+def build_bootstrap_tar(tar_path, entries, forbidden=frozenset()) -> Path:
+    """Build a deterministic Stage-1/Stage-2 bootstrap tar.gz (v0.3.0 M2).
+
+    ``entries`` is a list of ``(local_path, arcname, mode_or_None)``
+    (mode defaults to 0o644; token files pass 0o600). The archive is
+    deterministic (mtime=0, uid/gid=0, empty uname/gname) so a rebuild
+    of the same inputs is byte-identical. Fail-closed: an absolute
+    arcname, a ``..`` component, or a forbidden arcname (Stage 1
+    refuses ``h3_remote_worker.py``) raises before anything is written.
+    Never logs entry contents — token bytes pass through here.
+    """
+    tar_path = Path(tar_path)
+    for _local, arcname, _mode in entries:
+        if not arcname or arcname.startswith("/") or Path(arcname).is_absolute():
+            raise ValueError(f"Unsafe bootstrap entry (absolute path): {arcname!r}")
+        parts = Path(arcname).parts
+        if any(part == ".." for part in parts):
+            raise ValueError(f"Unsafe bootstrap entry (path traversal): {arcname!r}")
+        if arcname in forbidden:
+            raise ValueError(f"Forbidden bootstrap entry: {arcname!r}")
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+    # Deterministic gzip wrapper: empty filename + mtime 0, so a rebuild
+    # of the same inputs is byte-identical regardless of the output path.
+    import gzip
+    import io
+
+    with open(tar_path, "wb") as raw, \
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for local_path, arcname, mode in entries:
+            local_path = Path(local_path)
+            data = local_path.read_bytes()
+            info = tarfile.TarInfo(arcname)
+            info.size = len(data)
+            info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mode = mode if mode is not None else 0o644
+            tf.addfile(info, io.BytesIO(data))
+    return tar_path
 
 
 def _build_drive_upload_block(run_id: str, variant: str) -> dict:
@@ -1870,12 +1944,19 @@ def _make_worker_state_handler(run_id: str, session: str, run_dir,
     return _handler
 
 
-def launch_worker(session: str) -> dict:
+def launch_worker(session: str, bundled: bool = False) -> dict:
     """Short-start the detached worker. Returns the launch record
     (run_id, variant, pid, state_file, log_file). Raises on any launch
     failure: a launch that cannot be observed fails fast here instead of
-    leaving an untracked worker behind on a paid GPU."""
-    result = exec_script(session, ROOT / "h3_worker_launcher.py", timeout=180)
+    leaving an untracked worker behind on a paid GPU.
+
+    With ``bundled=True`` (v0.3.0 M2) the launch execs
+    ``h3_bootstrap_stage2.py``, which extracts the Stage-2 tar and then
+    invokes the same ``h3_worker_launcher.main()``; the launch JSON it
+    prints is parsed the same way.
+    """
+    script = ROOT / ("h3_bootstrap_stage2.py" if bundled else "h3_worker_launcher.py")
+    result = exec_script(session, script, timeout=180)
     text = (result or {}).get("stdout", "") or ""
     for line in text.splitlines():
         if line.startswith("MUSE_H3_LAUNCH_JSON:"):
@@ -2315,7 +2396,7 @@ def _resume_bootstrap(args, manifest: dict) -> dict:
         args._ref_image_2_path = refs["ref_image_2"]
     start = time.monotonic()
     boot = _run_bootstrap(args, session_id, run_dir, budget_sec, live["rate"], start)
-    launch = launch_worker(session_id)
+    launch = launch_worker(session_id, bundled=bool(boot.get("bundled")))
     record({"event": "worker_launched", "variant": variant, "session": session_id, "launch": launch})
     _manifest_update(run_id, bootstrap={
         "steps": {"launch_worker": {"state": "done", "at_utc": _utc_now_iso()}}})
@@ -2592,6 +2673,14 @@ def _run_bootstrap(args, session: str, run_dir: Path, budget_sec: int,
         ref1_path, ref2_path = refs["ref_image_1"], refs["ref_image_2"]
         args._ref_image_1_path, args._ref_image_2_path = ref1_path, ref2_path
     drive_source = getattr(args, "drive_source", "download")
+    # v0.3.0 M2: the bundled bootstrap replaces the one-file-at-a-time
+    # uploads for the noninteractive download source. The mount source
+    # always uses the legacy path (it needs the interactive mount).
+    if drive_source == "download" and resolve_bootstrap_mode(args) == "bundled":
+        return _run_bootstrap_bundled(args, session, run_dir, budget_sec,
+                                      live_rate, start, spec,
+                                      ref1_path, ref2_path)
+    legacy_t0 = time.monotonic()
     bootstrap = _bootstrap_state(run_id)
     done_steps = dict(bootstrap.get("steps") or {})
 
@@ -2761,9 +2850,185 @@ def _run_bootstrap(args, session: str, run_dir: Path, budget_sec: int,
     task_path.write_text(json.dumps(task))
     run_cli(["upload", "-s", session, str(task_path), REMOTE + "/task.json"], timeout=120)
     _finish("upload_task")
-    _manifest_update(run_id, task_state="WORKER_STARTED", heartbeat=True)
+    _manifest_update(run_id, task_state="WORKER_STARTED", heartbeat=True,
+                     bootstrap={"mode": "legacy",
+                                "bootstrap_wall_sec": round(time.monotonic() - legacy_t0, 3)})
     return {"drive_download": drive_download, "drive_upload": drive_upload,
             "task": task, "renewal_state": renewal_state}
+
+
+def _run_bootstrap_bundled(args, session: str, run_dir: Path, budget_sec: int,
+                           live_rate: float, start: float, spec,
+                           ref1_path, ref2_path) -> dict:
+    """Two-stage bundled bootstrap for the noninteractive download source
+    (v0.3.0 M2). Stage 1 uploads ONE tar (contract files, refs, manifest,
+    workflow, probe spec + scripts, and 0600 downscoped tokens — NEVER
+    ``h3_remote_worker.py``) plus the Stage-1 extractor, then runs the
+    Drive download probe: it must print ``MUSE_DRIVE_DOWNLOAD_PROBE_OK``
+    before Stage 2 is built or uploaded. Stage 2 uploads ONE tar
+    (``h3_job_state.py``, ``h3_remote_worker.py``,
+    ``h3_worker_launcher.py``, ``task.json``); the actual launch happens
+    in ``launch_worker(session, bundled=True)``. Both stages always
+    re-run (fresh tokens each time; the task is rebuilt with a fresh
+    budget/rate), so a resume re-proves the remote from scratch.
+    Local token files and tars are unlinked after use. Returns the same
+    dict as the legacy path plus ``"bundled": True`` and
+    ``"cli_round_trips"`` (the 4 bundled calls: stage-1 upload + exec,
+    stage-2 upload + launch exec).
+    """
+    import h3_drive_token
+
+    run_id = args.run_id
+    variant = spec.output_prefix
+    boot_t0 = time.monotonic()
+    cli_round_trips = 0
+    renewal_state = {"count": 0, "last_token_id": None}
+
+    def _begin(step: str) -> None:
+        _manifest_update(run_id, bootstrap={"current_step": step})
+
+    def _finish(step: str, state: str = "done") -> None:
+        _manifest_update(run_id, bootstrap={
+            "current_step": None,
+            "steps": {step: {"state": state, "at_utc": _utc_now_iso()}}})
+
+    _begin("bundled_stage1")
+    drive_download = _build_drive_download_block(args.cache_manifest)
+    api = validate_comfy_workflow(args.workflow_api, spec)
+    submitted_path = run_dir / f"workflow_{variant}_submitted.json"
+    submitted_path.write_text(json.dumps(api, ensure_ascii=False, indent=2))
+    probe_spec_path = run_dir / "drive_download_probe.json"
+    probe_spec_path.write_text(json.dumps(drive_download["probe"]))
+
+    # Mint the ephemeral tokens locally (0600) and unlink in finally.
+    # The worker token and the probe token are read-only; the upload
+    # token is drive.file (TASK-006 P1-A) and only joins the bundle
+    # when the upload block builds (fail-soft, as in the legacy path).
+    local_token_paths: list[Path] = []
+    stage1_tar = run_dir / "bootstrap_stage1.tar.gz"
+    drive_upload = None
+    try:
+        tok_worker_doc = _mint_drive_token_doc()
+        tok_worker_path = run_dir / "drive_token.json"
+        h3_drive_token.write_token_file(tok_worker_path, tok_worker_doc)
+        local_token_paths.append(tok_worker_path)
+
+        tok_probe_doc = _mint_drive_token_doc()
+        tok_probe_path = run_dir / "drive_token_probe.json"
+        h3_drive_token.write_token_file(tok_probe_path, tok_probe_doc)
+        local_token_paths.append(tok_probe_path)
+
+        stage1_entries = [
+            (ROOT / "h3_contract.py", "h3_contract.py", None),
+            (ROOT / "h3_task_spec.py", "h3_task_spec.py", None),
+            (ROOT / "assemble.py", "assemble.py", None),
+            (ROOT / "h3_drive_download.py", "h3_drive_download.py", None),
+            (ROOT / "h3_drive_download_probe.py", "h3_drive_download_probe.py", None),
+            (Path(ref1_path), "poster.jpg", None),
+            (Path(ref1_path), "ref_image_1.jpg", None),
+            (Path(ref2_path), "ref_image_2.jpg", None),
+            (Path(args.cache_manifest), "model_manifest.json", None),
+            (Path(args.workflow_api), "workflow_api.json", None),
+            (submitted_path, "workflow_submitted.json", None),
+            (probe_spec_path, "drive_download_probe.json", None),
+            (tok_worker_path, "drive_token.json", 0o600),
+            (tok_probe_path, "drive_token_probe.json", 0o600),
+        ]
+        try:
+            drive_upload = _build_drive_upload_block(run_id, variant)
+            tok_upload_doc = _mint_drive_token_doc(mint_fn=h3_drive_token.mint_file_token)
+            tok_upload_path = run_dir / "drive_upload_token.json"
+            h3_drive_token.write_token_file(tok_upload_path, tok_upload_doc)
+            local_token_paths.append(tok_upload_path)
+            stage1_entries.append((ROOT / "h3_drive_upload.py", "h3_drive_upload.py", None))
+            stage1_entries.append((tok_upload_path, "drive_upload_token.json", 0o600))
+            record({"event": "drive_upload_block_ready", "session": session,
+                    "run_id": run_id, "folder_id": drive_upload["folder_id"]})
+        except Exception as e:  # noqa: BLE001 - fail-soft to controller delivery
+            drive_upload = None
+            record({"event": "drive_upload_block_failed", "session": session,
+                    "run_id": run_id, "error_type": type(e).__name__,
+                    "error": str(e)[:300]})
+
+        build_bootstrap_tar(stage1_tar, stage1_entries,
+                            forbidden=frozenset({"h3_remote_worker.py"}))
+        run_cli(["upload", "-s", session, str(stage1_tar),
+                 "/content/bootstrap_stage1.tar.gz"], timeout=300)
+        cli_round_trips += 1
+    finally:
+        if stage1_tar.exists():
+            try:
+                stage1_tar.unlink()
+            except OSError:
+                pass
+        for tp in local_token_paths:
+            if tp.exists():
+                try:
+                    tp.unlink()
+                except OSError:
+                    pass
+
+    download_probe = exec_script(session, ROOT / "h3_bootstrap_stage1.py", timeout=180)
+    cli_round_trips += 1
+    persist_exec_result(run_dir, f"drive_download_probe_{variant}", download_probe)
+    if "MUSE_DRIVE_DOWNLOAD_PROBE_OK" not in (download_probe or {}).get("stdout", ""):
+        raise RuntimeError("Remote Drive download probe failed; release GPU")
+    record({"event": "drive_download_probe_ok", "session": session,
+            "run_id": run_id,
+            "probe_file_id": drive_download["probe"]["file_id"]})
+    _finish("bundled_stage1")
+    _finish("drive_download_probe")
+
+    # Stage 2: ONLY built and uploaded AFTER Stage 1 probe passes.
+    _begin("bundled_stage2")
+    elapsed = time.monotonic() - start
+    if elapsed > budget_sec:
+        raise TimeoutError("Budget wall time reached before " + variant)
+    task = {"variant": variant, "run_id": run_id, "drive_cache_dir": drive_download["dest_dir"],
+            "comfy_ref": args.comfy_ref,
+            "production_task_id": getattr(args, "production_task_id", PRODUCTION_TASK_ID),
+            "task_spec": spec.to_dict(),
+            "inference_timeout_sec": min(1800, max(100, int(budget_sec - elapsed - 120))),
+            "rate_cu_h": live_rate,
+            "session_budget_cu": round(budget_sec * float(live_rate) / 3600.0, 3),
+            "comfyui_cache": _comfyui_cache_task(),
+            "drive_source": "download",
+            "drive_download": drive_download}
+    if drive_upload is not None:
+        task["drive_upload"] = drive_upload
+    task_path = RUNS / f"task_{session}.json"
+    task_path.write_text(json.dumps(task))
+
+    stage2_tar = run_dir / "bootstrap_stage2.tar.gz"
+    try:
+        stage2_entries = [
+            (ROOT / "h3_job_state.py", "h3_job_state.py", None),
+            (ROOT / "h3_remote_worker.py", "h3_remote_worker.py", None),
+            (ROOT / "h3_worker_launcher.py", "h3_worker_launcher.py", None),
+            (task_path, "task.json", None),
+        ]
+        build_bootstrap_tar(stage2_tar, stage2_entries)
+        run_cli(["upload", "-s", session, str(stage2_tar),
+                 REMOTE + "/bootstrap_stage2.tar.gz"], timeout=300)
+        cli_round_trips += 1
+    finally:
+        if stage2_tar.exists():
+            try:
+                stage2_tar.unlink()
+            except OSError:
+                pass
+
+    _finish("bundled_stage2")
+    _finish("upload_task")
+    boot_wall = round(time.monotonic() - boot_t0, 3)
+    # +1 round trip accounts for launch_worker(session, bundled=True).
+    _manifest_update(run_id, task_state="WORKER_STARTED", heartbeat=True,
+                     bootstrap={"mode": "bundled",
+                                "bootstrap_wall_sec": boot_wall,
+                                "cli_round_trips": cli_round_trips + 1})
+    return {"drive_download": drive_download, "drive_upload": drive_upload,
+            "task": task, "renewal_state": renewal_state,
+            "bundled": True, "cli_round_trips": cli_round_trips + 1}
 
 
 @_with_task_lock
@@ -3651,7 +3916,7 @@ def _run_variant_inner(args) -> dict:
             # single long blocking exec is gone: a controller restart no
             # longer loses the worker's progress, and `resume` can pick
             # the run back up from the manifest + state file.
-            launch = launch_worker(session)
+            launch = launch_worker(session, bundled=bool(boot.get("bundled")))
             record({"event": "worker_launched", "variant": variant, "session": session, "launch": launch})
             # TASK-006 P1-B: record the launch durably. Resume uses it
             # to tell "worker launched but unobservable" (refuse, never
@@ -3975,6 +4240,11 @@ def main():
                         help="v0.3.0 M1: elastic backoff rounds on transient GPU capacity "
                              "failure (1..5). Default 3 for deliver / --auto-recover, "
                              "1 for a raw run.")
+    parser.add_argument("--bootstrap-mode", choices=("bundled", "legacy"), default="bundled",
+                        help="v0.3.0 M2: bundled uploads the Stage-1/Stage-2 tars; "
+                             "legacy uploads one file at a time. Bundled applies "
+                             "to the download source only; the mount source "
+                             "always uses legacy.")
     parser.add_argument("--max-rate-cu-h", type=float, default=14.0)
     parser.add_argument("--max-wall-sec", type=int, default=MAX_SESSION_SECONDS)
     parser.add_argument("--poll-interval-sec", type=int, default=60,
@@ -3993,6 +4263,10 @@ def main():
     _COLAB_AUTH = a.colab_auth
     try:
         a.allocation_rounds = resolve_allocation_rounds(a)
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        a.bootstrap_mode = resolve_bootstrap_mode(a)
     except ValueError as e:
         parser.error(str(e))
     if a.action == "run" and not a.production_task_id:

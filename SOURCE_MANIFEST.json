@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 26538,
-      "sha256": "2110906f1ecc3821f22e25e32e5570daa299579f9d5bfbeb0109315579980355",
+      "size_bytes": 28485,
+      "sha256": "b8610a3017ccb3c61ebb3c130c8ad96739f5746be297fe5edc7080c94bfd82d0",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 59616,
-      "sha256": "a5d1e970da34182e097037ddbe0d0039cd0eb25c3d0809890d4dc2416ffb96ac",
+      "size_bytes": 60636,
+      "sha256": "8c452e45d4a770ed84f44fc93370fdc0f58e577716c8e991ce0051041ba3e754",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 20522,
-      "sha256": "eb6f6affd11967c0b74a424ed145c730c2243e51f5dfd26a3c5472b0338b9e83",
+      "size_bytes": 22169,
+      "sha256": "6915b853e4694f539efc69bce85589b459e73f4e28784eb4ae0fa0b67c71c823",
       "role": "Documentation / evidence"
     },
     {
@@ -634,6 +634,18 @@
       "role": "Example (placeholder values only)"
     },
     {
+      "path": "h3_bootstrap_stage1.py",
+      "size_bytes": 5178,
+      "sha256": "97208787214fc511b47a00640a3aefdb6eb8add16d06eb5d98c1a050a4c20924",
+      "role": "Supporting file"
+    },
+    {
+      "path": "h3_bootstrap_stage2.py",
+      "size_bytes": 5006,
+      "sha256": "9f5a81da67be8bc4e73ba697673edfe76fc40e4bddb05fd496f95d4f361849c0",
+      "role": "Supporting file"
+    },
+    {
       "path": "h3_budget.py",
       "size_bytes": 26684,
       "sha256": "bd27ea8a9c78aa3c0dcc9c8ee41f506314d411033efbe9858fd5ae6083c95f9f",
@@ -653,8 +665,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 211797,
-      "sha256": "7d0fd29c512272a3324f91bf1d7b3b7355144709bbe9870a8f5104ab1cc125bb",
+      "size_bytes": 225199,
+      "sha256": "ece83353ebce8aba0bd0390380360b4990b0fe30c8b23dffcc7769c69b05b1b0",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -971,8 +983,8 @@
     },
     {
       "path": "scripts/run_h3_task.sh",
-      "size_bytes": 7676,
-      "sha256": "dbc742204121c30fb1ba183ea27bec031bb15fa5fc089a971dd4addfa5503efe",
+      "size_bytes": 8069,
+      "sha256": "76b73134e1723c54baa2463555f4f5f6cd07be6d7deee96ff45ecbe797b028d7",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1079,8 +1091,8 @@
     },
     {
       "path": "tests/test_drive_delivery.py",
-      "size_bytes": 28557,
-      "sha256": "1405c9d092a70d21a5313a7187924fad459ab124eac0bf770c68e406e3239f86",
+      "size_bytes": 29712,
+      "sha256": "9996c1017b427ed714adb6a6161922344586dd7762f6934e5f4c0cdb48e86ea8",
       "role": "Tests"
     },
     {
@@ -1139,8 +1151,8 @@
     },
     {
       "path": "tests/test_fault_injection.py",
-      "size_bytes": 56991,
-      "sha256": "6f180867b3440991612645bf012a571795842fde1fb15519306267fe99c5bc1d",
+      "size_bytes": 61042,
+      "sha256": "fd29c60a0801e4a77754eabdd3a219eaa3bea43d07aa46e573349c888d3bb395",
       "role": "Tests"
     },
     {
@@ -1259,8 +1271,8 @@
     },
     {
       "path": "tests/test_stop_state_hotfix.py",
-      "size_bytes": 33281,
-      "sha256": "c233c07f3df50b89931408cfad1771397ded1109df1f489cce53926df4eeef9f",
+      "size_bytes": 34436,
+      "sha256": "75d663746e99036f1ca191bdf01561da02c536e9194bca04b4b00ba44bdb7e0a",
       "role": "Tests"
     },
     {
@@ -1297,6 +1309,12 @@
       "path": "tests/test_v030_m1_backoff.py",
       "size_bytes": 13106,
       "sha256": "dadd68e3c8a2b72146bf392c0fefea07bfbbe7b36e2fc4cf3ccaa00e0b9dda7c",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m2_bundled_bootstrap.py",
+      "size_bytes": 12801,
+      "sha256": "6d486c1fcc5b6e7470c1d06654fbd0139743bb4a9a2991f288f302d8b0fed91d",
       "role": "Tests"
     },
     {

@@ -53,6 +53,9 @@ from h3_session_watchdog import (  # noqa: E402
     update_session_deadline,
     watch,
 )
+# v0.3.0 M2: shared chain-harness fixtures (real files the bundled
+# bootstrap reads) and the valid fake token document for the mint seam.
+from tests.test_fault_injection import _FIXTURE_DIR, FAKE_TOKEN_DOC  # noqa: E402
 
 SID = "muse-h3-abc123"
 RUN_ID = "h3-20261112T000000Z-a1b2c3"
@@ -80,8 +83,8 @@ def _args():
         comfy_ref="61e524bdba7a4e193b45c2697f1af83c1beb86d6",
         drive_cache_dir="/content/drive/MyDrive/Muse-H3-Model-Depot",
         approve_interactive_drive_mount=True, fresh_inference=True,
-        workflow_api="/tmp/workflow_api.json",
-        cache_manifest="/tmp/verified_manifest.json",
+        workflow_api=str(_FIXTURE_DIR / "workflow_api.json"),
+        cache_manifest=str(_FIXTURE_DIR / "verified_manifest.json"),
         max_rate_cu_h=14.0, max_wall_sec=3600,
         prior_unbilled_reserve_cu=0.14, authorize_new_task=False)
 
@@ -339,6 +342,17 @@ class _ChainHarness(unittest.TestCase):
         self._po(hc, "OUTPUT_ROOT", self.out_root)
         self._po(hc, "RUNS", self.runs_root)
         self._po(hc, "ROOT", Path(self.tmp.name))
+        # v0.3.0 M2: the bundled bootstrap reads the module files from
+        # ROOT to build its tar, so the temp root holds real copies
+        # (production runs from the repo root, where these sit next to
+        # the controller).
+        import shutil
+
+        for _mod in ("h3_contract.py", "h3_task_spec.py", "assemble.py",
+                     "h3_drive_download.py", "h3_drive_download_probe.py",
+                     "h3_drive_upload.py", "h3_job_state.py",
+                     "h3_remote_worker.py", "h3_worker_launcher.py"):
+            shutil.copy(ROOT / _mod, Path(self.tmp.name) / _mod)
         self._po(hc, "record", lambda data: self.events.append(data))
         self._po(hc.time, "sleep", lambda s: None)
         self._po(hc, "validate_local")
@@ -346,10 +360,12 @@ class _ChainHarness(unittest.TestCase):
         # TASK-007: reference-image materialisation is stubbed here the
         # same way validate_local is — the real function (local SHA-256
         # check + Drive download) is covered by tests/test_task_spec.py,
-        # and the temp ROOT has no poster file.
+        # and the temp ROOT has no poster file. v0.3.0 M2: the bundled
+        # bootstrap reads the ref files to build its tar, so the stub
+        # returns the shared REAL fixture files.
         self._po(hc, "_materialize_ref_images",
-                 return_value={"ref_image_1": Path("/tmp/ref_image_1.jpg"),
-                               "ref_image_2": Path("/tmp/ref_image_2.jpg")})
+                 return_value={"ref_image_1": _FIXTURE_DIR / "ref_image_1.jpg",
+                               "ref_image_2": _FIXTURE_DIR / "ref_image_2.jpg"})
         self._po(hc, "verify_environment", return_value={"ok": True, "checked": []})
         self._po(hc, "verify_drive_download_preflight",
                  return_value={"preflight": "ok"})
@@ -358,6 +374,8 @@ class _ChainHarness(unittest.TestCase):
         self._po(hc, "_mint_and_upload_drive_token",
                  return_value={"token_id": "test-token-id",
                                "remote_path": "/content/muse_h3/drive_token.json"})
+        # v0.3.0 M2: the bundled bootstrap mints token documents locally.
+        self._po(hc, "_mint_drive_token_doc", return_value=FAKE_TOKEN_DOC)
         self._po(hc, "_register_gpu_lease",
                  return_value={"session_id": "muse-h3-test",
                                "version": 1, "deadline_final": False})

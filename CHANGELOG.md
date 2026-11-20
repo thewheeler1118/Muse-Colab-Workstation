@@ -2,6 +2,39 @@
 
 ## Unreleased — v0.3.0 development (TASK-VERSION-ROADMAP-011)
 
+### M2 — two-stage bundled bootstrap (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.3.0 M2 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `--bootstrap-mode bundled|legacy`
+(default `bundled`; the wrapper validates it). Stage 1 uploads ONE
+deterministic tar (contract files, refs, manifest, workflow, probe
+spec + scripts, and 0600 downscoped tokens — never
+`h3_remote_worker.py`, refused at build time) plus the Stage-1
+extractor, then runs the Drive download probe, which must print
+`MUSE_DRIVE_DOWNLOAD_PROBE_OK` before Stage 2 is built or uploaded.
+Stage 2 uploads ONE tar (`h3_job_state.py`, `h3_remote_worker.py`,
+`h3_worker_launcher.py`, `task.json`); the launch execs the Stage-2
+extractor, which invokes the same worker launcher. Both extractors
+validate every tar member before extracting anything (absolute paths,
+`..`, symlinks/hardlinks, device nodes, escapes, oversize bundles
+rejected), enforce 0600 on `*token*.json`, and unlink the tar in
+`finally`. Local token files and tars are unlinked after use. Run
+manifests persist `bootstrap` telemetry (`mode`,
+`bootstrap_wall_sec`, `cli_round_trips` — 4 bundled calls; legacy
+records mode + wall time only). The mount source always uses legacy.
+The bundled path cut the bootstrap from ~23 CLI round trips to 4.
+
+Tests: `tests/test_v030_m2_bundled_bootstrap.py` (18: deterministic
+tar + modes + forbidden/traversal rejection, mode resolution, both
+extractors incl. validate-before-extract and tar unlinking, and
+fault-injection execution — bundled success with telemetry, probe
+failure never builds Stage 2, legacy mode keeps the old uploads,
+mount falls back to legacy). The three chain harnesses now read real
+fixture files (the bundled path reads them to build its tar) and stub
+the new `_mint_drive_token_doc` seam. Full offline suite: 986 tests,
+0 failures. Live GPU verification: NOT_VERIFIED.
+
 ### M1 — GPU 503 elastic backoff & error classification (2026-11-20)
 
 Muse-original reimplementation of the upstream v0.3.0 M1 behaviour

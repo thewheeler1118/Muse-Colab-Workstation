@@ -54,6 +54,7 @@ import drive_api
 import drive_depot
 import h3_budget
 import h3_controller as hc
+from h3_drive_download import token_id_for
 import h3_run_manifest as rm
 import h3_session_watchdog as hwd
 import h3_video_qa
@@ -70,6 +71,39 @@ def _video_info(sha, frames=274, width=1080, height=1920, fps=24.0):
             "fps": fps, "sha256": sha}
 
 
+# v0.3.0 M2: the bundled bootstrap actually reads the cache manifest,
+# the workflow file and the ref images to build its tar, so the
+# harness's default args must point at REAL files (the legacy path only
+# ever handed their paths to the mocked uploader). Module-level
+# fixtures: the content is inert here (the block builder, the workflow
+# validator and the ref materialiser are stubbed), only existence
+# matters. Other chain-harness test files import _FIXTURE_DIR and
+# FAKE_TOKEN_DOC from here instead of duplicating them.
+_FIXTURE_DIR = Path(tempfile.mkdtemp(prefix="muse-fixture-"))
+(_FIXTURE_DIR / "workflow_api.json").write_text("{}")
+(_FIXTURE_DIR / "verified_manifest.json").write_text(json.dumps({
+    "status": "READY", "verification_method": "drive_v3_server_api",
+    "account_verified": True, "verified_at_utc": "2026-11-20T00:00:00Z",
+    "hf_revision": "a" * 40,
+    "files": [{"path": p, "drive_file_id": f"id-{p}", "size": 100,
+               "sha256": "a" * 64, "server_verified": True,
+               "hf_revision": "a" * 40}
+              for p in ("diffusion_model.safetensors",
+                        "text_encoder.safetensors",
+                        "audio_vae.safetensors",
+                        "video_vae.safetensors")]}))
+(_FIXTURE_DIR / "ref_image_1.jpg").write_bytes(b"fake-ref-image-1")
+(_FIXTURE_DIR / "ref_image_2.jpg").write_bytes(b"fake-ref-image-2")
+# Fake token document for the M2 mint seam (write_token_file validates
+# token_id == first 16 hex of SHA-256(token), so the fake is built with
+# the real helper). The token value is built from fragments so no
+# token-shaped literal appears in this file.
+_FAKE_TOKEN_VALUE = "ya29." + "FAKE-M2-TOKEN-VALUE-12345"
+FAKE_TOKEN_DOC = {"access_token": _FAKE_TOKEN_VALUE,
+                  "expires_at_utc": "2099-01-01T00:00:00Z",
+                  "token_id": token_id_for(_FAKE_TOKEN_VALUE)}
+
+
 def _args(action="run", **over):
     kw = {"action": action, "variant": "A", "run_id": RUN_ID,
           "production_task_id": TASK,
@@ -80,8 +114,8 @@ def _args(action="run", **over):
           "comfy_ref": "61e524bdba7a4e193b45c2697f1af83c1beb86d6",
           "drive_cache_dir": "/content/drive/MyDrive/Muse-H3-Model-Depot",
           "approve_interactive_drive_mount": True, "fresh_inference": True,
-          "workflow_api": "/tmp/workflow_api.json",
-          "cache_manifest": "/tmp/verified_manifest.json",
+          "workflow_api": str(_FIXTURE_DIR / "workflow_api.json"),
+          "cache_manifest": str(_FIXTURE_DIR / "verified_manifest.json"),
           "max_rate_cu_h": 14.0, "max_wall_sec": 3600,
           "prior_unbilled_reserve_cu": 0.14, "authorize_new_task": False,
           "poll_interval_sec": 60}
@@ -151,6 +185,20 @@ class ChainHarness:
                 "production_task_id": TASK, "project_budget_cu": 30.0,
                 "hard_stop_balance_cu": 132.77, "max_observed_spent_cu": 0.0,
                 "run_ids": [RUN_ID]}))
+        # v0.3.0 M2: the bundled bootstrap reads the module files from
+        # ROOT to build its tar, so the harness root must hold the real
+        # ones (the legacy path only ever handed their paths to the
+        # mocked uploader). Production runs from the repo root, where
+        # these files sit next to the controller; the temp root mirrors
+        # that layout with copies.
+        import shutil
+
+        _repo_root = Path(__file__).resolve().parents[1]
+        for _mod in ("h3_contract.py", "h3_task_spec.py", "assemble.py",
+                     "h3_drive_download.py", "h3_drive_download_probe.py",
+                     "h3_drive_upload.py", "h3_job_state.py",
+                     "h3_remote_worker.py", "h3_worker_launcher.py"):
+            shutil.copy(_repo_root / _mod, self.root / _mod)
         self.ledger_bytes = self.ledger_path.read_bytes()
         # Real watchdog functions, captured BEFORE _install patches them.
         self._real_record = hwd.record_session
@@ -204,10 +252,13 @@ class ChainHarness:
         # TASK-007: reference-image materialisation is stubbed here the
         # same way validate_local is — the real function (local SHA-256
         # check + Drive download) is covered by tests/test_task_spec.py,
-        # and the temp ROOT has no poster file.
+        # and the temp ROOT has no poster file. v0.3.0 M2: the bundled
+        # bootstrap actually reads the ref files to build its tar, so
+        # the stub returns the REAL fixture files (shared module-level
+        # fixtures, not per-harness copies).
         self._po(hc, "_materialize_ref_images",
-                 return_value={"ref_image_1": Path("/tmp/ref_image_1.jpg"),
-                               "ref_image_2": Path("/tmp/ref_image_2.jpg")})
+                 return_value={"ref_image_1": _FIXTURE_DIR / "ref_image_1.jpg",
+                               "ref_image_2": _FIXTURE_DIR / "ref_image_2.jpg"})
         self._po(hc, "verify_environment", side_effect=self._fake_env)
         self._po(hc, "verify_drive_download_preflight",
                  return_value={"preflight": "ok"})
@@ -216,6 +267,10 @@ class ChainHarness:
         self._po(hc, "_mint_and_upload_drive_token",
                  return_value={"token_id": "test-token-id",
                                "remote_path": "/content/muse_h3/drive_token.json"})
+        # v0.3.0 M2: the bundled bootstrap mints token documents locally
+        # (write_token_file validates the doc shape, so the fake is the
+        # shared valid FAKE_TOKEN_DOC, not the bare token_id stub).
+        self._po(hc, "_mint_drive_token_doc", return_value=FAKE_TOKEN_DOC)
         self._po(hc, "_register_gpu_lease",
                  return_value={"session_id": "muse-h3-test",
                                "version": 1, "deadline_final": False})
@@ -383,6 +438,18 @@ class ChainHarness:
         if name == "h3_drive_download_probe.py":
             return {"returncode": 0, "stdout":
                     "MUSE_DRIVE_DOWNLOAD_PROBE_OK fid-1 10 10", "stderr": ""}
+        if name == "h3_bootstrap_stage1.py":
+            # v0.3.0 M2 bundled Stage 1: extracts the tar and runs the
+            # download probe, so it prints the probe OK line.
+            return {"returncode": 0, "stdout":
+                    "MUSE_DRIVE_DOWNLOAD_PROBE_OK fid-1 10 10", "stderr": ""}
+        if name == "h3_bootstrap_stage2.py":
+            # v0.3.0 M2 bundled Stage 2: extracts the tar and invokes
+            # the worker launcher, so it prints the launch JSON.
+            return {"returncode": 0, "stdout": "MUSE_H3_LAUNCH_JSON:" + json.dumps(
+                {"run_id": RUN_ID, "variant": "A", "pid": 123,
+                 "state_file": "/content/muse_h3/MUSE_H3_JOB_STATE.json",
+                 "log_file": "/content/muse_h3/worker.log"}), "stderr": ""}
         return {"returncode": 0, "stdout": "", "stderr": ""}
 
     def _fake_download(self, session, variant, run_id, spec=None):
