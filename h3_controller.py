@@ -1711,6 +1711,28 @@ def _manifest_update(run_id: str, **kwargs) -> None:
             pass
 
 
+def _manifest_update_strict(run_id: str, **kwargs) -> None:
+    """Strict durable-manifest update (TASK-HOTFIX-016 P0-B).
+
+    Unlike `_manifest_update` this RAISES on failure, and when a
+    session_id is written it re-reads the manifest and verifies the
+    value landed. Use it only where the run's recovery identity depends
+    on the write: the pre-allocation session pre-registration and the
+    post-allocation GPU_ALLOCATED move. A failed strict write must
+    refuse the GPU (pre-allocation) or fail the run (post-allocation),
+    never proceed as if the identity had been recorded."""
+    from h3_run_manifest import load_run_manifest, update_run
+
+    update_run(ROOT, run_id, **kwargs)
+    session_id = kwargs.get("session_id")
+    if session_id:
+        landed = load_run_manifest(ROOT, run_id).get("session_id")
+        if landed != session_id:
+            raise RuntimeError(
+                f"manifest session id did not land for run {run_id}: "
+                f"wrote {session_id!r}, read back {landed!r}")
+
+
 def _current_source_commit() -> str:
     """The commit this controller code came from (TASK-007.1, fix 3).
     Delegates to h3_environment.resolve_source_commit: git HEAD in a
@@ -2714,6 +2736,207 @@ def _resume_run(args) -> dict:
     return _resume_run_inner(args)
 
 
+def _find_interrupted_session_candidates(task_id: str, run_id: str) -> dict:
+    """Registry evidence for a run whose manifest has no session id
+    (TASK-HOTFIX-016 P0-B). Gathers candidate sessions from the local
+    registries that already record the allocation, in priority order:
+
+    1. the GPU lease registry (local file),
+    2. the managed-session file (watchdog state),
+    3. the Drive lease mirror — ONLY when the local sources yield zero
+       candidates (and zero foreign records).
+
+    A record is a candidate only when BOTH run_id and
+    production_task_id match exactly. Records under a different owner
+    are reported separately and are never candidates: claiming another
+    account's GPU would be a cross-account takeover. Nothing here
+    queries the server or mutates any state — classification happens in
+    the caller. Returns {"candidates": [...], "foreign": [...],
+    "mirror_used": bool, "mirror_error": str | None}. Each candidate
+    carries session_id, gpu_model, sources, run_id, production_task_id
+    and owner_id.
+    """
+    from h3_gpu_lease_registry import current_owner_id
+
+    try:
+        owner = current_owner_id()
+    except Exception:  # noqa: BLE001 - owner unknown: treat all as ours
+        owner = None
+    by_session: dict[str, dict] = {}
+    foreign: list[dict] = []
+
+    def _note(rec, source):
+        sid = rec.get("session_id")
+        if not sid or rec.get("run_id") != run_id:
+            return
+        if rec.get("production_task_id") != task_id:
+            return
+        rec_owner = rec.get("owner_id")
+        if owner is not None and rec_owner is not None and rec_owner != owner:
+            entry = {"session_id": sid, "gpu_model": rec.get("gpu_model"),
+                     "run_id": run_id, "production_task_id": task_id,
+                     "owner_id": rec_owner, "source": source}
+            if entry not in foreign:
+                foreign.append(entry)
+            return
+        entry = by_session.setdefault(sid, {
+            "session_id": sid, "gpu_model": rec.get("gpu_model"),
+            "run_id": run_id, "production_task_id": task_id,
+            "owner_id": rec_owner, "sources": []})
+        if source not in entry["sources"]:
+            entry["sources"].append(source)
+        if entry["gpu_model"] is None:
+            entry["gpu_model"] = rec.get("gpu_model")
+
+    try:
+        registry = _lease_registry()
+    except Exception as e:  # noqa: BLE001 - registry unreadable: fail closed
+        raise RuntimeError(
+            f"cannot recover sessionless run {run_id}: lease registry "
+            f"unreadable: {e}") from e
+    for lease in registry.list_leases():
+        _note(lease, "lease")
+    try:
+        from h3_session_watchdog import load_managed_sessions
+
+        for rec in load_managed_sessions():
+            _note({"session_id": rec.get("session_id"),
+                   "run_id": rec.get("run_id"),
+                   "production_task_id": rec.get("production_task_id"),
+                   "gpu_model": rec.get("gpu"),
+                   "owner_id": rec.get("owner_id")}, "managed")
+    except Exception:
+        # The managed file is a secondary source: a corrupt or missing
+        # file must not hide the lease evidence gathered above.
+        pass
+    mirror_used = False
+    mirror_error = None
+    if not by_session and not foreign:
+        try:
+            mirror_doc = registry.mirror.read_mirror() if registry.mirror else None
+        except Exception as e:  # noqa: BLE001 - mirror is best-effort only
+            mirror_doc = None
+            mirror_error = str(e)[:200]
+        if mirror_doc:
+            mirror_used = True
+            for lease in mirror_doc.get("leases") or []:
+                _note(lease, "mirror")
+    # Ownership is decided per session across ALL sources: the managed
+    # file carries no owner_id, so a session the lease registry says
+    # belongs to another account is foreign even though its managed
+    # record is ownerless. An explicit foreign owner always wins over
+    # an absent one — never let a second source re-admit a foreign
+    # session as a candidate.
+    foreign_ids = {f["session_id"] for f in foreign}
+    candidates = [c for c in by_session.values()
+                  if c["session_id"] not in foreign_ids]
+    return {"candidates": sorted(candidates, key=lambda c: c["session_id"]),
+            "foreign": foreign, "mirror_used": mirror_used,
+            "mirror_error": mirror_error}
+
+
+def _resume_sessionless_run(args, manifest: dict) -> tuple:
+    """Resume a run whose manifest has no session id (TASK-HOTFIX-016
+    P0-B). Returns ("adopt", session_id) — the adoption already landed
+    in the manifest via the strict write, so the caller re-reads the
+    manifest and continues into the existing session-state flow — or
+    ("return", result_dict) to return directly.
+
+    Branches (all fail closed; none allocates or stops blindly):
+    - foreign-only evidence: refuse ("different account").
+    - no evidence at all: close FAILED only after the live server
+      confirms no session exists for this account; an unreadable server
+      list, or any live session that cannot be attributed, refuses.
+    - any candidate UNKNOWN: refuse (one unconfirmed fate poisons all).
+    - two or more ACTIVE: refuse ("conflicting") — never pick one.
+    - exactly one ACTIVE: adopt it (strict write + audit event).
+    - all STOPPED: confirm each in the registries, record the identity
+      for the audit trail, then delegate to _resume_stopped_session
+      (0-GPU recovery or an audited FAILED close).
+    """
+    from h3_run_manifest import record_audit_event
+
+    run_id = manifest["run_id"]
+    task_id = manifest.get("production_task_id")
+    found = _find_interrupted_session_candidates(task_id, run_id)
+    candidates = found["candidates"]
+    if found["foreign"] and not candidates:
+        return ("return", {"resumed": False, "run_id": run_id,
+                           "reason": "interrupted session belongs to a different account; "
+                                     "refusing to claim it"})
+    if not candidates:
+        try:
+            live = _call_with_transient_retry(inspect, max_attempts=5,
+                                              delays=(5, 10, 20, 30))
+        except Exception as e:  # noqa: BLE001 - live data is the gate input
+            return ("return", {"resumed": False, "run_id": run_id,
+                               "reason": f"session state UNKNOWN: live session list unreadable "
+                                         f"({e}); refusing to close or allocate"})
+        if live.get("sessions"):
+            return ("return", {"resumed": False, "run_id": run_id,
+                               "reason": "live sessions exist but none can be attributed to this "
+                                         "run; refusing to guess or allocate a second GPU"})
+        from h3_run_manifest import update_run
+
+        update_run(ROOT, run_id, task_state="FAILED", session_state="UNKNOWN",
+                   last_error="run interrupted before any GPU allocation was recorded "
+                              "in the manifest or registries; no live session exists")
+        record_audit_event(ROOT, run_id, "SESSIONLESS_RUN_CLOSED_NO_EVIDENCE",
+                           {"mirror_used": found["mirror_used"]})
+        return ("return", {"resumed": False, "run_id": run_id,
+                           "outcome": "run interrupted before allocation; closed as FAILED",
+                           "reason": "run interrupted before any GPU allocation was recorded"})
+    from h3_session_watchdog import SessionQueryError, query_session_state
+    from h3_session_watchdog import SessionState
+
+    states: dict[str, SessionState] = {}
+    for cand in candidates:
+        sid = cand["session_id"]
+        try:
+            states[sid] = _call_with_transient_retry(
+                lambda sid=sid: query_session_state(sid, colab_auth=_COLAB_AUTH),
+                max_attempts=5, delays=(5, 10, 20, 30))
+        except SessionQueryError:
+            states[sid] = SessionState.UNKNOWN
+    if any(s == SessionState.UNKNOWN for s in states.values()):
+        unknown = sorted(sid for sid, s in states.items()
+                         if s == SessionState.UNKNOWN)
+        return ("return", {"resumed": False, "run_id": run_id,
+                           "reason": f"session state UNKNOWN for {unknown}; refusing to allocate "
+                                     f"a second GPU or stop blindly"})
+    active = sorted(sid for sid, s in states.items() if s == SessionState.ACTIVE)
+    if len(active) > 1:
+        return ("return", {"resumed": False, "run_id": run_id,
+                           "reason": f"conflicting ACTIVE sessions for this run: {active}; "
+                                     f"refusing to choose one automatically"})
+    if len(active) == 1:
+        sid = active[0]
+        _manifest_update_strict(run_id, session_id=sid)
+        record_audit_event(ROOT, run_id, "SESSION_RECOVERED_FROM_REGISTRY",
+                           {"session": sid,
+                            "gpu": next(c["gpu_model"] for c in candidates
+                                        if c["session_id"] == sid),
+                            "candidates": [c["session_id"] for c in candidates]})
+        return ("adopt", sid)
+    for cand in candidates:
+        sid = cand["session_id"]
+        try:
+            _confirm_gpu_lease_stopped(sid)
+        except Exception:
+            pass
+        try:
+            from h3_session_watchdog import mark_session_stopped
+
+            mark_session_stopped(sid, "STOPPED")
+        except Exception:
+            pass
+    _manifest_update(run_id, session_id=candidates[0]["session_id"])
+    from h3_run_manifest import load_run_manifest
+
+    return ("return", _resume_stopped_session(
+        args, load_run_manifest(ROOT, run_id)))
+
+
 def _resume_run_inner(args) -> dict:
     """Reconcile a run from its durable manifest and resume it if it is
     safe to do so. The checklist (TASK-005 §4.3), in order:
@@ -2767,9 +2990,20 @@ def _resume_run_inner(args) -> dict:
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     session_id = manifest.get("session_id")
     if not session_id:
-        return {"resumed": False, "run_id": run_id,
-                "reason": "manifest has no session id; nothing to resume",
-                "view": view}
+        # TASK-HOTFIX-016 P0-B: the manifest lost its session id (the
+        # v0.3.0 allocation window, or a failed pre-allocation write).
+        # Recover the identity from registry evidence instead of
+        # refusing outright — but only under the same gates: the version
+        # and ledger checks above already passed, and the helper refuses
+        # on any uncertainty (UNKNOWN, conflicting ACTIVE, foreign
+        # account) without allocating or stopping anything.
+        adopted = _resume_sessionless_run(args, manifest)
+        if adopted[0] == "return":
+            return adopted[1]
+        session_id = adopted[1]
+        from h3_run_manifest import load_run_manifest
+
+        manifest = load_run_manifest(ROOT, run_id)
     # Real session state (tristate, PR-1). UNKNOWN refuses everything.
     from h3_session_watchdog import SessionQueryError, query_session_state
     from h3_session_watchdog import SessionState
@@ -2911,6 +3145,24 @@ def _reconcile_task(args) -> dict:
                 update_run(ROOT, manifest["run_id"], session_state=live)
                 entry["corrected_to"] = live.value
                 report["corrections"] += 1
+        else:
+            # TASK-HOTFIX-016 P0-B: a sessionless manifest is reported
+            # with its registry evidence (read-only — reconcile never
+            # queries the server, stops, or allocates here; the resume
+            # path owns classification). An unreadable registry is
+            # reported, not hidden.
+            try:
+                found = _find_interrupted_session_candidates(
+                    args.production_task_id, manifest["run_id"])
+                entry["registry_candidates"] = [
+                    c["session_id"] for c in found["candidates"]]
+                entry["registry_sources"] = {
+                    c["session_id"]: c["sources"] for c in found["candidates"]}
+                entry["foreign_sessions"] = [
+                    f["session_id"] for f in found["foreign"]]
+                entry["mirror_used"] = found["mirror_used"]
+            except Exception as e:  # noqa: BLE001 - report, don't hide
+                entry["registry_error"] = str(e)[:300]
         report["runs"].append(entry)
     return report
 
@@ -3435,11 +3687,16 @@ DETERMINISTIC_ERROR_MARKERS = (
 
 # Resume-refusal reasons that mean the previous session may still be
 # alive: opening a second GPU under any of them is forbidden.
+# TASK-HOTFIX-016 P0-B adds the two sessionless-resume refusal classes:
+# "conflicting" (two or more ACTIVE candidates for one run) and
+# "different account" (the only evidence belongs to another account).
 _RESUME_LIVE_SESSION_MARKERS = (
     "UNKNOWN",
     "unobservable",
     "left running",
     "belongs to another run",
+    "conflicting",
+    "different account",
 )
 
 
@@ -3467,9 +3724,28 @@ def _task_runs(root: Path, production_task_id: str) -> list[dict]:
 
 
 def _attempts_used(task_id: str) -> int:
-    """GPU attempts already spent on this task: runs that allocated a
-    session. A run that failed before allocation spends no attempt."""
-    return sum(1 for m in _task_runs(ROOT, task_id) if m.get("session_id"))
+    """GPU attempts already spent on this task: runs with verified
+    allocation evidence. Evidence is a manifest session_id OR a lease
+    registry record for (run_id, task_id) — the second source is what
+    TASK-HOTFIX-016 P0-B adds: a run whose manifest lost its session id
+    (the v0.3.0 allocation window) still spent its attempt. One run
+    counts once no matter how many G4 -> G4 -> A100 rounds it ran; a
+    run that never reached allocation counts zero. An unreadable lease
+    registry raises: the count cannot be certified, so the attempt must
+    not be undercounted by silently falling back to manifests only."""
+    counted = {m["run_id"] for m in _task_runs(ROOT, task_id)
+               if m.get("session_id")}
+    try:
+        registry = _lease_registry()
+        leases = registry.list_leases()
+    except Exception as e:  # noqa: BLE001 - count cannot be certified
+        raise RuntimeError(
+            f"cannot certify attempt count for task {task_id}: lease "
+            f"registry unreadable: {e}") from e
+    for lease in leases:
+        if lease.get("production_task_id") == task_id and lease.get("run_id"):
+            counted.add(lease["run_id"])
+    return len(counted)
 
 
 def _read_task_ledger(task_id: str) -> dict | None:
@@ -4303,8 +4579,12 @@ def _run_variant_inner(args) -> dict:
             session_spent_prior_cu = float(warm_claim.get("session_spent_cu") or 0.0)
             budget_sec = int(warm_claim["budget_sec"])
             gpu_info = {"gpu": chosen_key, "warm_reused": True}
-            _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
-                             session_id=session, session_state="ACTIVE")
+            # TASK-HOTFIX-016 P0-B: a claimed warm session is a live GPU
+            # the run now owns; its identity must land in the manifest
+            # before the run proceeds (same strict contract as the cold
+            # post-allocation write below).
+            _manifest_update_strict(args.run_id, task_state="GPU_ALLOCATED",
+                                    session_id=session, session_state="ACTIVE")
         # Allocation loop (v0.3.0 M1): outer elastic backoff rounds
         # wrapping the inner GPU_ATTEMPT_PLAN = (G4, G4 retry,
         # A100_HIGH_MEM). Capacity failures exhaust the inner plan, then
@@ -4375,6 +4655,22 @@ def _run_variant_inner(args) -> dict:
                                     args.production_task_id, pre_deadline.isoformat(),
                                     args.per_session_budget_cu,
                                     max_wall_sec=args.max_wall_sec)
+                # TASK-HOTFIX-016 P0-B: persist the session identity
+                # BEFORE `colab new` runs. If the controller dies during
+                # the allocation call, the manifest still names the
+                # session, so the recovered controller can find it in the
+                # registries instead of refusing the run as untraceable.
+                # A failed write refuses the GPU: no session may exist
+                # without a recorded identity. This is a pre-registration
+                # (ALLOCATING), not an allocation: task_state stays
+                # TASK_AUTHORIZED and session_state stays UNKNOWN until
+                # the server confirms the session.
+                _manifest_update_strict(args.run_id, session_id=session)
+                from h3_run_manifest import record_audit_event
+
+                record_audit_event(ROOT, args.run_id, "SESSION_PRE_REGISTERED",
+                                   {"session": session, "gpu": chosen_key,
+                                    "round": round_idx + 1})
                 try:
                     cmd = allocation_command(session, chosen_key, allow_g4=args.allow_g4, allow_a100_highmem=args.allow_a100_highmem)
                     # 420s: with the POST-body patch a G4 503 is retried inside
@@ -4398,7 +4694,15 @@ def _run_variant_inner(args) -> dict:
                         try:
                             from h3_session_watchdog import mark_session_stopped
 
-                            mark_session_stopped(session)
+                            # TASK-HOTFIX-016 P0-B: the live-list check
+                            # above IS the confirmed verdict (no session
+                            # with this name exists), so the confirmed
+                            # state argument is "STOPPED". The old call
+                            # passed no state at all, which raised
+                            # ValueError inside mark_session_stopped and
+                            # was swallowed here — the allocating record
+                            # was never marked stopped.
+                            mark_session_stopped(session, "STOPPED")
                         except Exception:
                             pass
                     except RuntimeError:
@@ -4406,6 +4710,16 @@ def _run_variant_inner(args) -> dict:
                     except Exception:
                         pass
                     err_class = classify_allocation_error(str(e))
+                    # TASK-HOTFIX-016 §5.1: the error class and message
+                    # are durable evidence, not just an in-memory
+                    # `attempts` entry — the G4 failures in the E2E run
+                    # left no error text anywhere. Never infer a cause
+                    # from the class alone; the class is only the
+                    # recorded classification of the observed error.
+                    record({"event": "allocation_failed", "session": session,
+                            "gpu": chosen_key, "run_id": args.run_id,
+                            "round": round_idx + 1, "error_class": err_class,
+                            "error": str(e)[:500]})
                     if err_class in ("AUTH_FATAL", "QUOTA_EXCEEDED", "UNKNOWN_FATAL"):
                         raise RuntimeError(
                             f"GPU allocation failed ({chosen_key}, {err_class}): {str(e)[:500]}; no fallback unless capacity failure"
@@ -4424,8 +4738,13 @@ def _run_variant_inner(args) -> dict:
                 created = True
                 record({"event": "allocated", "session": session, "gpu": chosen_key,
                         "round": round_idx + 1})
-                _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
-                                 session_id=session, session_state="ACTIVE")
+                # TASK-HOTFIX-016 P0-B: the post-allocation manifest move
+                # is strict — a `colab new` that succeeded but whose
+                # identity never landed must fail the run, not proceed as
+                # if the session were recorded (the pre-allocation write
+                # above already recorded it; this move confirms it).
+                _manifest_update_strict(args.run_id, task_state="GPU_ALLOCATED",
+                                        session_id=session, session_state="ACTIVE")
                 break
             if created:
                 break

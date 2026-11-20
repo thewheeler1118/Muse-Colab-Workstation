@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "colab-workstation"
-version = "0.3.0"
+version = "0.3.1"
 description = "Versioned Colab AI production workstation with audited workflows, code, tests and runbooks"
 requires-python = ">=3.11"
 dependencies = [

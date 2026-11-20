@@ -44,6 +44,14 @@ JOB_STAGES = (
 # after object_info validation passes. INFERENCE_COMPLETED is written
 # explicitly after find_rendered_video/rescue succeeds.
 WORKER_PHASE_TO_JOB_STAGE = {
+    # TASK-HOTFIX-016 (Issue #19) P0-A: the v0.3.0 F3 dual-track setup
+    # phase. It is setup work, not a finished model restore, so it maps
+    # to RESTORING_MODELS — exactly how upstream Antigravity's
+    # equivalent phase ("dual_track_setup") is normalised to
+    # RESTORING_MODELS by its _job_stage_for(). Without this entry the
+    # raw phase leaked into the job state and the controller refused the
+    # run as an unknown stage (TASK-LIVE-E2E-015 defect A).
+    "setup_parallel": "RESTORING_MODELS",
     "ensure_comfy": "JOB_STARTED",
     "restore_weights": "RESTORING_MODELS",
     "comfyui_start": "RESTORING_MODELS",
