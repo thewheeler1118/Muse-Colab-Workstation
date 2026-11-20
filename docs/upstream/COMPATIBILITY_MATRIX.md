@@ -56,22 +56,45 @@ Files present in Muse v0.1.0 but absent upstream (must be retained):
 - `scripts/manifest_policy.py`
 - `tests/test_manifest_security.py`
 
-## Feature map (per-feature file mapping: detailed analysis in progress)
+## Per-version diff scale vs Muse v0.1.0 (verified 2026-11-20)
 
-| Feature | Upstream version | Upstream new tests (known) | Muse status |
+Detailed analysis: `upstream-analysis.md` + `porting-inventory.json`
+(73 entries) in the task work area
+(`~/workspace/version-roadmap-011/upstream/analysis/`, with raw
+diffs under `raw/`). Step diffs inside upstream: v0.2.0→v0.2.1 =
+14 files (+495/−69); v0.2.1→v0.3.0 = 28 files (+4,767/−457).
+Nothing changed-then-reverted: the 73-file union equals the v0.3.0
+set. Test counts are `def test` greps (Muse baseline 746; upstream
+v0.3.0 counts 874 by this method vs the 872 figure in the task
+brief — a counting-method difference, not a finding).
+
+| Upstream tag | Added | Deleted | Modified | Changed | Tree files | Ins / Del vs Muse | `def test` count |
+|---|---|---|---|---|---|---|---|
+| v0.2.0 | 16 | 2 | 42 | 60 | 223 | +8,150 / −1,472 | 810 |
+| v0.2.1 | 16 | 2 | 45 | 63 | 223 | +8,606 / −1,502 | 816 |
+| v0.3.0 | 25 | 2 | 46 | 73 | 232 | +13,253 / −1,839 | 874 |
+
+## Feature map (from each tag's CHANGELOG + diffstats)
+
+| Feature | Upstream version | Key files + diffstat vs Muse v0.1.0 | Muse status |
 |---|---|---|---|
-| F1 high-concurrency zero-merge download | v0.2.0 | `test_drive_download_v2.py`, `test_remote_worker_v020.py` | SPEC PENDING — detailed diff analysis in progress |
-| F2 ComfyUI offline wheelhouse | v0.2.0 | `test_comfyui_wheelhouse.py`, `test_controller_wheelhouse_telemetry.py` | SPEC PENDING |
-| F3 parallel install + model restore | v0.2.0 | `test_remote_worker_v020.py` | SPEC PENDING |
-| F4 standalone NVMe model storage + VRAM optimization | v0.2.0 | `test_remote_worker_v020.py` | SPEC PENDING |
-| F5 Remote Seed + cold-start telemetry | v0.2.0 | `test_drive_depot_remote_seed.py`, `test_reliability_coldstart.py` | SPEC PENDING — Remote Seed stays optional, no live GPU without separate approval |
-| P1 MD5 normalization (compare first) | v0.2.1 | — | SPEC PENDING — Muse already has MD5 normalization (PR #62); expect test-only work |
-| P2 Python 3.13 + slim offline wheelhouse | v0.2.1 | — | SPEC PENDING |
-| P3 monotonic `MODELS_READY` backfill + reliability stats fix | v0.2.1 | — | SPEC PENDING |
-| M1 GPU 503 capacity backoff + error classification | v0.3.0 | `test_v030_m1_backoff.py` | SPEC PENDING — Fatal/Auth/Quota must never retry infinitely |
-| M2 two-stage bundled bootstrap | v0.3.0 | `test_v030_m2_bundled_bootstrap.py` | SPEC PENDING — strict archive-entry rejection required |
-| M3 network-drop self-healing + Drive 0-GPU finished-video recovery | v0.3.0 | `test_v030_m3_self_healing.py` | SPEC PENDING — finished video recovers first, never blind re-inference |
-| M4 controlled warm pool | v0.3.0 | `test_v030_m4_controller_worker.py`, `test_v030_m4_warm_infra.py`, `test_v030_scripts_guard.py` | SPEC PENDING — default OFF, 25 CU / 14400 s / TTL bounds, guardian unverified until proven |
+| F1 high-concurrency zero-merge download | v0.2.0 | `h3_drive_download.py` (+902/−350, frozen after v0.2.0); `tests/test_drive_download_v2.py`, `tests/test_drive_download.py` | SPEC READY — reimplement from behavior, own PR |
+| F2 ComfyUI offline wheelhouse | v0.2.0 | `h3_comfyui_cache.py` (+833/−45); `scripts/setup_isolated_account.py`; controller wiring; `tests/test_comfyui_wheelhouse.py`, `tests/test_controller_wheelhouse_telemetry.py` | SPEC READY — reimplement from behavior, own PR |
+| F3 parallel install + model restore | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F4); `tests/test_remote_worker_v020.py` (CHANGELOG says `test_remote_worker_v2.py`, shipped file is `…_v020.py`) | SPEC READY — reimplement from behavior, own PR |
+| F4 standalone NVMe model storage + VRAM optimization | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F3); `tests/test_remote_worker_v020.py` | SPEC READY — reimplement from behavior, own PR |
+| F5 Remote Seed + cold-start telemetry | v0.2.0 | `drive_depot.py` (+572/−6); `h3_run_manifest.py`; `scripts/reliability_report.py`; `tests/test_drive_depot_remote_seed.py`, `tests/test_reliability_coldstart.py`; triple-flag gated | SPEC READY — Remote Seed stays optional, no live GPU without separate approval |
+| P1 MD5 normalization (compare first) | v0.2.1 | `h3_remote_worker.py`, `h3_drive_upload.py`, `tests/test_drive_upload.py` | SPEC READY — Muse already has MD5 normalization (PR #62); diff first, only add tests where equivalent |
+| P2 Python 3.13 + slim offline wheelhouse | v0.2.1 | `h3_comfyui_cache.py` (+36/−7); `h3_remote_worker.py`; `py313` handled via generic tag normalization, no hardcoded list | SPEC READY — verify dependency provenance + platform + integrity |
+| P3 monotonic `MODELS_READY` backfill + reliability stats fix | v0.2.1 | `h3_controller.py`, `h3_reliability.py`, `tests/test_reliability.py`, `tests/test_fault_injection.py` | SPEC READY — reimplement from behavior, own PR |
+| M1 GPU 503 capacity backoff + error classification | v0.3.0 | `h3_budget.py` (+75/−0); `h3_controller.py`; `scripts/run_h3_task.sh`; `tests/test_v030_m1_backoff.py`; classes `AUTH_FATAL` / `QUOTA_EXCEEDED` / `CAPACITY_TRANSIENT` (503/429/502/504/412) / `TRANSPORT_TRANSIENT` / `UNKNOWN_FATAL`; backoff 15s/45s/90s ±20% | SPEC READY — Fatal/Auth/Quota must never retry infinitely |
+| M2 two-stage bundled bootstrap | v0.3.0 | `h3_bootstrap_stage1.py`, `h3_bootstrap_stage2.py` (new); `tests/test_v030_m2_bundled_bootstrap.py`; tar members validated pre-extraction (absolute paths, `..`, symlinks/hardlinks, device nodes, escape from `/content/muse_h3` rejected); 0600 downscoped tokens; `MUSE_DRIVE_DOWNLOAD_PROBE_OK` gate | SPEC READY — strict archive-entry rejection is a hard gate |
+| M3 network-drop self-healing + Drive 0-GPU finished-video recovery | v0.3.0 | `h3_controller.py`; `h3_drive_token.py` (+47/−0, `ensure_token_freshness(min_remaining_sec=900)`); `tests/test_v030_m3_self_healing.py` | SPEC READY — finished video recovers first, never blind re-inference |
+| M4 controlled warm pool | v0.3.0 | `h3_controller.py` (largest v0.3.0 change, +1,264/−279); `h3_gpu_lease_registry.py` (+165/−1); `h3_shutdown_executor.py`; `h3_warm_health_probe.py` (new); `scripts/run_shutdown_guardian.py`; `scripts/verify_shutdown.sh`; 3 test suites; default OFF (`--keep-warm-ttl` default 0, allowed 0 or 60–900s); caps 14400s / 25.0 CU / 30.0 CU / 0.75 CU reserve; reuse requires `MUSE_WARM_HEALTH_OK` | SPEC READY — default OFF, guardian unverified until proven; no live warm pool without separate approval |
+
+Note on upstream performance claims: the v0.2.1 CHANGELOG cites a
+live A100 run (489s→230.9s, 4.44→3.70 CU). That is upstream's claim,
+not Muse-verified; treat it as TARGET / claimed MEASURED until a Muse
+GPU run with a run id proves it.
 
 ## Verification status key
 

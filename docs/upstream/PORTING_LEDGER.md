@@ -75,11 +75,14 @@ worktree.
 
 ## Shared modules that differ (blob SHA, Muse v0.1.0 → upstream v0.3.0)
 
-Sample, verified 2026-11-20. A full per-file diff analysis is
-produced as a separate work-area artifact under
-TASK-VERSION-ROADMAP-011 (Stage 2) and attached to the Stage 2
-tracking issue; each shared module gets its own ledger row when its
-feature PR opens.
+Sample, verified 2026-11-20. The full per-file diff analysis is
+complete (Stage 2, 2026-11-20): `upstream-analysis.md` +
+`porting-inventory.json` (73 entries, all `verbatim_allowed:
+false`) in the task work area
+(`~/workspace/version-roadmap-011/upstream/analysis/`, raw diffs
+under `raw/`). Per-version scale: v0.2.0 +8,150/−1,472 (60 files),
+v0.2.1 +8,606/−1,502 (63 files), v0.3.0 +13,253/−1,839 (73 files).
+Each shared module gets its own ledger row when its feature PR opens.
 
 | Module | Muse blob (v0.1.0) | Upstream blob (v0.3.0) | Same? | Note |
 |---|---|---|---|---|

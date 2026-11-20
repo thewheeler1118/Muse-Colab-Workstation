@@ -563,14 +563,14 @@
     },
     {
       "path": "docs/upstream/COMPATIBILITY_MATRIX.md",
-      "size_bytes": 4764,
-      "sha256": "a2784b04b8d65810b25197383c49b983b69d23fa30aacf5040474c8f2f82edab",
+      "size_bytes": 7841,
+      "sha256": "723275f15e5c2bdfacd9a94f62f5f6ef5e59fa22b0e24f707f7378adfba1b09f",
       "role": "Documentation / evidence"
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 10701,
-      "sha256": "fbcf514b558f98d3206f2093b27b27fa91ff0cdca151ed239ff479c57ac97bd1",
+      "size_bytes": 10929,
+      "sha256": "6343310de68da391c687f0a9fe6035bf8738ff0c9e12c475ee96d5c4ade01226",
       "role": "Documentation / evidence"
     },
     {
