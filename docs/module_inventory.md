@@ -21,9 +21,9 @@ Both are covered by `scripts/verify_manifest.py`.
 | `.github/workflows/ci.yml` | 3889 | 062c68c75e11e4e4c34b3daaac6d8e9e17d8c5a1d9bbb35581a9006bb820a518 | YAML | CI / templates | n/a | n/a | Low |
 | `.gitignore` | 904 | 015494328818556fdbd25c4286ef1a91a7a951fe086b91d8de6596ea87b100c7 | File | Supporting file | n/a | n/a | Low |
 | `AGENTS.md` | 4928 | 7660298b332ab5a03676370a074001d6a5786a71ada375d84a015805fc1e6f82 | Markdown | Supporting file | n/a | n/a | Low |
-| `CHANGELOG.md` | 33565 | d29bc93e87e89a95c18cb970844267cfbdd644505b5011f4f2ed311b1695a611 | Markdown | Supporting file | n/a | n/a | Low |
+| `CHANGELOG.md` | 34476 | e9a1880970e02811e25b2da0c9a0d69639df243d6fa8f696cbaec9f1a7f83cc4 | Markdown | Supporting file | n/a | n/a | Low |
 | `environment_manifest.json` | 1591 | 79ce5d8e7115608c94b0de846389009a780cbd716089c7301b60e46c00b88ed1 | JSON | Environment contract: pinned CLI 0.7.5 + client hash + both patches, ffmpeg/ffprobe, allowed Python, remote expectations; Drive transport now requests, GATED (TASK-005 §7, Issue #30) | Generated from the proven patched scratch venv 2026-11-13 | Y | Low |
-| `README.md` | 7857 | 18f6862e565c1b226e162aa9ea4926351615bac72846678577da665d7718394c | Markdown | Supporting file | n/a | n/a | Low |
+| `README.md` | 8432 | 8670675fef89073fd4514e1c82b3db516fda6c4357315dc3da50a2a5d80e14fa | Markdown | Supporting file | n/a | n/a | Low |
 | `assemble.py` | 2927 | cca6a5feb2c49636373bc977343b21b52b669934df724d0de5d86aedf6ea30fe | Python | Video assembly: 226 generated frames + 48 poster frames = 274 (ffmpeg) | A run h3-20261112T090027Z-8b07c6: assembled 274f, A.mp4 7,453,808 B | N | Low |
 | `auth_support.py` | 1729 | 20856f74b1c6278f90def9992f2d3e0de68ab36d61f28344fc0c0a4a57e26c20 | Python | Colab CLI resolution + ADC credential-metadata guards (never reads secrets) | Preflight ADC/CLI checks each run; A/B runs 2026-11-12 | Y | Low — metadata only, never reads OAuth secrets |
 | `build_api_candidate.py` | 2974 | 69b7344ec405746023c84a648fa59186b10a95871f14e6cc5cd9dabe1e5674b0 | Python | UI-format workflow -> API-format candidate (validation only) | API candidate generated 2026-11-10 (26 nodes, static contract OK); not a live acceptance | Y | Low |
@@ -146,7 +146,7 @@ Both are covered by `scripts/verify_manifest.py`.
 | `patches/google-colab-cli-0.7.5/README.md` | 2435 | 6fbfba57d0eb8531440e03660571719a1f33074b07155266b31d69938d84b376 | Markdown | Vendored CLI patch | n/a | n/a | Low |
 | `patches/google-colab-cli-0.7.5/drivemount_timeout.patch` | 1700 | fc7cbde9363c71f0aeaeed941376208f6e14ae6cf85e636c1813f0ea356ae9f9 | Unified diff | Vendored CLI patch | n/a | n/a | Low |
 | `patches/google-colab-cli-0.7.5/proxy_post_body.patch` | 811 | 0f5c5d9b73b90dca4d928261f28af1199138785a186f1fe9de1bc7aa9a3be639 | Unified diff | Vendored CLI patch | n/a | n/a | Low |
-| `pyproject.toml` | 870 | eec8ae41c9cdf5330c6b90f4fbdeb9c9af268c7ba467ec1b5202147f410149b4 | TOML | Supporting file | n/a | n/a | Low |
+| `pyproject.toml` | 870 | 93380209ea018344754db2b0403b4492b6e6594692837083d8e200a6990b5e6b | TOML | Supporting file | n/a | n/a | Low |
 | `reference_v2/README.md` | 1956 | 1f6168b2eef466739de09c458d55a3aed15e91b91a03a6d0094a56e67f106b2a | Markdown | Supporting file | n/a | n/a | Low |
 | `reference_v2/colab_manager.py` | 145688 | c7f7a9103beff8c5d974bfb2b99f8273787490c7e7ed533555d318e075710300 | Python | Vendored CLI output parsing (usage/sessions) + log redaction | Parser functions used by controller inspect() every run | Y | Low — contains redaction regexes (patterns, not values); allow-listed in CI |
 | `reference_v2/generate_video.py` | 33988 | 47a3d3eb288b4ba77e7eb1917e874c5cc81903207edc80952a026d2e5b2c1e45 | Python | Vendored video parameter validation (imported by colab_manager) | Imported by colab_manager; validation helpers used by its parsers | N | Low |

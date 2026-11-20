@@ -41,14 +41,14 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 33565,
-      "sha256": "d29bc93e87e89a95c18cb970844267cfbdd644505b5011f4f2ed311b1695a611",
+      "size_bytes": 34476,
+      "sha256": "e9a1880970e02811e25b2da0c9a0d69639df243d6fa8f696cbaec9f1a7f83cc4",
       "role": "Supporting file"
     },
     {
       "path": "README.md",
-      "size_bytes": 8184,
-      "sha256": "c35d7f8113c0ca3c4d5d672935791c88862fe494709d1db2ae950d2f89721a06",
+      "size_bytes": 8432,
+      "sha256": "8670675fef89073fd4514e1c82b3db516fda6c4357315dc3da50a2a5d80e14fa",
       "role": "Supporting file"
     },
     {
@@ -462,7 +462,7 @@
     {
       "path": "docs/module_inventory.md",
       "size_bytes": 62934,
-      "sha256": "6af4be7e1dcb03517918fe08746f29f02694258bc2d8fbe2a2f9e7a8364807c3",
+      "sha256": "dbc4cca50198fb7c84fe49ccb5b84b5e39398d2e11165a43e8186a5cc750be48",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -876,7 +876,7 @@
     {
       "path": "pyproject.toml",
       "size_bytes": 870,
-      "sha256": "eec8ae41c9cdf5330c6b90f4fbdeb9c9af268c7ba467ec1b5202147f410149b4",
+      "sha256": "93380209ea018344754db2b0403b4492b6e6594692837083d8e200a6990b5e6b",
       "role": "Supporting file"
     },
     {

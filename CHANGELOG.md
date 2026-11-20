@@ -1,6 +1,20 @@
 # CHANGELOG
 
-## Unreleased — v0.3.0 development (TASK-VERSION-ROADMAP-011)
+## v0.3.0 — 2026-11-20 (TASK-VERSION-ROADMAP-011 / TASK-VERSION-INTEGRATION-012)
+
+Integrated release (PR #18, single Merge Commit into `main`): the v0.2.0
+fast cold start (F1–F5), v0.2.1 zero-compute optimisations (P1–P3) and
+v0.3.0 self-healing + warm pool (M1–M4) stages, on top of the v0.1.0
+Muse Adapter. **v0.2.0 and v0.2.1 were development stages only and were
+never released separately** — their work is folded into this release
+and no retroactive v0.2.0 / v0.2.1 Release will be created.
+
+Release status: `OFFLINE_VERIFIED` (1046 offline tests, 0 failures;
+GitHub Actions 6/6 on the release HEAD) — `LIVE_E2E_NOT_VERIFIED`
+(no paid GPU session was started, no CU spent; Remote Seed, the
+Python 3.13 wheelhouse and warm-pool reuse were never run live) —
+`PRODUCTION_NOT_UPGRADED` (the production directory was never touched;
+upgrading production needs separate approval).
 
 ### M4 — controlled warm session pool, default OFF (2026-11-20)
 
@@ -149,7 +163,7 @@ round-2 success, auth/quota fail-fast, deadline abort, stale ledger
 deadline ignored, failed leases stopped immediately). Full offline
 suite: 968 tests, 0 failures. Live GPU verification: NOT_VERIFIED.
 
-## Unreleased — v0.2.1 development (TASK-VERSION-ROADMAP-011)
+## v0.2.1 development stage — folded into v0.3.0, never released separately (TASK-VERSION-ROADMAP-011)
 
 ### P1 — Drive upload MD5 hex alignment (2026-11-20)
 
@@ -253,7 +267,7 @@ now records the backfilled `MODELS_READY` (intended behaviour
 change, documented in Issue #13). Full offline suite: 947 tests,
 0 failures. Live GPU verification: NOT_VERIFIED.
 
-## Unreleased — v0.2.0 development (TASK-VERSION-ROADMAP-011)
+## v0.2.0 development stage — folded into v0.3.0, never released separately (TASK-VERSION-ROADMAP-011)
 
 ### F1 — Zero-copy high-concurrency Drive download (2026-11-20)
 
