@@ -38,7 +38,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
       - name: Python syntax and import check
-        run: python -m py_compile *.py jobs/minimax_h3_ab/video_contract.py tests/*.py scripts/*.py
+        run: python -m py_compile *.py jobs/minimax_h3_ab/video_contract.py tests/*.py scripts/*.py adapters/muse/*.py
       - name: Unit + mock integration tests (CI entry point)
         # tests/run_ci_tests.py runs unittest discover, skipping only the two
         # asset-gated poster tests (poster binary excluded from the repo).

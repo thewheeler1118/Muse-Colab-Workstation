@@ -1,5 +1,5 @@
 {
-  "generated_utc": "2026-11-16",
+  "generated_utc": "2026-11-20",
   "source": "~/workspace/Muse_Colab_H3_Drive_v3/ (production baseline; verbatim copies SHA-256-verified at migration)",
   "note": "Every file in this repo except SOURCE_MANIFEST.json itself. Regenerate after any change; verify with scripts/verify_manifest.py. Excluded by policy and therefore absent: model weights, poster binary, MP4s, live ledgers/sessions/depot state, .venv, __pycache__.",
   "files": [
@@ -23,8 +23,8 @@
     },
     {
       "path": ".github/workflows/ci.yml",
-      "size_bytes": 3889,
-      "sha256": "062c68c75e11e4e4c34b3daaac6d8e9e17d8c5a1d9bbb35581a9006bb820a518",
+      "size_bytes": 3908,
+      "sha256": "bf9fa8e6377d99fd1bf8b2d2deadb5dac0ed680b589df06d24c63d26e9a84ed9",
       "role": "CI / templates"
     },
     {
@@ -41,14 +41,50 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 6269,
-      "sha256": "e777e80c1b3241600cbf70e6612e470d61b9b23d95306b1b460d44a8533ef7a8",
+      "size_bytes": 7088,
+      "sha256": "b739d52cc8921d12f40b957edd761ad8eba01424bd2aaae3d77cf35733c532fd",
       "role": "Supporting file"
     },
     {
       "path": "README.md",
-      "size_bytes": 7867,
-      "sha256": "5ce539ff55c1793f165faf8ac25213669437d64cdb2c62bbdd632c9dcd2dffee",
+      "size_bytes": 8184,
+      "sha256": "c35d7f8113c0ca3c4d5d672935791c88862fe494709d1db2ae950d2f89721a06",
+      "role": "Supporting file"
+    },
+    {
+      "path": "adapters/antigravity/COMPATIBILITY.md",
+      "size_bytes": 3920,
+      "sha256": "9ea74dff4b410b173435fe8016e624e657930488445ade24f98beea498a3fb7a",
+      "role": "Supporting file"
+    },
+    {
+      "path": "adapters/muse/README.md",
+      "size_bytes": 3330,
+      "sha256": "b782a1ab5b8eaa046fda47219eb35cb0185fddd88c51b5c51e7051e0394b205f",
+      "role": "Supporting file"
+    },
+    {
+      "path": "adapters/muse/__init__.py",
+      "size_bytes": 1074,
+      "sha256": "179059d445c71622a637b8af1049eb99413f472a8b0177f4bf4b2242d2a55b80",
+      "role": "Supporting file"
+    },
+    {
+      "path": "adapters/muse/adapter.py",
+      "size_bytes": 8956,
+      "sha256": "23c60d718076e1ac10ebca88899b630ca5d15a2071a47513ef67dd9a5d4e2558",
+      "role": "Supporting file"
+    },
+    {
+      "path": "adapters/muse/paths.py",
+      "size_bytes": 4674,
+      "sha256": "7006714615085b6a0f931660115b8284c83d158c21dbf61faab8321a17d4ac3f",
+      "role": "Supporting file"
+    },
+    {
+      "path": "adapters/muse/redact.py",
+      "size_bytes": 2094,
+      "sha256": "71166b7d5f6db5fa340757ccfecedc35af986373e6c7791ac64837b5e0570be6",
       "role": "Supporting file"
     },
     {
@@ -523,6 +559,24 @@
       "path": "docs/storyboard_full_drive.md",
       "size_bytes": 3305,
       "sha256": "5930c71a3430deaef6cc9e15caabc700bc70c479cb8e447fa6921b677c8bbbc2",
+      "role": "Documentation / evidence"
+    },
+    {
+      "path": "docs/upstream/COMPATIBILITY_MATRIX.md",
+      "size_bytes": 4764,
+      "sha256": "a2784b04b8d65810b25197383c49b983b69d23fa30aacf5040474c8f2f82edab",
+      "role": "Documentation / evidence"
+    },
+    {
+      "path": "docs/upstream/PORTING_LEDGER.md",
+      "size_bytes": 10701,
+      "sha256": "fbcf514b558f98d3206f2093b27b27fa91ff0cdca151ed239ff479c57ac97bd1",
+      "role": "Documentation / evidence"
+    },
+    {
+      "path": "docs/upstream/UPSTREAM_LOCK.json",
+      "size_bytes": 1941,
+      "sha256": "1b261ce29d09ab69861bd1f6cef1a854ba1ce0778519a29815fc71712589d779",
       "role": "Documentation / evidence"
     },
     {
@@ -1099,6 +1153,12 @@
       "path": "tests/test_manifest_security.py",
       "size_bytes": 7997,
       "sha256": "48d7f4898c63be6e3b8a523626f67e038ee55e802ff16ee4abd2523d8bea50cb",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_muse_adapter.py",
+      "size_bytes": 12074,
+      "sha256": "1879b0b7ca8867cbb87b8244a95c50dbfba9303545c72f996940b74f650a7503",
       "role": "Tests"
     },
     {
