@@ -139,6 +139,34 @@ def _comfyui_download_task():
     }
 
 
+def _wheelhouse_download_task():
+    """Offline wheelhouse bundle descriptor for the NONINTERACTIVE
+    download path (v0.2.0 F2): Drive file ids from the local
+    wheelhouse manifest built by h3_comfyui_cache.py
+    publish-wheelhouse, so the worker can download the bundle instead
+    of installing from PyPI (worker-side install is F3). None when
+    the wheelhouse manifest is missing or has no Drive ids: the
+    worker then installs from PyPI exactly as before, and the
+    drive_download block carries no ``wheelhouses`` key at all."""
+    manifest_path = ROOT / "model_cache" / "comfyui_wheelhouse_manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    files = manifest.get("drive_files") or {}
+    archive = manifest.get("archive_name")
+    entry = files.get(archive) if archive else None
+    if not entry or not entry.get("id"):
+        return None
+    return {
+        "file_id": entry["id"],
+        "size": int(entry["size"]),
+        "sha256": entry["sha256"],
+        "archive": archive,
+        "commit": manifest["commit"],
+        "python_tag": manifest.get("python_tag"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # TASK-007: the generic task engine. One TaskSpec drives a run; --variant
 # A|B is only the built-in fixture adapter. These helpers resolve the
@@ -299,13 +327,22 @@ def _build_drive_download_block(cache_manifest):
                       "size": int(x["size"]), "sha256": x["sha256"],
                       "md5": x.get("server_md5")})
     probe_file = min(files, key=lambda f: f["size"])
-    return {
+    block = {
         "files": files,
         "comfyui": _comfyui_download_task(),
         "dest_dir": REMOTE + "/drive_downloads",
         "token_file": REMOTE + "/drive_token.json",
         "probe": {"file_id": probe_file["file_id"]},
     }
+    # v0.2.0 F2: optional wheelhouse bundle. Absent when no wheelhouse
+    # manifest exists (worker installs from PyPI as before); present
+    # as a one-entry list when a bundle was published. The worker
+    # ignores unknown keys until F3 teaches it to install from the
+    # bundle, so adding the key never changes a run that has none.
+    wheelhouse = _wheelhouse_download_task()
+    if wheelhouse is not None:
+        block["wheelhouses"] = [wheelhouse]
+    return block
 
 
 def verify_drive_download_preflight(args) -> dict:

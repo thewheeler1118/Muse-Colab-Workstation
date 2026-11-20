@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 9026,
-      "sha256": "2fbd7df0f6503ab2ac1d8cc43d8866ef6b206948adc120f4e9ba5b739cafc842",
+      "size_bytes": 10853,
+      "sha256": "79247e5f3775b9a384c3d3c1f995102b242184f028d2ab7549381ff353248639",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 55327,
-      "sha256": "eea7ef42ad892127e5cba63d999f1589821be0071efc67268f1c07aa9dc5d19d",
+      "size_bytes": 55791,
+      "sha256": "6c9967e2a8a2021fdd395c230592a507fd11c4bac3c64e0ef34c297249b4949c",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -641,8 +641,8 @@
     },
     {
       "path": "h3_comfyui_cache.py",
-      "size_bytes": 12381,
-      "sha256": "aaea4e824b1c882879d05104b3e079eb2afc71a5275f8fb91810fa21f5334356",
+      "size_bytes": 36479,
+      "sha256": "a335ebf6426c6214e6d8e9a7fe7777ccf028a113b20833a6d38bdf1e6a635195",
       "role": "ComfyUI source archive build / verify / publish to Drive cache"
     },
     {
@@ -653,8 +653,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 198923,
-      "sha256": "6977fc294983cf8af55de4f59317a47bda46a075954d81564cee9faca0581ae4",
+      "size_bytes": 200573,
+      "sha256": "23698f8d3b98a2bd854d7c63e6b142a6761ea24af582fa42c3ccf6ca02773410",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -1040,6 +1040,12 @@
       "size_bytes": 5555,
       "sha256": "7d21a6962f0f30d6f77ac8e565df8f182df7fcb8cdbb044176f89adf82b4afb1",
       "role": "Tests: CLI lookup, ADC metadata, Drive mount gates, READY guards"
+    },
+    {
+      "path": "tests/test_comfyui_wheelhouse.py",
+      "size_bytes": 19149,
+      "sha256": "f0c5ae6492cb8dac8a1bcbf00c0435f5aa6d826e1b292ff41073830f0b6999b4",
+      "role": "Tests"
     },
     {
       "path": "tests/test_config_contract.py",
