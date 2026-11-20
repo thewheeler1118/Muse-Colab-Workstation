@@ -243,13 +243,62 @@ def manifest_schema_version(manifest: dict) -> int:
         return 1
 
 
+def validate_coldstart_metrics(metrics) -> dict:
+    """Validate a v0.2.0 F5 cold-start report (worker or controller
+    input). Returns a normalised copy with only the known fields, or
+    raises ValueError. Fail closed: a corrupt report is never persisted
+    as if it were a measurement.
+
+    Known fields: setup_seconds (number >= 0, required),
+    comfy_install_seconds / restore_seconds (number >= 0 or None),
+    wheelhouse_hit (bool or None), models_reused / models_downloaded
+    (int >= 0), vram_mib (int >= 0 or None). Unknown fields are dropped
+    (a newer worker may report more; the manifest keeps what it knows).
+    """
+    if not isinstance(metrics, dict):
+        raise ValueError("coldstart_metrics must be a JSON object")
+    setup = metrics.get("setup_seconds")
+    if isinstance(setup, bool) or not isinstance(setup, (int, float)) or setup < 0:
+        raise ValueError("coldstart_metrics.setup_seconds must be a number >= 0")
+    out = {"setup_seconds": round(float(setup), 3)}
+    for key in ("comfy_install_seconds", "restore_seconds"):
+        value = metrics.get(key)
+        if value is None:
+            out[key] = None
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"coldstart_metrics.{key} must be a number >= 0 or null")
+        else:
+            out[key] = round(float(value), 3)
+    hit = metrics.get("wheelhouse_hit")
+    if hit is not None and not isinstance(hit, bool):
+        raise ValueError("coldstart_metrics.wheelhouse_hit must be a boolean or null")
+    out["wheelhouse_hit"] = hit
+    for key in ("models_reused", "models_downloaded"):
+        value = metrics.get(key)
+        if value is None:
+            out[key] = 0
+        elif isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"coldstart_metrics.{key} must be an integer >= 0")
+        else:
+            out[key] = value
+    vram = metrics.get("vram_mib")
+    if vram is None:
+        out["vram_mib"] = None
+    elif isinstance(vram, bool) or not isinstance(vram, int) or vram < 0:
+        raise ValueError("coldstart_metrics.vram_mib must be an integer >= 0 or null")
+    else:
+        out["vram_mib"] = vram
+    return out
+
+
 def update_run(root: Path, run_id: str, task_state: str | None = None,
                session_state=None, session_id: str | None = None,
                last_verified_stage: str | None = None,
                last_error: str | None = None, artifacts: dict | None = None,
                budget: dict | None = None, heartbeat: bool = False,
                reopen: bool = False, bootstrap: dict | None = None,
-               transient_error: str | None = None) -> tuple[dict, bool, str | None]:
+               transient_error: str | None = None,
+               coldstart_metrics: dict | None = None) -> tuple[dict, bool, str | None]:
     """Idempotent update. Returns (manifest, applied, anomaly).
 
     - task_state moves forward only (by stage index); a backward move is
@@ -271,6 +320,10 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
     - `transient_error` records manifest["last_transient_error"]
       (error + timestamp + count). It never moves task_state and never
       sets last_error: a network timeout is not a task failure.
+    - `coldstart_metrics` (v0.2.0 F5) stores the worker's validated
+      cold-start report at manifest["coldstart_metrics"]; it never
+      moves task_state. A later report replaces an earlier one (the
+      newest setup is the measurement that counts).
     - Re-applying the same values is a no-op (applied=False, no anomaly).
     """
     path = _manifest_path(root, run_id)
@@ -387,6 +440,15 @@ def update_run(root: Path, run_id: str, task_state: str | None = None,
                                     **bootstrap["steps"]}
         if merged_boot != current_boot:
             manifest["bootstrap"] = merged_boot
+            changed = True
+
+    if coldstart_metrics is not None:
+        # v0.2.0 F5: the worker's cold-start report. Validated before
+        # it is stored; a corrupt report raises instead of persisting
+        # a fake measurement. A re-run replaces the previous report.
+        validated = validate_coldstart_metrics(coldstart_metrics)
+        if validated != manifest.get("coldstart_metrics"):
+            manifest["coldstart_metrics"] = validated
             changed = True
 
     if transient_error is not None:

@@ -164,6 +164,66 @@ explicit tmp store so they cannot leak fixtures into the global
 default store. Full offline suite: 878 tests, 0 failures. Live GPU
 verification: NOT_VERIFIED (no GPU run under this change).
 
+### F5 — In-cloud remote seeding + cold-start telemetry (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.0 F5 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `drive_depot.py`:
+
+- New `remote-seed` action, triple-gated: `--allow-drive-write`,
+  `--allow-large-transfer`, and `--confirm-remote-seed`. It launches
+  ONE temporary Colab session (G4, cheapest, via `allocation_command`
+  + the watchdog's `record_session` / `confirm_session_active`) with a
+  short-lived `drive.file` token (`mint_file_token`, delivered as a
+  0600 file, never in the script, CLI args, or logs). The session
+  downloads the locked `config/pinned_hf_files.json` weights in-cloud
+  (8-way Range, SHA-256 verified), uploads them to the Drive Depot
+  (reusing an identical file, never overwriting a differing one), and
+  the local side verifies every entry server-side (`verify_drive_entry`)
+  before the shared `_commit_ready_manifest` publishes the READY
+  document (extracted from `seed()`'s tail, behaviour unchanged).
+- The session stop runs in `finally` on every path and is tristate
+  verified (`stop_and_verify` mirrors
+  `h3_controller.stop_and_verify_session`); an unconfirmed stop raises
+  `REMOTE_SEED_ORPHAN_RISK` and the seed never reports success. A
+  failed `new` that still produced a session stops it before raising.
+  The runner is injectable, so the whole flow is testable offline.
+
+Cold-start telemetry:
+
+- `h3_remote_worker.py`: the setup tracks record per-track wall time
+  (`_SETUP_TRACK_TIMINGS`), the wheelhouse outcome (`_WHEELHOUSE_HIT`)
+  and per-file reuse/download counts (`_RESTORE_COUNTS`). After setup
+  succeeds, `main()` emits `COLDSTART_METRICS_JSON` (setup_seconds,
+  comfy_install_seconds, restore_seconds, wheelhouse_hit,
+  models_reused, models_downloaded, vram_mib) and persists the same
+  report in `MUSE_H3_JOB_STATE.json`. VRAM is now detected once and
+  shared by the flags and the report.
+- `h3_run_manifest.py`: `validate_coldstart_metrics` (fail-closed
+  shape check) + `update_run(..., coldstart_metrics=...)` stores the
+  validated report; a later report replaces an earlier one.
+- `h3_controller.py`: `parse_coldstart_metrics` extracts the report
+  from exec/log text (last line wins, corrupt lines skipped);
+  `_record_coldstart_metrics` persists the polled job state's report
+  from `_manifest_worker_state` (same path as the remote-upload
+  evidence), best-effort, never breaking a run.
+- `h3_reliability.py`: the report gains a `coldstart` section —
+  setup_seconds P50/P90 (`_percentile`, linear interpolation) and
+  `wheelhouse_hit_rate` (Wilson rate over runs reporting a boolean
+  hit; `None` means pip was skipped, not a miss). UNKNOWN when no run
+  reports metrics.
+
+Tests: `tests/test_drive_depot_remote_seed.py` (12: triple-flag CLI
+gate, fake runner happy path, exec failure still stops, unconfirmed
+stop is an orphan risk, report mismatch rejected before commit,
+token never in the script), worker `ColdstartMetricsTest` (5) +
+`RestoreCountsTest` (1) in `tests/test_remote_worker_v020.py`,
+`tests/test_controller_wheelhouse_telemetry.py` (15: parse, validate,
+manifest persistence, poll wiring),
+`tests/test_reliability_coldstart.py` (6: P50/P90 + hit rate + helper).
+Full offline suite: 917 tests, 0 failures. Live GPU verification:
+NOT_VERIFIED. No live remote seed was started.
+
 ### Muse Adapter (Stage 1)
 
 

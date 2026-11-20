@@ -189,6 +189,16 @@ def _abort_progress(on_progress, abort_event):
     return _checked
 
 
+# v0.2.0 F5: cold-start metric state. run_setup_parallel records
+# each track's wall time here; _install_requirements records whether
+# the offline wheelhouse was used; restore_weights records per-file
+# reuse/download counts. main() reads them after setup to build the
+# COLDSTART_METRICS_JSON report. All values are timings/counts/flags.
+_SETUP_TRACK_TIMINGS: dict = {}
+_WHEELHOUSE_HIT: bool | None = None
+_RESTORE_COUNTS = {"reused": 0, "downloaded": 0}
+
+
 def run_setup_parallel(tracks, abort_event=None):
     """Run the setup tracks concurrently (v0.2.0 F3).
 
@@ -213,12 +223,17 @@ def run_setup_parallel(tracks, abort_event=None):
     results = {}
 
     def _run_one(index, stage, fn):
+        started = time.monotonic()
         try:
             fn()
             results[index] = (stage, None, None, None)
         except BaseException as e:  # noqa: BLE001 — recorded, re-raised by caller
             results[index] = (stage, e, _cmd_failure_get(), time.monotonic())
             abort_event.set()
+        finally:
+            # v0.2.0 F5: per-track wall time for the cold-start report.
+            _SETUP_TRACK_TIMINGS[stage] = round(
+                time.monotonic() - started, 3)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(_run_one, i, stage, fn) for i, (stage, fn) in enumerate(tracks)]
@@ -776,11 +791,14 @@ def _install_requirements(requirements, drive_download=None, token_provider=None
     Offline install failure (download, extract, verify, or pip) falls
     back to plain PyPI and emits WHEELHOUSE_FALLBACK_PYPI with the
     reason; the plain install's own failure still raises."""
+    global _WHEELHOUSE_HIT
     entry, reason = _select_wheelhouse_entry(drive_download)
     if entry is None:
         if (drive_download or {}).get("wheelhouses"):
             print("WHEELHOUSE_FALLBACK_PYPI",
                   json.dumps({"reason": reason, "archive": None}, ensure_ascii=False), flush=True)
+        # v0.2.0 F5: no usable wheelhouse entry — plain PyPI.
+        _WHEELHOUSE_HIT = False
         run_cmd([sys.executable, "-m", "pip", "install", "-r", str(requirements)], timeout=1200)
         return
     try:
@@ -791,8 +809,12 @@ def _install_requirements(requirements, drive_download=None, token_provider=None
         print("WHEELHOUSE_FALLBACK_PYPI",
               json.dumps({"reason": f"{type(e).__name__}: {str(e)[:300]}",
                           "archive": entry.get("archive")}, ensure_ascii=False), flush=True)
+        # v0.2.0 F5: offline path failed, fell back to plain PyPI.
+        _WHEELHOUSE_HIT = False
         run_cmd([sys.executable, "-m", "pip", "install", "-r", str(requirements)], timeout=1200)
         return
+    # v0.2.0 F5: the offline wheelhouse served this install.
+    _WHEELHOUSE_HIT = True
     print("WHEELHOUSE_INSTALL_OK", entry.get("archive"), flush=True)
 
 
@@ -805,6 +827,40 @@ def _install_requirements(requirements, drive_download=None, token_provider=None
 NVME_MODELS_DIR_DEFAULT = Path('/content/nvme_models/h3')
 HIGH_VRAM_THRESHOLD_MIB = 76800
 HIGH_VRAM_FLAGS = ('--highvram', '--disable-mmap')
+
+
+def build_coldstart_metrics(setup_started: float, vram_mib=None) -> dict:
+    """Assemble the v0.2.0 F5 cold-start report from the module-global
+    recordings (per-track wall times, wheelhouse hit, restore counts).
+    Only timings, counts, flags and the detected VRAM — never tokens,
+    paths, or credentials. ``setup_started`` is the monotonic time the
+    parallel setup began; per-track times come from
+    ``_SETUP_TRACK_TIMINGS`` (missing when a track never ran)."""
+    return {
+        "setup_seconds": round(time.monotonic() - setup_started, 3),
+        "comfy_install_seconds": _SETUP_TRACK_TIMINGS.get("ensure_comfy"),
+        "restore_seconds": _SETUP_TRACK_TIMINGS.get("restore_weights"),
+        "wheelhouse_hit": _WHEELHOUSE_HIT,
+        "models_reused": _RESTORE_COUNTS["reused"],
+        "models_downloaded": _RESTORE_COUNTS["downloaded"],
+        "vram_mib": vram_mib,
+    }
+
+
+def emit_coldstart_metrics(setup_started: float, run_id: str, variant: str,
+                           vram_mib=None) -> dict:
+    """Print ``COLDSTART_METRICS_JSON`` and persist the same report in
+    the job state, so the controller can read it on its next poll.
+    Returns the metrics dict. Never raises for a bookkeeping failure:
+    a metrics write must not kill a worker whose setup succeeded."""
+    metrics = build_coldstart_metrics(setup_started, vram_mib=vram_mib)
+    try:
+        print("COLDSTART_METRICS_JSON", json.dumps(metrics, ensure_ascii=False), flush=True)
+        write_job_state(ROOT, run_id, variant, _LAST_STAGE or "restore_weights",
+                        extra={"coldstart_metrics": metrics})
+    except Exception as e:  # noqa: BLE001 — observability only
+        print("COLDSTART_METRICS_UNAVAILABLE", type(e).__name__, flush=True)
+    return metrics
 
 
 def nvme_models_dir() -> Path:
@@ -1016,6 +1072,7 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
             dst=store/relative
             dst.parent.mkdir(parents=True,exist_ok=True)
             if dst.exists() and dst.stat().st_size==item['size'] and sha256_file(dst)==item['sha256']:
+                _RESTORE_COUNTS["reused"] += 1
                 print('CACHE_REUSE',relative,flush=True);continue
             entry = by_path.get(item['path'])
             if not entry or not entry.get('file_id'):
@@ -1035,6 +1092,7 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
                         next_milestone),
                     abort_event),
                 on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
+            _RESTORE_COUNTS["downloaded"] += 1
             print('CACHE_VERIFIED_NVME',relative,flush=True)
         # Every store file was verified in this run (reuse-check hash
         # or the downloader's streaming SHA-256), so the link step
@@ -1060,6 +1118,7 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
         dst=store/relative
         dst.parent.mkdir(parents=True,exist_ok=True)
         if dst.exists() and dst.stat().st_size==item['size'] and sha256_file(dst)==item['sha256']:
+            _RESTORE_COUNTS["reused"] += 1
             print('CACHE_REUSE',relative,flush=True);continue
         tmp=dst.with_name(dst.name+'.part')
         try:
@@ -1079,6 +1138,7 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
             tmp.replace(dst)
         finally:
             if tmp.exists():tmp.unlink()
+        _RESTORE_COUNTS["downloaded"] += 1
         print('CACHE_VERIFIED_NVME',relative,flush=True)
     # Every store file was verified in this run (copy-time SHA-256),
     # so the link step runs with verify=False under its documented
@@ -1582,6 +1642,7 @@ def main():
         # handler prints WORKER_FAILED_JSON with that stage plus the
         # failing track's command record.
         set_stage('setup_parallel')
+        setup_started = time.monotonic()
         setup_abort = threading.Event()
         try:
             run_setup_parallel([
@@ -1603,8 +1664,12 @@ def main():
         shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
         shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
         set_stage('comfyui_start')
-        vram_flags = comfy_vram_flags()
+        # v0.2.0 F5: detect VRAM once — the flags and the cold-start
+        # report share the same reading.
+        vram_mib = detect_gpu_vram_mib()
+        vram_flags = comfy_vram_flags(vram_mib)
         print('COMFY_VRAM_FLAGS', ' '.join(vram_flags) or '(none)', flush=True)
+        emit_coldstart_metrics(setup_started, _JOB_RUN_ID, _JOB_VARIANT, vram_mib=vram_mib)
         proc=subprocess.Popen([sys.executable,'main.py','--listen','127.0.0.1','--port','8188']+vram_flags,cwd=comfy,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
         set_stage('object_info_validation')
         object_info=wait_health(server,proc,time.monotonic()+180)

@@ -140,6 +140,21 @@ def _metric(k: int, n: int, definition: str,
             "unknown_reason": None}
 
 
+def _percentile(sorted_values: list, q: float) -> float | None:
+    """Linear-interpolation percentile over an already-sorted list
+    (v0.2.0 F5 cold-start latencies). Returns None for an empty list.
+    ``q`` is a fraction in [0, 1]."""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return round(float(sorted_values[0]), 3)
+    pos = q * (len(sorted_values) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = pos - lo
+    return round(float(sorted_values[lo]) + frac * float(sorted_values[hi] - sorted_values[lo]), 3)
+
+
 def _audit_stages(root: Path, run_id: str) -> set[str]:
     try:
         return {e.get("detail", {}).get("to")
@@ -570,6 +585,41 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             f"{metric_b['denominator']} terminal runs; "
             f"the 95% target is not verified.")
 
+    # v0.2.0 F5: cold-start telemetry. A run counts when its manifest
+    # carries a validated coldstart_metrics report. Latencies are
+    # P50/P90 over the reported setup_seconds; the wheelhouse hit rate
+    # is a Wilson rate over the runs that reported wheelhouse_hit
+    # (None means pip was skipped, not a miss — those runs are excluded
+    # from the rate, never counted as failures).
+    cold_reports = [m.get("coldstart_metrics") for m in manifests
+                    if isinstance(m.get("coldstart_metrics"), dict)]
+    setup_seconds = sorted(
+        float(c["setup_seconds"]) for c in cold_reports
+        if isinstance(c.get("setup_seconds"), (int, float)))
+    wheel_hits = [c["wheelhouse_hit"] for c in cold_reports
+                  if isinstance(c.get("wheelhouse_hit"), bool)]
+    if cold_reports:
+        coldstart = {
+            "status": "MEASURED",
+            "runs_with_metrics": len(cold_reports),
+            "setup_seconds_p50": _percentile(setup_seconds, 0.5),
+            "setup_seconds_p90": _percentile(setup_seconds, 0.9),
+            "wheelhouse_hit_rate": _metric(
+                sum(1 for h in wheel_hits if h), len(wheel_hits),
+                "wheelhouse_hit == True / runs reporting wheelhouse_hit",
+                unknown_reason="no run in scope reported wheelhouse_hit"),
+        }
+    else:
+        coldstart = {
+            "status": "UNKNOWN",
+            "runs_with_metrics": 0,
+            "setup_seconds_p50": None,
+            "setup_seconds_p90": None,
+            "wheelhouse_hit_rate": _metric(
+                0, 0, "wheelhouse_hit == True / runs reporting wheelhouse_hit",
+                unknown_reason="no run in scope reported cold-start metrics"),
+        }
+
     return {
         "root": str(root),
         "sample_scope": {"production_task_id": production_task_id,
@@ -589,6 +639,7 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             "budget_compliance_rate": metric_e,
             "deadline_bound_e2e_success_rate": metric_f,
         },
+        "coldstart": coldstart,
         "target_95_verified": target_verified,
         "target_95_evidence": target_evidence,
         "e_unknown_ledger_runs": sorted(e_unknown_runs),

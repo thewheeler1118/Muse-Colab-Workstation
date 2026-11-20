@@ -33,8 +33,10 @@ from h3_remote_worker import (
     _runtime_python_tag,
     _safe_extract_tar,
     _select_wheelhouse_entry,
+    build_coldstart_metrics,
     comfy_vram_flags,
     detect_gpu_vram_mib,
+    emit_coldstart_metrics,
     ensure_comfy,
     link_models_into_comfy,
     nvme_models_dir,
@@ -769,6 +771,121 @@ class RestoreWeightsNvmeTest(unittest.TestCase):
                             nvme_dir=self.store)
         self.assertEqual(calls, [])
         self._assert_store_and_links()
+
+class ColdstartMetricsTest(unittest.TestCase):
+    """v0.2.0 F5: the worker's COLDSTART_METRICS_JSON report."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        hrw._SETUP_TRACK_TIMINGS.clear()
+        hrw._RESTORE_COUNTS.update({"reused": 0, "downloaded": 0})
+        hrw._WHEELHOUSE_HIT = None
+
+    def test_build_report_shape(self):
+        hrw._SETUP_TRACK_TIMINGS.update({"ensure_comfy": 12.5,
+                                         "restore_weights": 30.25})
+        hrw._WHEELHOUSE_HIT = True
+        hrw._RESTORE_COUNTS.update({"reused": 3, "downloaded": 1})
+        metrics = build_coldstart_metrics(time.monotonic() - 42.0,
+                                          vram_mib=81920)
+        self.assertGreaterEqual(metrics["setup_seconds"], 42.0)
+        self.assertEqual(metrics["comfy_install_seconds"], 12.5)
+        self.assertEqual(metrics["restore_seconds"], 30.25)
+        self.assertTrue(metrics["wheelhouse_hit"])
+        self.assertEqual(metrics["models_reused"], 3)
+        self.assertEqual(metrics["models_downloaded"], 1)
+        self.assertEqual(metrics["vram_mib"], 81920)
+        # The report is plain JSON: no tokens, no paths.
+        json.dumps(metrics)
+
+    def test_build_report_missing_tracks_are_none(self):
+        metrics = build_coldstart_metrics(time.monotonic(), vram_mib=None)
+        self.assertIsNone(metrics["comfy_install_seconds"])
+        self.assertIsNone(metrics["restore_seconds"])
+        self.assertIsNone(metrics["wheelhouse_hit"])
+        self.assertIsNone(metrics["vram_mib"])
+
+    def test_emit_prints_marker_and_persists_job_state(self):
+        hrw._SETUP_TRACK_TIMINGS.update({"ensure_comfy": 5.0,
+                                         "restore_weights": 7.0})
+        hrw._WHEELHOUSE_HIT = False
+        hrw._RESTORE_COUNTS.update({"reused": 4, "downloaded": 0})
+        with mock.patch.object(hrw, "ROOT", self.root), \
+                mock.patch.object(hrw, "_JOB_RUN_ID", "h3-test-1"), \
+                mock.patch.object(hrw, "_JOB_VARIANT", "A"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                metrics = emit_coldstart_metrics(time.monotonic() - 12.0,
+                                                 "h3-test-1", "A",
+                                                 vram_mib=49152)
+        line = next(l for l in buf.getvalue().splitlines()
+                    if l.startswith("COLDSTART_METRICS_JSON"))
+        printed = json.loads(line.split("COLDSTART_METRICS_JSON", 1)[1])
+        self.assertEqual(printed, metrics)
+        from h3_job_state import read_job_state
+        state = read_job_state(self.root)
+        self.assertEqual(state["coldstart_metrics"], metrics)
+        self.assertEqual(state["run_id"], "h3-test-1")
+
+    def test_parallel_tracks_record_wall_time(self):
+        def slow():
+            time.sleep(0.05)
+
+        run_setup_parallel([("ensure_comfy", slow),
+                            ("restore_weights", slow)])
+        self.assertGreaterEqual(
+            hrw._SETUP_TRACK_TIMINGS["ensure_comfy"], 0.05)
+        self.assertGreaterEqual(
+            hrw._SETUP_TRACK_TIMINGS["restore_weights"], 0.05)
+
+    def test_wheelhouse_hit_recorded_by_install(self):
+        # Reuse the wheelhouse fixture: an offline install marks a hit,
+        # a no-entry install marks a miss.
+        base = WheelhouseInstallTest("test_offline_install_used_when_entry_matches")
+        base.setUp()
+        self.addCleanup(base.tearDown)
+        req = Path(self.tmp.name) / "requirements.txt"
+        req.write_text("fake-pkg==1.0\n")
+        # Same fakes as _run_ensure: a fake DriveDownloader serving the
+        # wheelhouse tar, and a fake pip.
+        with mock.patch("h3_drive_download.DriveDownloader",
+                        base._fake_downloader([])), \
+                mock.patch.object(hrw, "run_cmd", return_value=None):
+            hrw._install_requirements(
+                req, {"wheelhouses": [base.entry]},
+                token_provider=mock.Mock())
+        self.assertTrue(hrw._WHEELHOUSE_HIT)
+        hrw._WHEELHOUSE_HIT = None
+        with mock.patch.object(hrw, "run_cmd", return_value=None):
+            hrw._install_requirements(req, {}, token_provider=mock.Mock())
+        self.assertFalse(hrw._WHEELHOUSE_HIT)
+
+
+class RestoreCountsTest(WheelhouseTestBase):
+    """v0.2.0 F5: restore_weights counts reuse vs download/copy."""
+
+    def test_mount_path_counts_downloads_then_reuse(self):
+        cache = Path(self.tmp.name) / "cache"
+        manifest, content = _real_manifest_and_content()
+        for path, data in content.items():
+            f = cache / path
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(data)
+        store = Path(self.tmp.name) / "nvme"
+        with mock.patch.object(shutil, "disk_usage",
+                               return_value=_big_disk_usage()):
+            hrw._RESTORE_COUNTS.update({"reused": 0, "downloaded": 0})
+            restore_weights(Path(self.tmp.name) / "ComfyUI", cache,
+                            manifest, nvme_dir=store)
+            self.assertEqual(hrw._RESTORE_COUNTS["downloaded"], 4)
+            self.assertEqual(hrw._RESTORE_COUNTS["reused"], 0)
+            hrw._RESTORE_COUNTS.update({"reused": 0, "downloaded": 0})
+            restore_weights(Path(self.tmp.name) / "ComfyUI", cache,
+                            manifest, nvme_dir=store)
+            self.assertEqual(hrw._RESTORE_COUNTS["reused"], 4)
+            self.assertEqual(hrw._RESTORE_COUNTS["downloaded"], 0)
 
 if __name__ == "__main__":
     unittest.main()

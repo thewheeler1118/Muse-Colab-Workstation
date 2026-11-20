@@ -632,6 +632,28 @@ def check_worker_done_marker(exec_result: dict, variant: str) -> dict:
         f"the output file was never produced. Worker output tail:\n{tail}")
 
 
+def parse_coldstart_metrics(text: str) -> dict | None:
+    """Extract the worker's ``COLDSTART_METRICS_JSON`` report from exec
+    or log text (v0.2.0 F5). The last such line wins. Returns the
+    validated report, or None when no line exists or the line is not a
+    valid report — a missing or corrupt report is never an error here:
+    the run proceeds without cold-start telemetry and the manifest
+    simply has no coldstart_metrics. The validator is the manifest's
+    own (h3_run_manifest.validate_coldstart_metrics), so the parser
+    and the persister can never disagree about what a report is."""
+    from h3_run_manifest import validate_coldstart_metrics
+
+    metrics = None
+    for line in (text or "").splitlines():
+        if line.startswith("COLDSTART_METRICS_JSON"):
+            try:
+                candidate = json.loads(line.split("COLDSTART_METRICS_JSON", 1)[1].strip())
+                metrics = validate_coldstart_metrics(candidate)
+            except Exception:  # noqa: BLE001 - corrupt line is skipped
+                continue
+    return metrics
+
+
 def check_remote_output(exec_result: dict, variant: str, spec=None) -> dict:
     """Fail-closed gate on the remote MP4 BEFORE any download: the remote
     output-check script must report OUTPUT_CHECK_JSON with ok=true, the
@@ -1687,6 +1709,31 @@ def _record_remote_upload(run_id: str, state: dict) -> dict | None:
     return None
 
 
+def _record_coldstart_metrics(run_id: str, state: dict) -> dict | None:
+    """Persist the worker's cold-start report from a polled job state
+    (v0.2.0 F5). The worker writes it via write_job_state's ``extra``
+    when setup succeeds, so it appears in the state dict the
+    controller polls. Returns the validated report or None (absent or
+    invalid). Best-effort: never raises — telemetry must not break a
+    run. A corrupt report is logged, never persisted."""
+    try:
+        metrics = (state or {}).get("coldstart_metrics")
+        if metrics is None:
+            return None
+        from h3_run_manifest import validate_coldstart_metrics
+
+        validated = validate_coldstart_metrics(metrics)
+        _manifest_update(run_id, coldstart_metrics=validated)
+        return validated
+    except Exception as e:  # noqa: BLE001 - telemetry only
+        try:
+            record({"event": "coldstart_metrics_invalid", "run_id": run_id,
+                    "error": str(e)[:200]})
+        except Exception:
+            pass
+        return None
+
+
 def _manifest_worker_state(run_id: str, state: dict) -> None:
     """Record a polled worker state in the durable manifest (best-effort).
     Forward-only enforcement lives in update_run: a stale or out-of-order
@@ -1702,6 +1749,8 @@ def _manifest_worker_state(run_id: str, state: dict) -> None:
     # records it immediately, so a controller restart after VIDEO_READY
     # still finds the Drive id in the manifest.
     _record_remote_upload(run_id, state)
+    # v0.2.0 F5: the same poll catches the cold-start report.
+    _record_coldstart_metrics(run_id, state)
 
 
 def _handle_token_refresh_request(session: str, run_id: str, run_dir,
