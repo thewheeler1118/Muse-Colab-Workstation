@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## Unreleased — v0.2.1 development (TASK-VERSION-ROADMAP-011)
+
+### P1 — Drive upload MD5 hex alignment (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.1 P1 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `h3_remote_worker.py`:
+`_md5_b64` is replaced by `_md5_hex` — `validate_assembled_mp4`
+now returns the 32-char lowercase hex MD5 that matches Google Drive
+API v3 `md5Checksum` directly, and the worker evidence
+(`upload_remote_archive`) carries hex instead of base64. The
+defensive `_normalize_md5` in `h3_drive_upload.py` already accepted
+both forms (PR #62 lineage); it was verified, not re-implemented:
+hex case-insensitively, 24-char base64 16-byte digests decoded to
+hex, anything else lower-cased — and `verify_uploaded` fails closed
+when an expected MD5 has no server `md5Checksum`.
+
+Tests: `NormalizeMd5Tests` (4), `VerifyTests` gains the missing-
+server-MD5 fail-closed case plus the no-MD5-requested pass case
+(`tests/test_drive_upload.py`); `Md5HexTest` (2) in
+`tests/test_remote_worker_v020.py`. Full offline suite: 925 tests,
+0 failures. Live GPU verification: NOT_VERIFIED.
+
 ## Unreleased — v0.2.0 development (TASK-VERSION-ROADMAP-011)
 
 ### F1 — Zero-copy high-concurrency Drive download (2026-11-20)

@@ -84,11 +84,12 @@ def _sha256_file(path: Path) -> str:
 def _normalize_md5(value: str | None) -> str:
     """Normalize an MD5 digest to lowercase hex.
 
-    Drive's md5Checksum is hex (32 chars). Callers historically pass
-    base64 (24 chars, e.g. hashlib.md5().digest() base64-encoded, as
-    h3_remote_worker._md5_b64 does). Comparing the two forms literally
-    always mismatches -- a false alarm, proven 2026-11-15 on the Qwen
-    GGUF upload (b64 784JWODJOjhOIeaZKS7RZg== == hex
+    Drive's md5Checksum is hex (32 chars). The worker now emits hex
+    directly (h3_remote_worker._md5_hex, v0.2.1 P1); base64 (24 chars,
+    e.g. hashlib.md5().digest() base64-encoded) is still accepted for
+    legacy callers -- comparing the two forms literally always
+    mismatches, a false alarm proven 2026-11-15 on the Qwen GGUF
+    upload (b64 784JWODJOjhOIeaZKS7RZg== == hex
     efce0958e0c93a384e21e699292ed166). Accept both; anything else is
     returned lower-cased so a genuine mismatch still fails closed.
     """

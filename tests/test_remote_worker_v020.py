@@ -887,5 +887,40 @@ class RestoreCountsTest(WheelhouseTestBase):
             self.assertEqual(hrw._RESTORE_COUNTS["reused"], 4)
             self.assertEqual(hrw._RESTORE_COUNTS["downloaded"], 0)
 
+class Md5HexTest(unittest.TestCase):
+    """v0.2.1 P1: the worker emits 32-char lowercase hex MD5 (Drive
+    md5Checksum form) for the assembled video."""
+
+    def test_md5_hex_matches_hashlib(self):
+        with tempfile.NamedTemporaryFile(delete=False) as fp:
+            fp.write(b"hello world")
+            path = fp.name
+        try:
+            self.assertEqual(hrw._md5_hex(path),
+                             hashlib.md5(b"hello world").hexdigest())
+            self.assertRegex(hrw._md5_hex(path), r"^[0-9a-f]{32}$")
+        finally:
+            os.unlink(path)
+
+    def test_validate_assembled_mp4_returns_hex_md5(self):
+        with tempfile.TemporaryDirectory() as td:
+            final = Path(td) / "final.mp4"
+            content = b"fake-mp4-bytes"
+            final.write_bytes(content)
+            probe = {"streams": [{"codec_type": "video",
+                                  "nb_read_frames": "274",
+                                  "r_frame_rate": "24/1",
+                                  "width": 1080, "height": 1920}]}
+            with mock.patch.object(hrw, "ffprobe",
+                                   return_value=probe), \
+                    mock.patch.object(hrw.subprocess, "run",
+                                      return_value=mock.Mock(returncode=0)):
+                out = hrw.validate_assembled_mp4(
+                    final, {"sha256": hashlib.sha256(content).hexdigest()})
+            self.assertEqual(out["md5"],
+                             hashlib.md5(content).hexdigest())
+            self.assertEqual(out["frames"], 274)
+
+
 if __name__ == "__main__":
     unittest.main()

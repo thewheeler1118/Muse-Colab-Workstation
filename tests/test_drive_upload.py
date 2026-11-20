@@ -224,11 +224,17 @@ class FakeUploadDrive:
         f = self.files.get(fid)
         if f is None:
             raise _http_error(url, 404)
-        body = json.dumps({
+        body = {
             "id": f["id"], "name": f["name"], "size": str(f["size"]),
-            "md5Checksum": f["md5Checksum"], "sha256Checksum": f["sha256Checksum"],
-            "trashed": f["trashed"], "parents": f["parents"]}).encode()
-        return FakeResp(200, body, {"Content-Type": "application/json"})
+            "sha256Checksum": f["sha256Checksum"],
+            "trashed": f["trashed"], "parents": f["parents"]}
+        # v0.2.1 P1: a server record without md5Checksum must be
+        # representable (Drive omits the field); the verifier must fail
+        # closed on it when an MD5 was expected.
+        if f.get("md5Checksum") is not None:
+            body["md5Checksum"] = f["md5Checksum"]
+        return FakeResp(200, json.dumps(body).encode(),
+                        {"Content-Type": "application/json"})
 
     def _media(self, url):
         fid = url.split("/files/")[1].split("?")[0]
@@ -317,8 +323,9 @@ class HappyPathTests(UploadTestBase):
         self.assertNotIn(SECRET_A, json.dumps(evidence))
 
     def test_verify_accepts_base64_md5_against_hex_server(self):
-        # Regression: production worker passes base64 MD5
-        # (h3_remote_worker._md5_b64); real Drive answers hex.
+        # Regression: legacy callers pass base64 MD5; real Drive
+        # answers hex. The worker now emits hex directly (v0.2.1 P1),
+        # but the normalizer must keep accepting base64.
         self.write_content()
         evidence = self.upload()
         verified = self.uploader.verify_uploaded(
@@ -483,6 +490,63 @@ class VerifyTests(UploadTestBase):
                 evidence["drive_file_id"], len(self.CONTENT),
                 sha(self.CONTENT))
 
+    def test_verify_fails_closed_when_server_md5_missing(self):
+        # v0.2.1 P1: an expected MD5 with no server md5Checksum is a
+        # mismatch, never a pass.
+        self.write_content()
+        evidence = self.upload()
+        del self.fake.files[evidence["drive_file_id"]]["md5Checksum"]
+        with self.assertRaises(DriveUploadError):
+            self.uploader.verify_uploaded(
+                evidence["drive_file_id"], len(self.CONTENT),
+                sha(self.CONTENT), expected_md5=md5_hex(self.CONTENT),
+                parent_id=FOLDER)
+
+    def test_verify_without_expected_md5_ignores_missing_server_md5(self):
+        # No MD5 was requested, so a missing server checksum is not a
+        # failure; size + SHA-256 read-back still verify.
+        self.write_content()
+        evidence = self.upload()
+        del self.fake.files[evidence["drive_file_id"]]["md5Checksum"]
+        verified = self.uploader.verify_uploaded(
+            evidence["drive_file_id"], len(self.CONTENT),
+            sha(self.CONTENT), parent_id=FOLDER)
+        self.assertTrue(verified["verified"])
+
+
+class NormalizeMd5Tests(unittest.TestCase):
+    """v0.2.1 P1: _normalize_md5 accepts hex (any case) and 24-char
+    base64 16-byte digests; anything else is returned lower-cased so a
+    genuine mismatch still fails closed."""
+
+    def test_hex_case_insensitive(self):
+        from h3_drive_upload import _normalize_md5
+        self.assertEqual(
+            _normalize_md5("EFCE0958E0C93A384E21E699292ED166"),
+            "efce0958e0c93a384e21e699292ed166")
+
+    def test_base64_decodes_to_hex(self):
+        from h3_drive_upload import _normalize_md5
+        self.assertEqual(
+            _normalize_md5("784JWODJOjhOIeaZKS7RZg=="),
+            "efce0958e0c93a384e21e699292ed166")
+
+    def test_missing_is_empty(self):
+        from h3_drive_upload import _normalize_md5
+        self.assertEqual(_normalize_md5(None), "")
+        self.assertEqual(_normalize_md5(""), "")
+
+    def test_non_digest_is_lowercased_passthrough(self):
+        from h3_drive_upload import _normalize_md5
+        self.assertEqual(_normalize_md5("NOT-A-DIGEST"), "not-a-digest")
+        # Invalid base64: decode fails, value passes through lower-cased.
+        self.assertEqual(_normalize_md5("!!!not-base64!!!"),
+                         "!!!not-base64!!!")
+        # Valid base64, but not a 16-byte digest (13 bytes): no hex
+        # conversion, passes through lower-cased.
+        self.assertEqual(_normalize_md5("QUJDREVGR0hJSktMTQ=="),
+                         "qujdrevgr0hjsktmtq==")
+
 
 class MintTests(unittest.TestCase):
     """mint_file_token uses the drive.file scope, nothing broader.
@@ -604,7 +668,9 @@ class WorkerUploadTests(unittest.TestCase):
         evidence = self.hw.upload_remote_archive(
             self.mp4, self.info, self.task, RUN_ID, "A")
         self.assertEqual(evidence["sha256"], sha(self.CONTENT))
-        self.assertEqual(evidence["md5"], md5_b64(self.CONTENT))
+        # v0.2.1 P1: the worker evidence carries hex MD5 (Drive
+        # md5Checksum form), not base64.
+        self.assertEqual(evidence["md5"], md5_hex(self.CONTENT))
         self.assertEqual(evidence["uploaded_by"], "worker")
         self.assertEqual(evidence["verified_by"], "worker_readback")
         self.assertEqual(evidence["read_back_bytes"], len(self.CONTENT))

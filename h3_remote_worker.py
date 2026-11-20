@@ -6,7 +6,7 @@ cache manifest.
 Must NOT be considered production-verified until ComfyUI API workflow is exported/validated.
 """
 from __future__ import annotations
-import base64,concurrent.futures,hashlib,json,os,re,shutil,subprocess,sys,tarfile,tempfile,threading,time,urllib.request,urllib.error,uuid
+import concurrent.futures,hashlib,json,os,re,shutil,subprocess,sys,tarfile,tempfile,threading,time,urllib.request,urllib.error,uuid
 from pathlib import Path
 
 ROOT=Path('/content/muse_h3')
@@ -1481,12 +1481,16 @@ def rescue_rendered_video(comfy, run_id, variant, remaining_budget_seconds, prob
     raise RuntimeError(f'Rescue found no verifiable video for run {run_id} variant {variant} '
                        f'(scanned {len(matches)} name-matching files)')
 
-def _md5_b64(path) -> str:
+def _md5_hex(path) -> str:
+    """Return 32-char lowercase hex MD5 matching Google Drive API v3
+    md5Checksum (v0.2.1 P1). The previous base64 form only ever
+    matched after the upload verifier's normalization; emitting hex
+    directly removes the mismatch class entirely."""
     h = hashlib.md5()
     with open(path, "rb") as fp:
         for chunk in iter(lambda: fp.read(4 * 1024 * 1024), b""):
             h.update(chunk)
-    return base64.b64encode(h.digest()).decode("ascii")
+    return h.hexdigest().lower()
 
 
 def validate_assembled_mp4(final, info, spec=None) -> dict:
@@ -1531,7 +1535,7 @@ def validate_assembled_mp4(final, info, spec=None) -> dict:
     sha = sha256_file(final)
     if info.get("sha256") and sha.lower() != str(info["sha256"]).lower():
         raise ValueError("assembled MP4 SHA-256 does not match assemble info")
-    return {"sha256": sha, "md5": _md5_b64(final), "frames": frames}
+    return {"sha256": sha, "md5": _md5_hex(final), "frames": frames}
 
 
 def upload_remote_archive(final, info, task, run_id, version, spec=None):

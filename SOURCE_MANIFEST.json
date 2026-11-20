@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 19419,
-      "sha256": "20a7d9bfd61bdb0bb4a39a3dbb4a344fb42ab8f2ea2684781ae4ec987035ffbf",
+      "size_bytes": 20598,
+      "sha256": "106e18c151785ce7e4957c2faea916d2b8dfd25af27654797c2b9f08aab61f66",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 58009,
-      "sha256": "8220a076e6bd8ee44104d139995ce6fc030b4206fecca800c39b3aeaf7b069eb",
+      "size_bytes": 58299,
+      "sha256": "328155818235c729631fddd0d7900f8d9aaf2373da3d8bfa093baca44030c5ec",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 16677,
-      "sha256": "27e0005492f3a603cdc466f85bc85c7cbd309b85863fb7eb0f6836f6c76a05e2",
+      "size_bytes": 17510,
+      "sha256": "cd37850714f5d6fb2a8910dcfd14d80871a51a18dfbe21d2e607bfea919de466",
       "role": "Documentation / evidence"
     },
     {
@@ -689,8 +689,8 @@
     },
     {
       "path": "h3_drive_upload.py",
-      "size_bytes": 25722,
-      "sha256": "fe1fb716951aa87b8ff3c7527c02438bb1d1f802d28f3c13581d2bdf83be03e8",
+      "size_bytes": 25775,
+      "sha256": "de3c527f01e4e01a18bcb7ffded5def1a7b910f17725994caa1ce9ecd12add05",
       "role": "Supporting file"
     },
     {
@@ -761,8 +761,8 @@
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 89754,
-      "sha256": "da2ad363d8d7555e32dc3ba08337d1a82e291d68ab01ca643fa2175a5c75c667",
+      "size_bytes": 89978,
+      "sha256": "f9035612a7073931b91e2cac70caefeb69acd8c898bcf593c280141f05130ac7",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -1121,8 +1121,8 @@
     },
     {
       "path": "tests/test_drive_upload.py",
-      "size_bytes": 31634,
-      "sha256": "43683cd99d738acdf44c59d4f114becd32e6d249e57d33f38accd761b4aad29c",
+      "size_bytes": 34649,
+      "sha256": "8e542ffd1d84a5a4ebb34fd7d1f696f1b7eb72f576c9ff0ee48e48e3b2301962",
       "role": "Tests"
     },
     {
@@ -1211,8 +1211,8 @@
     },
     {
       "path": "tests/test_remote_worker_v020.py",
-      "size_bytes": 37462,
-      "sha256": "a715ecd5d2826c2dad654f538180b000a57a2fa727453fefdb375eb1af310c1f",
+      "size_bytes": 39034,
+      "sha256": "b6f88fddb550df52315b3c723c7efc625352d25893a0f5fce86b336629f70990",
       "role": "Tests"
     },
     {
