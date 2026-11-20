@@ -425,9 +425,14 @@ class ResumeRefusalTest(_ResumeBase):
         # fail-closed on UNKNOWN, without closing the run or allocating
         # anything. A readable empty server list would close it FAILED
         # instead (see tests/test_v031_hotfix_session_recovery.py).
+        # TASK-HOTFIX-016B: the owner gate runs before the evidence
+        # branch, so the fixture pins a verifiable owner here — the
+        # unverifiable-owner refusal itself is covered by O01/O02.
         self._manifest(task_state="GPU_ALLOCATED", session_id=None)
         self._ledger()
-        result = hc._resume_run(self._args())
+        with mock.patch("h3_gpu_lease_registry.current_owner_id",
+                        return_value="owner-test-0001"):
+            result = hc._resume_run(self._args())
         self.assertFalse(result["resumed"])
         self.assertIn("UNKNOWN", result["reason"])
         self.assertIn("live session list unreadable", result["reason"])

@@ -655,5 +655,336 @@ class DeliverGateTest(_RecoveryBase):
         self.assertEqual(self._new_calls(), [])
 
 
+class _FakeMirror:
+    """Minimal Drive lease-mirror stub (read-only) for O09: the mirror
+    is the only evidence source for the run."""
+
+    def __init__(self, doc):
+        self._doc = doc
+
+    def read_mirror(self):
+        return self._doc
+
+
+def _fake_drive_recover(h):
+    """Stub for recover_from_drive_archive performing the real manifest
+    moves (VIDEO_VALIDATED -> ARTIFACT_DURABLE -> DRIVE_VERIFIED ->
+    TASK_COMPLETED); returns the real success shape. Same shape as the
+    T12 stub, reused by O12."""
+
+    def _recover(run_id, variant, manifest, spec=None, drive=None):
+        rm.update_run(h.root, run_id, task_state="VIDEO_VALIDATED",
+                      last_verified_stage="VIDEO_VALIDATED",
+                      session_state="STOPPED",
+                      artifacts={"local_sha256": h.sha,
+                                 "local_frames": 274,
+                                 "delivery_state": "COMPLETE_LOCAL"})
+        rm.update_run(h.root, run_id, task_state="ARTIFACT_DURABLE",
+                      session_state="STOPPED")
+        rm.update_run(h.root, run_id, task_state="DRIVE_VERIFIED",
+                      last_verified_stage="DRIVE_VERIFIED",
+                      session_state="STOPPED",
+                      artifacts={"drive_file_id": "fid-archive-1",
+                                 "drive_output_folder_id": "fld-run-1",
+                                 "local_sha256": h.sha,
+                                 "local_frames": 274,
+                                 "delivery_state": "DELIVERED"})
+        rm.update_run(h.root, run_id, task_state="TASK_COMPLETED",
+                      session_state="STOPPED")
+        return {"resumed": True,
+                "outcome": "recovered_from_drive_archive_0gpu",
+                "run_id": run_id, "variant": variant,
+                "drive_file_id": "fid-archive-1",
+                "delivery": {"state": "DELIVERY_COMPLETED",
+                             "drive_file_id": "fid-archive-1"}}
+
+    return _recover
+
+
+class OwnerVerificationTest(_RecoveryBase):
+    """O01-O12 (TASK-HOTFIX-016B): session ownership must be PROVEN
+    before any sessionless resume may claim a session.
+
+    The v0.3.1 finder degraded a failed current_owner_id() lookup to
+    owner=None and then admitted every record as a candidate whenever
+    the owner check could not run — including foreign leases and
+    ownerless records. These tests prove the hole first (O01/O02/O03/
+    O07/O08/O09-ownerless/O11 fail against the unfixed code) and pin
+    the fail-closed contract afterwards:
+
+    - the current owner must be verifiable (O01/O02 -> OWNER_ID_UNVERIFIABLE);
+    - a candidate needs a trusted lease/mirror record whose owner_id
+      matches the current owner (O03/O08/O09-ownerless refuse);
+    - a managed record never carries owner_id, so it can only
+      corroborate a session a trusted source already proves (O06);
+    - any explicit foreign owner, or two trusted sources disagreeing
+      about one session, refuse the claim (O05/O07/O09-foreign);
+    - a valid candidate next to foreign evidence is still adopted, and
+      the foreign session is never touched (O10);
+    - after an owner refusal, deliver opens no second GPU and leaves
+      the ledger alone (O11);
+    - the matching-owner ACTIVE / STOPPED recovery chains keep working
+      (O04/O12)."""
+
+    def _lease_doc(self):
+        return json.loads(self.registry.path.read_text())
+
+    def _save_lease_doc(self, doc):
+        self.registry.path.write_text(json.dumps(doc))
+
+    def _strip_lease_owner(self, sid):
+        """Simulate a legacy/corrupt lease record carrying no owner_id."""
+        doc = self._lease_doc()
+        for lease in doc["leases"]:
+            if lease.get("session_id") == sid:
+                lease.pop("owner_id", None)
+        self._save_lease_doc(doc)
+
+    def _duplicate_lease_with_owner(self, sid, owner):
+        """Simulate a merged/corrupt registry: two lease records for
+        one session id, disagreeing about its owner."""
+        doc = self._lease_doc()
+        orig = next(l for l in doc["leases"]
+                    if l.get("session_id") == sid)
+        clone = dict(orig)
+        clone["owner_id"] = owner
+        doc["leases"].append(clone)
+        self._save_lease_doc(doc)
+
+    def _assert_refused_untouched(self, res, h=None):
+        """A refused resume must not query, stop, allocate, or mutate
+        the manifest: the run stays TASK_AUTHORIZED with no session id,
+        exactly as the interrupted run left it."""
+        h = h or self.h
+        self.assertFalse(res["resumed"])
+        self.assertEqual(h.query_idx, 0)
+        self.assertEqual(self._new_calls(h), [])
+        self.assertEqual(h.stop_cli_sessions, [])
+        m = h.manifest()
+        self.assertEqual(m["task_state"], "TASK_AUTHORIZED")
+        self.assertEqual(m.get("session_id") or "", "")
+
+    def test_owner_lookup_failure_refuses_recovery(self):
+        # O01: current_owner_id() raises -> OWNER_ID_UNVERIFIABLE.
+        h = self.h
+        self._sessionless_state(["G4"])
+        h.query_plan = [SessionState.ACTIVE]
+        with mock.patch("h3_gpu_lease_registry.current_owner_id",
+                        side_effect=RuntimeError("whoami down")):
+            res = h.resume()
+        self.assertFalse(res["resumed"])
+        self.assertIn("OWNER_ID_UNVERIFIABLE", res["reason"])
+        self._assert_refused_untouched(res)
+
+    def test_owner_lookup_empty_identity_refuses_recovery(self):
+        # O02: None or "" from current_owner_id() is not an identity.
+        h = self.h
+        self._sessionless_state(["G4"])
+        h.query_plan = [SessionState.ACTIVE]
+        for bad in (None, ""):
+            with self.subTest(bad=bad):
+                with mock.patch("h3_gpu_lease_registry.current_owner_id",
+                                return_value=bad):
+                    res = h.resume()
+                self.assertFalse(res["resumed"])
+                self.assertIn("OWNER_ID_UNVERIFIABLE", res["reason"])
+                self._assert_refused_untouched(res)
+
+    def test_ownerless_lease_never_claimed(self):
+        # O03: a lease with session/run/task but no owner proof.
+        h = self.h
+        sid = self._sessionless_state(["G4"])[0]
+        self._strip_lease_owner(sid)
+        h.query_plan = [SessionState.ACTIVE]
+        res = h.resume()
+        self.assertFalse(res["resumed"])
+        self.assertIn("ownership unverifiable", res["reason"])
+        self._assert_refused_untouched(res)
+
+    def test_matching_owner_active_session_still_recovers(self):
+        # O04: positive control — a lease whose owner matches the
+        # current account still recovers exactly as in T09.
+        h = self.h
+        sid = self._sessionless_state(["G4"])[0]
+        lease = next(l for l in self.registry.list_leases()
+                     if l["session_id"] == sid)
+        self.assertEqual(lease.get("owner_id"), OWNER)
+        h.query_plan = [SessionState.ACTIVE]
+        if h.mp4.is_file():
+            h.mp4.unlink()
+        self._finish_mocks()
+        res = h.resume()
+        self.assertTrue(res["resumed"])
+        m = h.manifest()
+        self.assertEqual(m["task_state"], "TASK_COMPLETED")
+        self.assertEqual(m["session_id"], sid)
+        self.assertEqual(self._new_calls(), [])
+        self.assertTrue(any(
+            e.get("event") == "SESSION_RECOVERED_FROM_REGISTRY"
+            for e in h.audit_events()))
+
+    def test_foreign_owner_lease_never_claimed(self):
+        # O05: a lease under a different account is foreign, never a
+        # candidate; the refusal names the foreign account.
+        h = self.h
+        h.construct_manifest("TASK_AUTHORIZED")
+        sid = hc.allocate_managed_session("G4", RUN_ID)
+        hwd.record_session(sid, "G4", RUN_ID, DEADLINE,
+                           production_task_id=TASK, status="allocating")
+        with mock.patch("h3_gpu_lease_registry.current_owner_id",
+                        return_value=OTHER_OWNER):
+            hc._register_gpu_lease(sid, "G4", RUN_ID, TASK, DEADLINE, 25.0)
+        h.query_plan = [SessionState.ACTIVE]
+        res = h.resume()
+        self.assertFalse(res["resumed"])
+        self.assertIn("different account", res["reason"])
+        self._assert_refused_untouched(res)
+
+    def test_matching_lease_owner_with_ownerless_managed_record_recovers(self):
+        # O06: the managed file never carries owner_id — that absence
+        # must not break recovery when the lease proves ownership.
+        h = self.h
+        sid = self._sessionless_state(["G4"])[0]
+        managed = [s for s in h.managed_sessions()
+                   if s["session_id"] == sid][0]
+        self.assertNotIn("owner_id", managed)
+        lease = next(l for l in self.registry.list_leases()
+                     if l["session_id"] == sid)
+        self.assertEqual(lease.get("owner_id"), OWNER)
+        h.query_plan = [SessionState.ACTIVE]
+        if h.mp4.is_file():
+            h.mp4.unlink()
+        self._finish_mocks()
+        res = h.resume()
+        self.assertTrue(res["resumed"])
+        self.assertEqual(h.manifest()["session_id"], sid)
+        self.assertEqual(self._new_calls(), [])
+
+    def test_conflicting_owners_for_one_session_refuse_recovery(self):
+        # O07: two trusted lease records disagree about one session's
+        # owner. The session is disputed, not foreign and not ours.
+        h = self.h
+        sid = self._sessionless_state(["G4"])[0]
+        self._duplicate_lease_with_owner(sid, OTHER_OWNER)
+        h.query_plan = [SessionState.ACTIVE]
+        res = h.resume()
+        self.assertFalse(res["resumed"])
+        self.assertIn("conflicting", res["reason"])
+        self._assert_refused_untouched(res)
+
+    def test_managed_only_record_never_claimed(self):
+        # O08: only an ownerless managed record, no lease at all.
+        h = self.h
+        h.construct_manifest("TASK_AUTHORIZED")
+        sid = hc.allocate_managed_session("G4", RUN_ID)
+        hwd.record_session(sid, "G4", RUN_ID, DEADLINE,
+                           production_task_id=TASK, status="allocating")
+        h.query_plan = [SessionState.ACTIVE]
+        res = h.resume()
+        self.assertFalse(res["resumed"])
+        self.assertIn("ownership unverifiable", res["reason"])
+        self._assert_refused_untouched(res)
+
+    def test_mirror_only_evidence_without_matching_owner_refuses(self):
+        # O09: the Drive mirror is the only evidence. A foreign owner
+        # refuses as foreign; a missing owner refuses as unverifiable.
+        h = self.h
+        h.construct_manifest("TASK_AUTHORIZED")
+        sid = hc.allocate_managed_session("G4", RUN_ID)
+        foreign_doc = {"version": 1, "leases": [{
+            "session_id": sid, "run_id": RUN_ID,
+            "production_task_id": TASK, "gpu_model": "G4",
+            "owner_id": OTHER_OWNER}]}
+        self.registry.mirror = _FakeMirror(foreign_doc)
+        h.query_plan = [SessionState.ACTIVE]
+        with self.subTest(case="foreign"):
+            res = h.resume()
+            self.assertFalse(res["resumed"])
+            self.assertIn("different account", res["reason"])
+            self._assert_refused_untouched(res)
+        ownerless_doc = {"version": 1, "leases": [{
+            "session_id": sid, "run_id": RUN_ID,
+            "production_task_id": TASK, "gpu_model": "G4"}]}
+        self.registry.mirror = _FakeMirror(ownerless_doc)
+        with self.subTest(case="ownerless"):
+            res = h.resume()
+            self.assertFalse(res["resumed"])
+            self.assertIn("ownership unverifiable", res["reason"])
+            self._assert_refused_untouched(res)
+
+    def test_valid_candidate_with_foreign_evidence_claims_only_ours(self):
+        # O10: a matching candidate plus a foreign lease for the same
+        # run. The valid session may be adopted; the foreign session
+        # must never be queried, stopped, or claimed.
+        h = self.h
+        ours = self._sessionless_state(["G4"])[0]
+        foreign_sid = hc.allocate_managed_session("A100_HIGH_MEM", RUN_ID)
+        hwd.record_session(foreign_sid, "A100_HIGH_MEM", RUN_ID, DEADLINE,
+                           production_task_id=TASK, status="allocating")
+        with mock.patch("h3_gpu_lease_registry.current_owner_id",
+                        return_value=OTHER_OWNER):
+            hc._register_gpu_lease(foreign_sid, "A100_HIGH_MEM", RUN_ID,
+                                   TASK, DEADLINE, 25.0)
+        queried = []
+
+        def _recording_query(session_id, colab_auth=None):
+            queried.append(session_id)
+            return h._fake_query(session_id, colab_auth=colab_auth)
+
+        h.query_plan = [SessionState.ACTIVE]
+        if h.mp4.is_file():
+            h.mp4.unlink()
+        self._finish_mocks()
+        with mock.patch.object(hwd, "query_session_state",
+                               side_effect=_recording_query):
+            res = h.resume()
+        self.assertTrue(res["resumed"])
+        self.assertEqual(h.manifest()["session_id"], ours)
+        self.assertIn(ours, queried)
+        self.assertNotIn(foreign_sid, queried)
+        self.assertNotIn(foreign_sid, h.stop_cli_sessions)
+        self.assertEqual(self._new_calls(), [])
+
+    def test_deliver_after_owner_refusal_creates_no_gpu(self):
+        # O11: after an owner refusal, deliver must not open a second
+        # GPU and must not touch the task ledger.
+        h = self.h
+        self._sessionless_state(["G4"])
+        _write_ledger(h.root, deadline=_future_iso())
+        ledger_before = (h.root / "model_cache"
+                         / f"h3_production_budget_{TASK}.json").read_bytes()
+        h.query_plan = [SessionState.ACTIVE]
+        with mock.patch("h3_gpu_lease_registry.current_owner_id",
+                        side_effect=RuntimeError("whoami down")):
+            result = hc.deliver_task(_deliver_args(h.root))
+        self.assertFalse(result["delivered"])
+        self.assertEqual(result["outcome"], "blocked_live_session")
+        self.assertEqual(self._new_calls(), [])
+        self.assertEqual(h.stop_cli_sessions, [])
+        self.assertEqual((h.root / "model_cache"
+                          / f"h3_production_budget_{TASK}.json").read_bytes(),
+                         ledger_before)
+        self.assertEqual(h.manifest()["task_state"], "TASK_AUTHORIZED")
+
+    def test_stopped_candidates_with_matching_owner_still_recover(self):
+        # O12: the STOPPED positive — matching-owner candidates plus a
+        # Drive archive still recover with 0 GPU, as in T12.
+        h = self.h
+        sid = self._sessionless_state(["G4"])[0]
+        lease = next(l for l in self.registry.list_leases()
+                     if l["session_id"] == sid)
+        self.assertEqual(lease.get("owner_id"), OWNER)
+        h.query_plan = [SessionState.STOPPED]
+        if h.mp4.is_file():
+            h.mp4.unlink()
+        with mock.patch.object(hc, "recover_from_drive_archive",
+                               side_effect=_fake_drive_recover(h)):
+            res = h.resume()
+        self.assertTrue(res["resumed"])
+        self.assertEqual(res["outcome"], "recovered_from_drive_archive_0gpu")
+        self.assertEqual(h.manifest()["task_state"], "TASK_COMPLETED")
+        self.assertEqual(self._new_calls(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

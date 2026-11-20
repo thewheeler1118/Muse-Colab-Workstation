@@ -109,6 +109,27 @@ upgrading production needs separate approval).
   phase and fail closed at the controller, which is the safe
   direction; no silent wrong state is possible.
 
+### TASK-HOTFIX-016B — ownership verification (PR #20 review patch)
+
+- `_find_interrupted_session_candidates` no longer degrades a failed
+  `current_owner_id()` lookup to "owner unknown, treat all as ours":
+  a failed lookup, or a `None`/empty identity, refuses the whole
+  recovery with `OWNER_ID_UNVERIFIABLE`. A candidate now needs a
+  trusted lease/mirror record whose `owner_id` matches the current
+  account; a managed record never carries `owner_id` and can only
+  corroborate a session a trusted source already proves. Sessions
+  with no ownership proof are reported as `unattributable` and block
+  the recovery; sessions whose trusted sources disagree about the
+  owner are reported as `conflicting` and block it too; a proven
+  foreign session is never claimed (a valid candidate next to foreign
+  evidence is still adopted, the foreign session untouched). Both new
+  refusal classes are in `_RESUME_LIVE_SESSION_MARKERS`, so `deliver`
+  blocks a second GPU on them as well.
+- Tests: `OwnerVerificationTest` O01–O12 in
+  `tests/test_v031_hotfix_session_recovery.py` (12 tests; 7 of them
+  failed or errored against the pre-patch code, proving the hole).
+  Full suite: 1093 tests, 0 failures.
+
 ### Tests
 
 - New: `tests/test_v031_hotfix_stage_contract.py` (15),

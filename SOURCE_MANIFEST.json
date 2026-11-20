@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 41310,
-      "sha256": "86e359a5dee6d113d9203a622c8c60a4162dca3a81178d4515a46f7ab9bd0e59",
+      "size_bytes": 42517,
+      "sha256": "7025bfa0afbc38b41bfadc300b8603a7c99da97742bd5f4c56393ec2a0e8f5d3",
       "role": "Supporting file"
     },
     {
@@ -665,8 +665,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 273809,
-      "sha256": "37d376119225fd36f738f82f5eceddabc90a899f65a44a325ec7b14a7e495cd7",
+      "size_bytes": 279143,
+      "sha256": "8bd33a3bd8d1d7c4b5aa041955a7c58a8f615ec63979cadc4de231485f4c032c",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -1205,8 +1205,8 @@
     },
     {
       "path": "tests/test_recoverable_controller.py",
-      "size_bytes": 33680,
-      "sha256": "6c423082c7da6f7d509c274d05a4683ce7a3de9fe291dc10f8abe703e6001211",
+      "size_bytes": 34012,
+      "sha256": "ee2f06d40dd91cf0ffb02ee5a923bba3a93907168ba51b672d356f0f12502ea4",
       "role": "Tests"
     },
     {
@@ -1343,8 +1343,8 @@
     },
     {
       "path": "tests/test_v031_hotfix_session_recovery.py",
-      "size_bytes": 30468,
-      "sha256": "40e36d30bd2be7c8c135d3445cb5aff05c8bcfa93de47679e307db4e9cc5f820",
+      "size_bytes": 45699,
+      "sha256": "2da579784d310bc8ac969de9ce16c49b87f7ffe7011db24c3924422ed6249fb8",
       "role": "Tests"
     },
     {

@@ -2738,55 +2738,84 @@ def _resume_run(args) -> dict:
 
 def _find_interrupted_session_candidates(task_id: str, run_id: str) -> dict:
     """Registry evidence for a run whose manifest has no session id
-    (TASK-HOTFIX-016 P0-B). Gathers candidate sessions from the local
-    registries that already record the allocation, in priority order:
+    (TASK-HOTFIX-016 P0-B, ownership rules hardened by TASK-HOTFIX-016B).
+    Gathers candidate sessions from the local registries that already
+    record the allocation, in priority order:
 
     1. the GPU lease registry (local file),
     2. the managed-session file (watchdog state),
     3. the Drive lease mirror — ONLY when the local sources yield zero
-       candidates (and zero foreign records).
+       records for this run at all.
 
-    A record is a candidate only when BOTH run_id and
-    production_task_id match exactly. Records under a different owner
-    are reported separately and are never candidates: claiming another
-    account's GPU would be a cross-account takeover. Nothing here
-    queries the server or mutates any state — classification happens in
-    the caller. Returns {"candidates": [...], "foreign": [...],
-    "mirror_used": bool, "mirror_error": str | None}. Each candidate
-    carries session_id, gpu_model, sources, run_id, production_task_id
-    and owner_id.
+    A record is a candidate only when run_id and production_task_id
+    match exactly AND its ownership is proven. Ownership proof is
+    decided per session across ALL trusted sources (lease registry and
+    Drive mirror — the only sources that record owner_id):
+
+    - the current account owner must be verifiable first: a failed
+      current_owner_id() lookup, or a None/empty identity, refuses the
+      whole recovery with owner_error "OWNER_ID_UNVERIFIABLE" (no
+      record is classified at all);
+    - a session is a candidate only when every explicit owner on its
+      trusted records is the current owner;
+    - a session with no explicit owner anywhere is "unattributable":
+      the managed file never carries owner_id, so a managed-only record
+      proves nothing — it may corroborate a session a trusted source
+      already proves, but never proves ownership itself;
+    - a session whose trusted records disagree about its owner (one
+      says us, another says someone else) is "conflicting";
+    - a session whose trusted records all name another account is
+      "foreign" and is never a candidate: claiming another account's
+      GPU would be a cross-account takeover.
+
+    Nothing here queries the server or mutates any state —
+    classification happens in the caller. Returns {"candidates": [...],
+    "foreign": [...], "unattributable": [...], "conflicting": [...],
+    "owner_error": str | None, "mirror_used": bool,
+    "mirror_error": str | None}. Each entry carries session_id,
+    gpu_model, sources, run_id, production_task_id and owner_id
+    (None for unattributable sessions).
     """
     from h3_gpu_lease_registry import current_owner_id
 
+    # TASK-HOTFIX-016B: the current owner MUST be verifiable before any
+    # record can be classified. A failed lookup (or an empty identity)
+    # is not a reason to treat every record as ours — it refuses the
+    # whole recovery; the caller reports OWNER_ID_UNVERIFIABLE.
     try:
         owner = current_owner_id()
-    except Exception:  # noqa: BLE001 - owner unknown: treat all as ours
+    except Exception:  # noqa: BLE001 - owner unverifiable: fail closed
         owner = None
+    if not isinstance(owner, str) or not owner.strip():
+        return {"candidates": [], "foreign": [], "unattributable": [],
+                "conflicting": [], "owner_error": "OWNER_ID_UNVERIFIABLE",
+                "mirror_used": False, "mirror_error": None}
+    owner = owner.strip()
     by_session: dict[str, dict] = {}
-    foreign: list[dict] = []
 
-    def _note(rec, source):
+    def _note(rec, source, trusted_owner):
+        # trusted_owner is True for the lease registry and the Drive
+        # mirror (the sources that record owner_id by design) and False
+        # for the managed file: record_session never writes owner_id, so
+        # a managed record can only corroborate a session whose
+        # ownership a trusted source already proves.
         sid = rec.get("session_id")
         if not sid or rec.get("run_id") != run_id:
             return
         if rec.get("production_task_id") != task_id:
             return
-        rec_owner = rec.get("owner_id")
-        if owner is not None and rec_owner is not None and rec_owner != owner:
-            entry = {"session_id": sid, "gpu_model": rec.get("gpu_model"),
-                     "run_id": run_id, "production_task_id": task_id,
-                     "owner_id": rec_owner, "source": source}
-            if entry not in foreign:
-                foreign.append(entry)
-            return
         entry = by_session.setdefault(sid, {
             "session_id": sid, "gpu_model": rec.get("gpu_model"),
             "run_id": run_id, "production_task_id": task_id,
-            "owner_id": rec_owner, "sources": []})
+            "owners": set(), "sources": []})
         if source not in entry["sources"]:
             entry["sources"].append(source)
         if entry["gpu_model"] is None:
             entry["gpu_model"] = rec.get("gpu_model")
+        if trusted_owner:
+            rec_owner = rec.get("owner_id")
+            if isinstance(rec_owner, str) and rec_owner.strip():
+                entry["owners"].add(rec_owner.strip())
 
     try:
         registry = _lease_registry()
@@ -2795,7 +2824,7 @@ def _find_interrupted_session_candidates(task_id: str, run_id: str) -> dict:
             f"cannot recover sessionless run {run_id}: lease registry "
             f"unreadable: {e}") from e
     for lease in registry.list_leases():
-        _note(lease, "lease")
+        _note(lease, "lease", True)
     try:
         from h3_session_watchdog import load_managed_sessions
 
@@ -2804,14 +2833,17 @@ def _find_interrupted_session_candidates(task_id: str, run_id: str) -> dict:
                    "run_id": rec.get("run_id"),
                    "production_task_id": rec.get("production_task_id"),
                    "gpu_model": rec.get("gpu"),
-                   "owner_id": rec.get("owner_id")}, "managed")
+                   "owner_id": rec.get("owner_id")}, "managed", False)
     except Exception:
         # The managed file is a secondary source: a corrupt or missing
         # file must not hide the lease evidence gathered above.
         pass
     mirror_used = False
     mirror_error = None
-    if not by_session and not foreign:
+    if not by_session:
+        # No local record for this run at all: the mirror is the last
+        # resort. When local evidence exists — even unattributable — the
+        # mirror is not consulted to overturn the local verdict.
         try:
             mirror_doc = registry.mirror.read_mirror() if registry.mirror else None
         except Exception as e:  # noqa: BLE001 - mirror is best-effort only
@@ -2820,18 +2852,37 @@ def _find_interrupted_session_candidates(task_id: str, run_id: str) -> dict:
         if mirror_doc:
             mirror_used = True
             for lease in mirror_doc.get("leases") or []:
-                _note(lease, "mirror")
-    # Ownership is decided per session across ALL sources: the managed
-    # file carries no owner_id, so a session the lease registry says
-    # belongs to another account is foreign even though its managed
-    # record is ownerless. An explicit foreign owner always wins over
-    # an absent one — never let a second source re-admit a foreign
-    # session as a candidate.
-    foreign_ids = {f["session_id"] for f in foreign}
-    candidates = [c for c in by_session.values()
-                  if c["session_id"] not in foreign_ids]
-    return {"candidates": sorted(candidates, key=lambda c: c["session_id"]),
-            "foreign": foreign, "mirror_used": mirror_used,
+                _note(lease, "mirror", True)
+    # Ownership is decided per session across ALL trusted sources.
+    # An explicit foreign owner in ANY trusted source poisons the
+    # session — never let a second source re-admit it as a candidate —
+    # and a session with no explicit owner anywhere proves nothing.
+    candidates: list[dict] = []
+    foreign: list[dict] = []
+    unattributable: list[dict] = []
+    conflicting: list[dict] = []
+    for entry in by_session.values():
+        owners = entry.pop("owners")
+        base = {"session_id": entry["session_id"],
+                "gpu_model": entry["gpu_model"],
+                "run_id": run_id, "production_task_id": task_id,
+                "sources": entry["sources"]}
+        if not owners:
+            unattributable.append({**base, "owner_id": None})
+        elif owners == {owner}:
+            candidates.append({**base, "owner_id": owner})
+        elif owner in owners:
+            conflicting.append({**base, "owner_id": None,
+                                "owners": sorted(owners)})
+        else:
+            foreign.append({**base, "owner_id": sorted(owners)[0],
+                            "owners": sorted(owners)})
+    by_sid = lambda items: sorted(items, key=lambda c: c["session_id"])
+    return {"candidates": by_sid(candidates),
+            "foreign": by_sid(foreign),
+            "unattributable": by_sid(unattributable),
+            "conflicting": by_sid(conflicting),
+            "owner_error": None, "mirror_used": mirror_used,
             "mirror_error": mirror_error}
 
 
@@ -2843,6 +2894,10 @@ def _resume_sessionless_run(args, manifest: dict) -> tuple:
     ("return", result_dict) to return directly.
 
     Branches (all fail closed; none allocates or stops blindly):
+    - current owner unverifiable: refuse ("OWNER_ID_UNVERIFIABLE").
+    - conflicting ownership evidence for a session: refuse.
+    - unattributable session evidence: refuse (never claim, close, or
+      allocate on evidence whose owner cannot be proven).
     - foreign-only evidence: refuse ("different account").
     - no evidence at all: close FAILED only after the live server
       confirms no session exists for this account; an unreadable server
@@ -2859,7 +2914,31 @@ def _resume_sessionless_run(args, manifest: dict) -> tuple:
     run_id = manifest["run_id"]
     task_id = manifest.get("production_task_id")
     found = _find_interrupted_session_candidates(task_id, run_id)
+    if found.get("owner_error"):
+        # TASK-HOTFIX-016B: the current account owner could not be
+        # verified, so no record can be classified as ours. Refuse the
+        # whole recovery — never claim, close, or allocate on an
+        # unverified identity.
+        return ("return", {"resumed": False, "run_id": run_id,
+                           "reason": "OWNER_ID_UNVERIFIABLE: current account owner could not "
+                                     "be verified; refusing to claim or allocate"})
     candidates = found["candidates"]
+    if found["conflicting"]:
+        # Trusted sources disagree about this session's owner: it may
+        # be ours, it may not be — never claim a disputed session.
+        disputed = sorted(c["session_id"] for c in found["conflicting"])
+        return ("return", {"resumed": False, "run_id": run_id,
+                           "reason": f"conflicting ownership evidence for {disputed}; "
+                                     f"refusing to claim or allocate a second GPU"})
+    if found["unattributable"]:
+        # Allocation evidence exists but no trusted source proves it is
+        # ours — the run may still hold a live GPU we cannot attribute.
+        # Neither claim it, close the run, nor allocate: an operator
+        # must resolve the orphan first.
+        unknown = sorted(u["session_id"] for u in found["unattributable"])
+        return ("return", {"resumed": False, "run_id": run_id,
+                           "reason": f"session ownership unverifiable for {unknown}; "
+                                     f"refusing to claim or allocate a second GPU"})
     if found["foreign"] and not candidates:
         return ("return", {"resumed": False, "run_id": run_id,
                            "reason": "interrupted session belongs to a different account; "
@@ -3160,6 +3239,12 @@ def _reconcile_task(args) -> dict:
                     c["session_id"]: c["sources"] for c in found["candidates"]}
                 entry["foreign_sessions"] = [
                     f["session_id"] for f in found["foreign"]]
+                entry["unattributable_sessions"] = [
+                    u["session_id"] for u in found["unattributable"]]
+                entry["conflicting_sessions"] = [
+                    c["session_id"] for c in found["conflicting"]]
+                if found.get("owner_error"):
+                    entry["owner_error"] = found["owner_error"]
                 entry["mirror_used"] = found["mirror_used"]
             except Exception as e:  # noqa: BLE001 - report, don't hide
                 entry["registry_error"] = str(e)[:300]
@@ -3690,6 +3775,11 @@ DETERMINISTIC_ERROR_MARKERS = (
 # TASK-HOTFIX-016 P0-B adds the two sessionless-resume refusal classes:
 # "conflicting" (two or more ACTIVE candidates for one run) and
 # "different account" (the only evidence belongs to another account).
+# TASK-HOTFIX-016B adds "OWNER_ID_UNVERIFIABLE" (the current account
+# owner could not be verified) and "ownership unverifiable" (a session
+# whose owner no trusted source proves): both mean the previous session
+# may still be alive under an identity we cannot attribute, so deliver
+# must block a second GPU on them too.
 _RESUME_LIVE_SESSION_MARKERS = (
     "UNKNOWN",
     "unobservable",
@@ -3697,6 +3787,8 @@ _RESUME_LIVE_SESSION_MARKERS = (
     "belongs to another run",
     "conflicting",
     "different account",
+    "OWNER_ID_UNVERIFIABLE",
+    "ownership unverifiable",
 )
 
 
