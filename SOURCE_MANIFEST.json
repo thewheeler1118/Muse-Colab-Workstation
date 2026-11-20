@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 13898,
-      "sha256": "2302ec0a8fe0fd8ec13391e7de8f8ace6f837f00e1fcc9757c42ba23379e64c6",
+      "size_bytes": 16015,
+      "sha256": "9bc6bb1d661134a8ce696125ec389975c021dd225672e6c240eaa221181692c9",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 56294,
-      "sha256": "225487e0896141d4ef67cae2927fbeb5b3e2fc41b26e8b72284d756e4dbdd98f",
+      "size_bytes": 56483,
+      "sha256": "dfb9f5e3d5a6c6a07899d8fad5d38d924495b9161bc028e91f622ffe17e78038",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 14373,
-      "sha256": "601442af602429e492025d3a7da8bd5a15bd63828d467601ef884be65446f623",
+      "size_bytes": 15286,
+      "sha256": "68e5a3e26e67eb145288f93d41988718a90d092fc0518150b502a92c9e873368",
       "role": "Documentation / evidence"
     },
     {
@@ -761,8 +761,8 @@
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 79585,
-      "sha256": "7dd1d285f2664720ed81116eca90b4b54bea347e14e825e940014a1ab056e869",
+      "size_bytes": 86507,
+      "sha256": "db0f085f898db3e7e7824bbb85faddbb04d3b0b4d4c3ce31465eecaa068ee3c7",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -1085,8 +1085,8 @@
     },
     {
       "path": "tests/test_drive_download.py",
-      "size_bytes": 46520,
-      "sha256": "c95a3c0e55b92dced73bd86ee16cf7e868bde3d9684c1c83b443c988b5798bc4",
+      "size_bytes": 47540,
+      "sha256": "60d79343c45772461a8364b76566cb18580f5db0c6ec9ea1335905f2e175e729",
       "role": "Tests"
     },
     {
@@ -1193,8 +1193,8 @@
     },
     {
       "path": "tests/test_remote_worker_v020.py",
-      "size_bytes": 18962,
-      "sha256": "4d43d6fed4a186d11b6ca97e0cb002f8ca7e26c323e116b2e6c7110b8413de9f",
+      "size_bytes": 31783,
+      "sha256": "1d7c7434ccef9a22a4db9322e6e4d64636f99e1cb7f44818664032e9b8cfdb7f",
       "role": "Tests"
     },
     {

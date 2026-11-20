@@ -1,12 +1,16 @@
-"""v0.2.0 F3 tests: dual-track parallel setup + wheelhouse-first install.
+"""v0.2.0 F3 + F4 tests: dual-track parallel setup, wheelhouse-first
+install, independent NVMe model store + high-VRAM flags.
 
-Offline only (0 CU): fake transport, fake pip, fake Drive downloads.
-No GPU, no Drive, no network.
+Offline only (0 CU): fake transport, fake pip, fake Drive downloads,
+fake GPU probe, tmp filesystems. No GPU, no Drive, no network.
 """
 
 import contextlib
+import hashlib
 import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -29,7 +33,11 @@ from h3_remote_worker import (
     _runtime_python_tag,
     _safe_extract_tar,
     _select_wheelhouse_entry,
+    comfy_vram_flags,
+    detect_gpu_vram_mib,
     ensure_comfy,
+    link_models_into_comfy,
+    nvme_models_dir,
     restore_weights,
     run_cmd,
     run_setup_parallel,
@@ -56,6 +64,37 @@ def _fake_manifest():
         ],
     }
 
+
+def _real_manifest_and_content():
+    """Manifest + bytes for the four MODEL_FILES paths, with real
+    sizes and SHA-256s, so link/restore tests verify real content."""
+    content = {}
+    files = []
+    for p in sorted(MODEL_FILES):
+        data = (f"weights:{p}:".encode() * 8)[:256]
+        content[p] = data
+        files.append({
+            "path": p,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "drive_file_id": "fake-id-" + p,
+            "server_verified": True,
+            "hf_revision": "rev",
+        })
+    manifest = {
+        "status": "READY",
+        "verification_method": "drive_v3_server_api",
+        "account_verified": True,
+        "verified_at_utc": "2026-01-01T00:00:00Z",
+        "files": files,
+    }
+    return manifest, content
+
+
+def _big_disk_usage():
+    return type("usage", (), {"total": 200 * 1024 ** 3,
+                             "used": 10 * 1024 ** 3,
+                             "free": 190 * 1024 ** 3})()
 
 class RunSetupParallelTest(unittest.TestCase):
     def test_both_tracks_run_concurrently(self):
@@ -466,6 +505,270 @@ class RestoreWeightsAbortTest(unittest.TestCase):
                                 abort_event=threading.Event())
             self.assertNotIn("aborted", str(cm.exception))
 
+
+class NvmeStoreTest(unittest.TestCase):
+    """v0.2.0 F4: the NVMe model store + link_models_into_comfy."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.store = self.base / "nvme"
+        self.comfy = self.base / "ComfyUI"
+        self.manifest, self.content = _real_manifest_and_content()
+
+    def _write_store(self, corrupt=None, missing=None):
+        for path, data in self.content.items():
+            if path == missing:
+                continue
+            f = self.store / path
+            f.parent.mkdir(parents=True, exist_ok=True)
+            # Corrupt bytes keep the size: the checksum check (not
+            # the size check) must be the one that fires.
+            bad = bytes([data[0] ^ 0xFF]) + data[1:] if data else b"x"
+            f.write_bytes(bad if path == corrupt else data)
+
+    def test_nvme_models_dir_default_and_env_override(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("H3_NVME_MODELS_DIR", None)
+            self.assertEqual(nvme_models_dir(),
+                             Path("/content/nvme_models/h3"))
+            with mock.patch.dict(os.environ,
+                                {"H3_NVME_MODELS_DIR": "/tmp/store-x"}):
+                self.assertEqual(nvme_models_dir(), Path("/tmp/store-x"))
+            with mock.patch.dict(os.environ,
+                                {"H3_NVME_MODELS_DIR": "   "}):
+                self.assertEqual(nvme_models_dir(),
+                                 Path("/content/nvme_models/h3"))
+
+    def test_link_verified_weights(self):
+        self._write_store()
+        link_models_into_comfy(self.store, self.comfy, self.manifest)
+        for path, data in self.content.items():
+            dst = self.comfy / "models" / path
+            self.assertTrue(dst.is_symlink(), path)
+            self.assertEqual(os.readlink(dst), str(self.store / path))
+            self.assertEqual(dst.read_bytes(), data)
+
+    def test_link_rejects_missing_store_file(self):
+        missing = sorted(self.content)[0]
+        self._write_store(missing=missing)
+        with self.assertRaises(RuntimeError) as cm:
+            link_models_into_comfy(self.store, self.comfy, self.manifest)
+        self.assertIn("missing", str(cm.exception))
+        self.assertFalse((self.comfy / "models" / missing).exists())
+
+    def test_link_rejects_size_mismatch(self):
+        path = sorted(self.content)[0]
+        self._write_store()
+        (self.store / path).write_bytes(b"short")
+        with self.assertRaises(RuntimeError) as cm:
+            link_models_into_comfy(self.store, self.comfy, self.manifest)
+        self.assertIn("size", str(cm.exception))
+
+    def test_link_verify_rejects_bad_checksum(self):
+        path = sorted(self.content)[0]
+        self._write_store(corrupt=path)
+        with self.assertRaises(RuntimeError) as cm:
+            link_models_into_comfy(self.store, self.comfy, self.manifest)
+        self.assertIn("checksum", str(cm.exception))
+
+    def test_link_verify_false_trusts_caller(self):
+        # Documented contract: verify=False only for callers that
+        # verified the store files in this same run. The link step
+        # then links without hashing.
+        path = sorted(self.content)[0]
+        self._write_store(corrupt=path)
+        link_models_into_comfy(self.store, self.comfy, self.manifest,
+                               verify=False)
+        self.assertTrue((self.comfy / "models" / path).is_symlink())
+
+    def test_relink_is_idempotent(self):
+        self._write_store()
+        link_models_into_comfy(self.store, self.comfy, self.manifest)
+        first = {p: os.readlink(self.comfy / "models" / p)
+                 for p in self.content}
+        link_models_into_comfy(self.store, self.comfy, self.manifest)
+        second = {p: os.readlink(self.comfy / "models" / p)
+                  for p in self.content}
+        self.assertEqual(first, second)
+
+    def test_stale_link_replaced(self):
+        self._write_store()
+        path = sorted(self.content)[0]
+        dst = self.comfy / "models" / path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        decoy = self.base / "decoy.bin"
+        decoy.write_bytes(b"decoy")
+        os.symlink(str(decoy), dst)
+        link_models_into_comfy(self.store, self.comfy, self.manifest)
+        self.assertEqual(os.readlink(dst), str(self.store / path))
+        self.assertEqual(dst.read_bytes(), self.content[path])
+
+    def test_real_file_with_right_content_left_alone(self):
+        self._write_store()
+        path = sorted(self.content)[0]
+        dst = self.comfy / "models" / path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(self.content[path])
+        link_models_into_comfy(self.store, self.comfy, self.manifest)
+        self.assertFalse(dst.is_symlink())
+        self.assertEqual(dst.read_bytes(), self.content[path])
+
+    def test_real_file_with_wrong_content_fails_closed(self):
+        self._write_store()
+        path = sorted(self.content)[0]
+        dst = self.comfy / "models" / path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"wrong-content-here")
+        with self.assertRaises(RuntimeError) as cm:
+            link_models_into_comfy(self.store, self.comfy, self.manifest)
+        self.assertIn("wrong content", str(cm.exception))
+        # The real file is untouched.
+        self.assertEqual(dst.read_bytes(), b"wrong-content-here")
+        self.assertFalse(dst.is_symlink())
+
+    def test_manifest_with_escaping_path_rejected(self):
+        bad = dict(self.manifest)
+        bad["files"] = [dict(f) for f in self.manifest["files"]]
+        bad["files"][0]["path"] = "../evil.safetensors"
+        with self.assertRaises(Exception):
+            link_models_into_comfy(self.store, self.comfy, bad)
+
+
+class VramFlagsTest(unittest.TestCase):
+    """v0.2.0 F4: detect_gpu_vram_mib + comfy_vram_flags."""
+
+    def _fake_run(self, stdout, returncode=0):
+        proc = mock.Mock()
+        proc.stdout = stdout
+        proc.returncode = returncode
+        return mock.patch.object(hrw.subprocess, "run",
+                                 return_value=proc)
+
+    def test_detect_parses_nvidia_smi(self):
+        with self._fake_run("81920\n"):
+            self.assertEqual(detect_gpu_vram_mib(), 81920)
+
+    def test_detect_returns_none_on_failure(self):
+        with self._fake_run("", returncode=1):
+            self.assertIsNone(detect_gpu_vram_mib())
+        with mock.patch.object(hrw.subprocess, "run",
+                               side_effect=FileNotFoundError("no nvidia-smi")):
+            self.assertIsNone(detect_gpu_vram_mib())
+        with self._fake_run("N/A\n"):
+            self.assertIsNone(detect_gpu_vram_mib())
+        with self._fake_run(""):
+            self.assertIsNone(detect_gpu_vram_mib())
+
+    def test_flags_for_high_vram(self):
+        self.assertEqual(comfy_vram_flags(81920),
+                         ["--highvram", "--disable-mmap"])
+        self.assertEqual(comfy_vram_flags(76800),
+                         ["--highvram", "--disable-mmap"])
+        self.assertEqual(comfy_vram_flags(76799), [])
+
+    def test_flags_none_when_no_gpu_detected(self):
+        with mock.patch.object(hrw, "detect_gpu_vram_mib", return_value=None):
+            self.assertEqual(comfy_vram_flags(), [])
+
+    def test_env_override_wins(self):
+        with mock.patch.dict(os.environ,
+                             {"H3_COMFY_VRAM_FLAGS": "--lowvram --foo"}):
+            self.assertEqual(comfy_vram_flags(81920),
+                             ["--lowvram", "--foo"])
+        with mock.patch.dict(os.environ, {"H3_COMFY_VRAM_FLAGS": ""}):
+            self.assertEqual(comfy_vram_flags(81920), [])
+
+
+class RestoreWeightsNvmeTest(unittest.TestCase):
+    """v0.2.0 F4: restore_weights writes the store, then links."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.comfy = self.base / "ComfyUI"
+        self.store = self.base / "nvme"
+        self.manifest, self.content = _real_manifest_and_content()
+        self.drive_download = {
+            "files": [{"file_id": f["drive_file_id"], "path": f["path"],
+                       "size": f["size"], "sha256": f["sha256"]}
+                      for f in self.manifest["files"]],
+            "dest_dir": "/nonexistent",
+        }
+
+    def _assert_store_and_links(self):
+        for path, data in self.content.items():
+            self.assertEqual((self.store / path).read_bytes(), data)
+            dst = self.comfy / "models" / path
+            self.assertTrue(dst.is_symlink(), path)
+            self.assertEqual(dst.read_bytes(), data)
+
+    def test_drive_path_restores_into_store_and_links(self):
+        content = self.content
+
+        class WritingDownloader:
+            def __init__(self, *a, **k):
+                pass
+
+            def download_file(self, file_id, size, sha256, dest, **kw):
+                dest = Path(dest)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                path = next(f["path"] for f in
+                            self_files if f["drive_file_id"] == file_id)
+                dest.write_bytes(content[path])
+                return {"drive_file_id": file_id, "size": size,
+                        "sha256": sha256, "path": str(dest)}
+
+        self_files = self.manifest["files"]
+        with mock.patch("h3_drive_download.DriveDownloader",
+                        WritingDownloader), \
+                mock.patch.object(shutil, "disk_usage",
+                                  return_value=_big_disk_usage()):
+            restore_weights(self.comfy, Path("/nonexistent"), self.manifest,
+                            drive_download=self.drive_download,
+                            token_provider=mock.Mock(),
+                            nvme_dir=self.store)
+        self._assert_store_and_links()
+
+    def test_mount_path_copies_into_store_and_links(self):
+        cache = self.base / "cache"
+        for path, data in self.content.items():
+            f = cache / path
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(data)
+        with mock.patch.object(shutil, "disk_usage",
+                               return_value=_big_disk_usage()):
+            restore_weights(self.comfy, cache, self.manifest,
+                            nvme_dir=self.store)
+        self._assert_store_and_links()
+
+    def test_reuse_via_store_skips_download(self):
+        for path, data in self.content.items():
+            f = self.store / path
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(data)
+        calls = []
+
+        class CountingDownloader:
+            def __init__(self, *a, **k):
+                pass
+
+            def download_file(self, *a, **k):
+                calls.append(1)
+                raise AssertionError("must not download when store is valid")
+
+        with mock.patch("h3_drive_download.DriveDownloader",
+                        CountingDownloader), \
+                mock.patch.object(shutil, "disk_usage",
+                                  return_value=_big_disk_usage()):
+            restore_weights(self.comfy, Path("/nonexistent"), self.manifest,
+                            drive_download=self.drive_download,
+                            token_provider=mock.Mock(),
+                            nvme_dir=self.store)
+        self.assertEqual(calls, [])
+        self._assert_store_and_links()
 
 if __name__ == "__main__":
     unittest.main()

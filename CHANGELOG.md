@@ -126,6 +126,44 @@ transport). Full offline suite: 818 tests, 0 failures. Live GPU
 verification: NOT_VERIFIED (no GPU run under this change).
 
 
+### F4 — Independent NVMe model store + high-VRAM flags (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.0 F4 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `h3_remote_worker.py`:
+
+- Weights now live in one NVMe store, `/content/nvme_models/h3`
+  (overridable via `H3_NVME_MODELS_DIR`), and are atomically
+  symlinked into `comfy/models` by `link_models_into_comfy()` (temp
+  symlink + `os.replace`). A re-run reuses the store instead of
+  re-downloading; a ComfyUI reinstall never touches the weights.
+- The link step only links verified weights: store file must resolve
+  inside the store (`require_inside`), exist, be readable, and match
+  the pinned size and SHA-256 (`verify=True` by default). An existing
+  correct link or correct real file is left alone; a stale link is
+  atomically replaced; a real file with wrong content fails closed.
+  `restore_weights` verifies each store file in-run (reuse-check hash
+  or the downloader's streaming SHA-256), so it links with
+  `verify=False` under a documented contract. The destination
+  containment check is lexical (`_lexical_inside`): `require_inside`
+  would follow an existing link into the store and fail every
+  re-link.
+- `restore_weights` gains an explicit `nvme_dir` parameter (tests
+  isolate the store; production uses the env/default store).
+- GPU VRAM auto-detection (`detect_gpu_vram_mib`, silent `nvidia-smi`
+  probe, None on any failure) appends `--highvram --disable-mmap`
+  for VRAM >= 76800 MiB, overridable via `H3_COMFY_VRAM_FLAGS`
+  (split on whitespace; empty means no flags). The launch prints
+  `COMFY_VRAM_FLAGS`.
+
+Tests: `NvmeStoreTest` (11), `VramFlagsTest` (5) and
+`RestoreWeightsNvmeTest` (3) in `tests/test_remote_worker_v020.py`
+(19 new tests, offline fake filesystem/GPU probe); pre-existing
+`WorkerDownloadTests` in `tests/test_drive_download.py` now pass an
+explicit tmp store so they cannot leak fixtures into the global
+default store. Full offline suite: 878 tests, 0 failures. Live GPU
+verification: NOT_VERIFIED (no GPU run under this change).
+
 ### Muse Adapter (Stage 1)
 
 

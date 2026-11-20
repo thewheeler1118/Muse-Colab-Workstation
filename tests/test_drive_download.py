@@ -883,6 +883,13 @@ class WorkerDownloadTests(unittest.TestCase):
         (comfy / "models").mkdir(parents=True, exist_ok=True)
         return comfy
 
+    def _nvme(self):
+        # v0.2.0 F4: the restore writes weights to the NVMe store, so
+        # each test gets its own tmp store instead of the global
+        # /content/nvme_models/h3 (which would leak fixtures across
+        # tests and make later tests hit CACHE_REUSE).
+        return Path(self.td) / "nvme"
+
     def test_restore_weights_download_failure_fails_closed(self):
         """Download failure propagates: the worker never claims the
         model is restored, so MODELS_READY is never reached."""
@@ -902,7 +909,8 @@ class WorkerDownloadTests(unittest.TestCase):
                 self.hrw.restore_weights(
                     self._comfy(), Path("/nonexistent"), self.manifest,
                     drive_download=self.drive_download,
-                    token_provider=FakeProvider())
+                    token_provider=FakeProvider(),
+                    nvme_dir=self._nvme())
         self.assertFalse((self._comfy() / "models" / "vae" / "minimax_h3_video_vae_int8_convrot.safetensors").exists())
 
     def test_restore_weights_download_success_writes_verified_file(self):
@@ -925,8 +933,15 @@ class WorkerDownloadTests(unittest.TestCase):
             self.hrw.restore_weights(
                 self._comfy(), Path("/nonexistent"), self.manifest,
                 drive_download=self.drive_download,
-                token_provider=FakeProvider())
+                token_provider=FakeProvider(),
+                nvme_dir=self._nvme())
+        # v0.2.0 F4: the real file lives in the store; comfy/models
+        # holds a symlink to it, and reads follow the link.
+        store_file = (self._nvme() / "vae"
+                      / "minimax_h3_video_vae_int8_convrot.safetensors")
+        self.assertEqual(store_file.read_bytes(), self.content)
         dst = self._comfy() / "models" / "vae" / "minimax_h3_video_vae_int8_convrot.safetensors"
+        self.assertTrue(dst.is_symlink())
         self.assertEqual(dst.read_bytes(), self.content)
 
     def test_restore_weights_real_downloader_end_to_end(self):
@@ -959,9 +974,14 @@ class WorkerDownloadTests(unittest.TestCase):
             self.hrw.restore_weights(
                 self._comfy(), Path("/nonexistent"), manifest,
                 drive_download=self.drive_download,
-                token_provider=FakeProvider())
+                token_provider=FakeProvider(),
+                nvme_dir=self._nvme())
         for p in self.paths:
+            # v0.2.0 F4: real file in the store, symlink in comfy/models.
+            self.assertEqual((self._nvme() / p).read_bytes(),
+                             self.content, p)
             dst = self._comfy() / "models" / p
+            self.assertTrue(dst.is_symlink(), p)
             self.assertEqual(dst.read_bytes(), self.content, p)
         self.assertEqual(drive.meta_calls, len(self.paths) * 2)
 

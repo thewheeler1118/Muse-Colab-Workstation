@@ -234,6 +234,18 @@ def run_setup_parallel(tracks, abort_event=None):
 def require_inside(path:Path, root:Path):
     if not path.resolve().is_relative_to(root.resolve()):raise ValueError('unsafe path')
 
+
+def _lexical_inside(path, root):
+    """Containment for a path whose final component may be a symlink:
+    resolve the parent, then append the name lexically, so an existing
+    link is judged by its own location, not by where it points.
+    (require_inside would follow the link: a correct link points into
+    the NVMe store, outside comfy/models, and would fail the check on
+    every re-link.)"""
+    resolved = Path(path).parent.resolve() / Path(path).name
+    if not resolved.is_relative_to(Path(root).resolve()):
+        raise ValueError('unsafe path')
+
 # 2026-11-11 (item 8): Drive -> Colab 40GB restore capacity detection.
 # The four weights total 40,073,842,159 bytes. The restore copies them from
 # the mounted Drive cache to local NVMe before inference, so a short disk or
@@ -784,6 +796,121 @@ def _install_requirements(requirements, drive_download=None, token_provider=None
     print("WHEELHOUSE_INSTALL_OK", entry.get("archive"), flush=True)
 
 
+# v0.2.0 F4: independent NVMe model store + high-VRAM flags.
+# The model store is the single home for verified weights; ComfyUI
+# only ever sees symlinks into it. A re-run reuses the store instead
+# of re-downloading, and a ComfyUI reinstall never touches the
+# weights. The link step is the only place that writes into
+# comfy/models for weights.
+NVME_MODELS_DIR_DEFAULT = Path('/content/nvme_models/h3')
+HIGH_VRAM_THRESHOLD_MIB = 76800
+HIGH_VRAM_FLAGS = ('--highvram', '--disable-mmap')
+
+
+def nvme_models_dir() -> Path:
+    """The model store directory: H3_NVME_MODELS_DIR wins, else the
+    /content/nvme_models/h3 default. Never raises."""
+    override = os.environ.get('H3_NVME_MODELS_DIR', '').strip()
+    return Path(override) if override else NVME_MODELS_DIR_DEFAULT
+
+
+def detect_gpu_vram_mib() -> int | None:
+    """Total VRAM in MiB via nvidia-smi, or None when there is no GPU,
+    no nvidia-smi, or the output does not parse. A probe failure is
+    never a run failure: the caller falls back to no extra flags."""
+    try:
+        proc = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total',
+             '--format=csv,noheader,nounits'],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=30)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip().splitlines()[0].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+def comfy_vram_flags(vram_mib=None) -> list:
+    """ComfyUI launch flags for this GPU. H3_COMFY_VRAM_FLAGS wins
+    (split on whitespace; empty means no flags). Otherwise
+    --highvram --disable-mmap when VRAM >= 76800 MiB, else none."""
+    override = os.environ.get('H3_COMFY_VRAM_FLAGS')
+    if override is not None:
+        return override.split()
+    if vram_mib is None:
+        vram_mib = detect_gpu_vram_mib()
+    if vram_mib is not None and vram_mib >= HIGH_VRAM_THRESHOLD_MIB:
+        return list(HIGH_VRAM_FLAGS)
+    return []
+
+
+def link_models_into_comfy(nvme_dir, comfy, manifest, verify=True):
+    """Atomically symlink verified weights from the NVMe store into
+    comfy/models (v0.2.0 F4).
+
+    For each manifest file the store file is nvme_dir/relative. It
+    must resolve inside the store (require_inside), exist, be a
+    regular readable file, and match the pinned size — and the pinned
+    SHA-256 when verify=True. The link is created via a temp symlink
+    + os.replace, so a reader never sees a half-made link.
+
+    Policy for what is already at the destination: a link already
+    pointing at the right store file is left alone (idempotent); a
+    real file with the right size and SHA-256 is left alone too (an
+    earlier restore wrote real files); a stale link is atomically
+    replaced (the store is the source of truth); a real file with
+    wrong content fails closed instead of being silently replaced.
+
+    verify=False is only for callers that verified every store file
+    in this same run (restore_weights does: its reuse check hashes
+    the store file, and the downloader verifies what it writes).
+    Standalone callers must leave verify on.
+    """
+    validate_model_cache_manifest(manifest)
+    nvme_dir = Path(nvme_dir)
+    models_dir = Path(comfy) / 'models'
+    for item in manifest['files']:
+        relative = Path(item['path'])
+        store_file = nvme_dir / relative
+        require_inside(store_file, nvme_dir)
+        if not store_file.is_file():
+            raise RuntimeError('NVMe store missing model: ' + str(store_file))
+        if not os.access(store_file, os.R_OK):
+            raise RuntimeError('NVMe store model unreadable: ' + str(store_file))
+        if store_file.stat().st_size != int(item['size']):
+            raise RuntimeError('NVMe store model size mismatch: ' + str(store_file))
+        if verify and sha256_file(store_file) != item['sha256']:
+            raise RuntimeError('NVMe store model checksum mismatch: ' + str(store_file))
+        dst = models_dir / relative
+        _lexical_inside(dst, models_dir)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink():
+            if os.readlink(dst) == str(store_file):
+                print('NVME_LINK_REUSED', relative, flush=True)
+                continue
+            print('NVME_LINK_REPLACED', relative, flush=True)
+        elif dst.exists():
+            if dst.stat().st_size == int(item['size']) and sha256_file(dst) == item['sha256']:
+                print('NVME_LINK_REUSED', relative, flush=True)
+                continue
+            raise RuntimeError('comfy/models holds a real file with wrong content: ' + str(dst))
+        tmp_link = dst.with_name(dst.name + '.link-tmp')
+        try:
+            if tmp_link.is_symlink() or tmp_link.exists():
+                tmp_link.unlink()
+            os.symlink(str(store_file), tmp_link)
+            os.replace(tmp_link, dst)
+        except BaseException:
+            if tmp_link.is_symlink() or tmp_link.exists():
+                tmp_link.unlink()
+            raise
+        print('NVME_LINKED', relative, flush=True)
+
+
 def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_provider=None,abort_event=None):
     """Install the pinned ComfyUI source, then its Python dependencies.
 
@@ -855,7 +982,7 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
     else:
         print('PIP_INSTALL_SKIPPED', 'all requirements already satisfied', flush=True)
 
-def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu=None,drive_download=None,token_provider=None,abort_event=None):
+def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu=None,drive_download=None,token_provider=None,abort_event=None,nvme_dir=None):
     validate_model_cache_manifest(manifest)
     # v0.2.0 F3: a sibling track that already failed aborts this one
     # before any expensive check runs, so its failure is not masked by
@@ -877,10 +1004,16 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
         downloader = DriveDownloader(token_provider)
         files = drive_download.get('files') or []
         by_path = {entry['path']: entry for entry in files}
+        # v0.2.0 F4: weights live in the NVMe store; comfy/models only
+        # ever sees symlinks into it (link step below). nvme_dir is an
+        # explicit parameter so tests can isolate the store; None means
+        # the env/default store from nvme_models_dir().
+        store = Path(nvme_dir) if nvme_dir is not None else nvme_models_dir()
+        store.mkdir(parents=True, exist_ok=True)
         projected = [False]
         for item in manifest['files']:
             relative=Path(item['path'])
-            dst=comfy/'models'/relative
+            dst=store/relative
             dst.parent.mkdir(parents=True,exist_ok=True)
             if dst.exists() and dst.stat().st_size==item['size'] and sha256_file(dst)==item['sha256']:
                 print('CACHE_REUSE',relative,flush=True);continue
@@ -903,10 +1036,18 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
                     abort_event),
                 on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
             print('CACHE_VERIFIED_NVME',relative,flush=True)
+        # Every store file was verified in this run (reuse-check hash
+        # or the downloader's streaming SHA-256), so the link step
+        # runs with verify=False under its documented contract.
+        link_models_into_comfy(store, comfy, manifest, verify=False)
         return
     if not cache.is_dir():raise RuntimeError('Drive cache not mounted. OAuth/mount MUST be handled interactively before worker.')
     total=int(sum(int(x['size']) for x in manifest['files']))
     check_restore_capacity(comfy,total,rate_cu_h=rate_cu_h,budget_cu=budget_cu)
+    # v0.2.0 F4: weights live in the NVMe store; comfy/models only
+    # ever sees symlinks into it (link step below).
+    store = Path(nvme_dir) if nvme_dir is not None else nvme_models_dir()
+    store.mkdir(parents=True, exist_ok=True)
     projected=False
     for item in manifest['files']:
         if abort_event is not None and abort_event.is_set():
@@ -916,7 +1057,7 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
         require_inside(src,cache)
         if not src.is_file() or src.stat().st_size!=item['size']:
             raise RuntimeError('Drive cache absent/incomplete: '+str(src))
-        dst=comfy/'models'/relative
+        dst=store/relative
         dst.parent.mkdir(parents=True,exist_ok=True)
         if dst.exists() and dst.stat().st_size==item['size'] and sha256_file(dst)==item['sha256']:
             print('CACHE_REUSE',relative,flush=True);continue
@@ -939,6 +1080,10 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
         finally:
             if tmp.exists():tmp.unlink()
         print('CACHE_VERIFIED_NVME',relative,flush=True)
+    # Every store file was verified in this run (copy-time SHA-256),
+    # so the link step runs with verify=False under its documented
+    # contract.
+    link_models_into_comfy(store, comfy, manifest, verify=False)
 
 
 def _download_progress(relative, done, grand_total, copy_start, projected, rate_cu_h, budget_cu, next_milestone=None):
@@ -1458,7 +1603,9 @@ def main():
         shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
         shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
         set_stage('comfyui_start')
-        proc=subprocess.Popen([sys.executable,'main.py','--listen','127.0.0.1','--port','8188'],cwd=comfy,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
+        vram_flags = comfy_vram_flags()
+        print('COMFY_VRAM_FLAGS', ' '.join(vram_flags) or '(none)', flush=True)
+        proc=subprocess.Popen([sys.executable,'main.py','--listen','127.0.0.1','--port','8188']+vram_flags,cwd=comfy,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
         set_stage('object_info_validation')
         object_info=wait_health(server,proc,time.monotonic()+180)
         info=object_info
