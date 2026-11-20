@@ -530,7 +530,8 @@ class AbortProgressTest(unittest.TestCase):
                     restore_weights(Path(d) / "ComfyUI", Path("/nonexistent"),
                                     manifest, drive_download=drive_download,
                                     token_provider=mock.Mock(),
-                                    abort_event=abort)
+                                    abort_event=abort,
+                                    nvme_dir=Path(d) / "nvme")
 
 
 class RestoreWeightsAbortTest(unittest.TestCase):
@@ -555,7 +556,8 @@ class RestoreWeightsAbortTest(unittest.TestCase):
             cache.mkdir()
             with self.assertRaises(RuntimeError) as cm:
                 restore_weights(Path(d) / "ComfyUI", cache, _fake_manifest(),
-                                abort_event=threading.Event())
+                                abort_event=threading.Event(),
+                                nvme_dir=Path(d) / "nvme")
             self.assertNotIn("aborted", str(cm.exception))
 
 

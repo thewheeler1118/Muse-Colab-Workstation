@@ -462,7 +462,7 @@
     {
       "path": "docs/module_inventory.md",
       "size_bytes": 62934,
-      "sha256": "ef59543b0fa7d9b74baca0e2a8d2c0f9b2aceba3a3352a6f300c43b92e2ed4d2",
+      "sha256": "6af4be7e1dcb03517918fe08746f29f02694258bc2d8fbe2a2f9e7a8364807c3",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -1235,8 +1235,8 @@
     },
     {
       "path": "tests/test_remote_worker_v020.py",
-      "size_bytes": 41481,
-      "sha256": "fa3d29a449a98522a6a5ce51e023b6845f2c91e95d69ead1b6d0f49d4770bfd3",
+      "size_bytes": 41603,
+      "sha256": "816bb193cf4af7fc40cdb67d593c797c6cc94030c273a6bab893f69a7ca8e7eb",
       "role": "Tests"
     },
     {
