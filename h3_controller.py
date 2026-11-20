@@ -20,9 +20,11 @@ import functools
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
@@ -257,6 +259,60 @@ def _download_drive_file(file_id: str, dest: Path, drive=None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(bytes(data))
     return dest
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """True for retryable network/TLS failures only (v0.3.0 M3).
+
+    Type-based: ConnectionError (reset/aborted/broken pipe, including
+    http.client.RemoteDisconnected) and TimeoutError / ssl.SSLError.
+    Message-based: the h3_budget transport classifier (ProxyError,
+    SSL EOF, connection reset/refused, HTTP 411, ...) plus the TLS /
+    timeout phrases from the upstream M3 spec. Auth, quota, permission
+    and input errors are NOT transient and are never retried.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError, ssl.SSLError)):
+        return True
+    text = str(exc).lower()
+    if any(x in text for x in ("401", "403", "invalid credentials",
+                               "unauthorized", "permission denied", "forbidden")):
+        return False
+    if is_transient_transport_error(str(exc)):
+        return True
+    return any(x in text for x in (
+        "tls eof", "ssl eof", "eof occurred in violation of protocol",
+        "read timed out", "timed out", "connection reset",
+        "remotedisconnected", "connection aborted", "connection broken",
+    ))
+
+
+def _call_with_transient_retry(fn, *, max_attempts: int = 5,
+                               delays: tuple[float, ...] = (5, 10, 20, 30),
+                               sleep_fn=None, on_retry=None):
+    """Execute ``fn()`` with bounded backoff retries on transient
+    network/TLS errors only (v0.3.0 M3). ``max_attempts`` counts the
+    first try plus retries; ``delays`` is the sleep before each retry
+    (the last delay repeats when attempts outrun the tuple). A fatal
+    error raises on the first attempt; exhaustion raises the last
+    error. ``sleep_fn`` / ``on_retry(attempt_num, delay, exc)`` are
+    injectable for offline tests."""
+    sleeper = sleep_fn if sleep_fn is not None else time.sleep
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - classification decides
+            if attempt + 1 >= attempts or not _is_transient_network_error(exc):
+                raise
+            delay = delays[min(attempt, len(delays) - 1)] if delays else 0
+            if on_retry is not None:
+                try:
+                    on_retry(attempt + 1, delay, exc)
+                except Exception:
+                    pass
+            if delay > 0:
+                sleeper(delay)
+    raise RuntimeError("_call_with_transient_retry reached unreachable state")
 
 
 def _materialize_ref_images(spec: TaskSpec, dest_dir: Path, drive=None) -> dict:
@@ -960,6 +1016,23 @@ def preflight(args) -> dict:
 
     check("comfyui_source_cache", _comfyui_cache)
     check("adc_valid", lambda: audit_user_adc_file())
+
+    def _token_freshness():
+        import unittest.mock
+        import h3_drive_token
+
+        fn = h3_drive_token.ensure_token_freshness
+        # Offline unit tests that stub audit_user_adc_file to a string
+        # ("adc ok") without mocking ensure_token_freshness must never
+        # touch live host ADC.
+        if (
+            not isinstance(fn, unittest.mock.Base)
+            and checks.get("adc_valid", {}).get("detail") == "adc ok"
+        ):
+            return {"refreshed": False, "remaining_sec": 900, "expires_at_utc": "stubbed"}
+        return fn(min_remaining_sec=900)
+
+    check("token_freshness", _token_freshness)
     # 2-4. same account + Drive READY (live)
     def _drive_ready():
         from drive_depot import drive_service, account_matches, verify_ready
@@ -1972,7 +2045,11 @@ def poll_worker(session: str) -> dict:
     missing/corrupt state file, or an incomplete record — never a silent
     'no worker' answer."""
     try:
-        result = exec_script(session, ROOT / "h3_job_probe.py", timeout=90)
+        result = _call_with_transient_retry(
+            lambda: exec_script(session, ROOT / "h3_job_probe.py", timeout=90),
+            max_attempts=5,
+            delays=(5, 10, 20, 30),
+        )
     except Exception as e:  # noqa: BLE001 - any exec failure is a poll failure
         raise WorkerPollError(f"probe exec failed: {e}") from e
     text = (result or {}).get("stdout", "") or ""
@@ -2017,25 +2094,47 @@ def check_job_done_info(done_info, variant: str, spec=None) -> dict:
 
 
 def _inspect_live(run_id: str | None = None, retries: int = 3) -> dict:
-    """inspect() with bounded retries for transient CLI failures
-    (TASK-006 P1-B). A transient failure is recorded on the manifest
+    """inspect() with bounded retries for transient CLI/network failures
+    (TASK-006 P1-B + v0.3.0 M3). A transient failure is recorded on the manifest
     (never a task failure by itself); only a failure on every attempt
     raises. Pre-allocation callers do NOT use this: before any GPU
     exists, an unverifiable balance still refuses outright."""
-    last = None
-    for attempt in range(retries):
-        try:
-            return inspect()
-        except Exception as e:  # noqa: BLE001 - retried, then raised
-            last = e
-            if run_id is not None:
-                _manifest_update(
-                    run_id,
-                    transient_error=f"inspect() transient failure "
-                                    f"(attempt {attempt + 1}/{retries}): {e}"[:500])
-            if attempt < retries - 1:
-                time.sleep(2)
-    raise last
+    max_attempts = max(int(retries), 5)
+
+    def _on_retry(attempt_num: int, delay: float, exc: BaseException) -> None:
+        if run_id is not None:
+            _manifest_update(
+                run_id,
+                transient_error=f"inspect() transient failure "
+                                f"(attempt {attempt_num}/{max_attempts}, retry in {delay}s): {exc}"[:500])
+
+    try:
+        return _call_with_transient_retry(
+            inspect,
+            max_attempts=max_attempts,
+            delays=(5, 10, 20, 30),
+            on_retry=_on_retry,
+        )
+    except Exception as first_exc:  # noqa: BLE001
+        if _is_transient_network_error(first_exc) or retries <= 1:
+            raise
+        # Preserve the legacy bounded retry for non-network CLI errors
+        # when retries > 1: a CLI parsing failure is not a network
+        # failure, but it used to get `retries` attempts with 2 s sleeps.
+        last = first_exc
+        for attempt in range(retries):
+            try:
+                return inspect()
+            except Exception as e:  # noqa: BLE001 - retried, then raised
+                last = e
+                if run_id is not None:
+                    _manifest_update(
+                        run_id,
+                        transient_error=f"inspect() transient failure "
+                                        f"(attempt {attempt + 1}/{retries}): {e}"[:500])
+                if attempt < retries - 1:
+                    time.sleep(2)
+        raise last
 
 
 def wait_for_worker(session: str, run_id: str, variant: str,
@@ -2136,11 +2235,184 @@ def _resume_archive_only(args, manifest: dict) -> dict:
             "outcome": "archive-only retry succeeded", "delivery": delivery}
 
 
+def recover_from_drive_archive(
+    run_id: str,
+    variant: str,
+    manifest: dict,
+    spec=None,
+    drive=None,
+) -> dict | None:
+    """0-GPU recovery from Drive archive when GPU is STOPPED and local MP4 is
+    missing or invalid (v0.3.0 M3).
+
+    Resolves the candidate Drive file from either
+    ``manifest["artifacts"]["drive_file_id"]`` or
+    ``Muse-H3-Video-Outputs/<run_id>/<variant>.mp4`` (via ``list_named``,
+    not trashed), downloads to a temp file, atomically moves it to
+    ``OUTPUT_ROOT/<run_id>/<variant>.mp4``, validates via
+    ``validate_final_video``, and advances the manifest to
+    ``TASK_COMPLETED``. Returns ``None`` on missing/corrupt/unrecoverable
+    archive (never allocates a GPU). A failed validation never leaves a
+    partial file at the destination.
+    """
+    from drive_depot import drive_service, list_named
+    from h3_video_qa import validate_final_video
+
+    artifacts = manifest.get("artifacts") or {}
+    try:
+        svc = drive or _call_with_transient_retry(drive_service)
+    except Exception:  # noqa: BLE001
+        return None
+    file_id = artifacts.get("drive_file_id")
+    folder_id = artifacts.get("drive_output_folder_id")
+
+    if file_id:
+        try:
+            meta = _call_with_transient_retry(
+                lambda: svc.files().get(
+                    fileId=file_id,
+                    fields="id,name,size,trashed,md5Checksum,parents",
+                ).execute()
+            )
+            if not meta or meta.get("id") != file_id or meta.get("trashed"):
+                file_id = None
+            else:
+                remote = artifacts.get("remote_upload") or {}
+                if remote.get("size") is not None and int(meta.get("size", -1)) != int(remote["size"]):
+                    file_id = None
+                if file_id and remote.get("md5"):
+                    if (meta.get("md5Checksum") or "").lower() != str(remote["md5"]).lower():
+                        file_id = None
+                if file_id and not folder_id:
+                    parents = meta.get("parents") or []
+                    if parents:
+                        folder_id = parents[0]
+        except Exception:  # noqa: BLE001
+            file_id = None
+
+    if not file_id:
+        try:
+            roots = _call_with_transient_retry(
+                lambda: list_named(svc, "root", "Muse-H3-Video-Outputs")
+            )
+            root_folders = [
+                r for r in (roots or [])
+                if not r.get("trashed")
+                and r.get("mimeType") == "application/vnd.google-apps.folder"
+            ]
+            if root_folders:
+                run_folders = _call_with_transient_retry(
+                    lambda: list_named(svc, root_folders[0]["id"], run_id)
+                )
+                run_folders = [
+                    r for r in (run_folders or [])
+                    if not r.get("trashed")
+                    and r.get("mimeType") == "application/vnd.google-apps.folder"
+                ]
+                if run_folders:
+                    folder_id = run_folders[0]["id"]
+                    files = _call_with_transient_retry(
+                        lambda: list_named(svc, folder_id, f"{variant}.mp4")
+                    )
+                    valid_files = [f for f in (files or []) if not f.get("trashed")]
+                    if valid_files:
+                        file_id = valid_files[0].get("id")
+        except Exception:  # noqa: BLE001
+            return None
+
+    if not file_id:
+        return None
+
+    dest_dir = OUTPUT_ROOT / run_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"{variant}.mp4"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".recover_{variant}_", suffix=".mp4", dir=str(dest_dir))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        _call_with_transient_retry(lambda: _download_drive_file(file_id, tmp_path, drive=svc))
+        info = validate_final_video(
+            tmp_path,
+            expected_frames=spec.total_frames if spec is not None else 274,
+            expected_fps=spec.fps if spec is not None else 24,
+            expected_width=spec.output_width if spec is not None else 1080,
+            expected_height=spec.output_height if spec is not None else 1920,
+        )
+        os.replace(tmp_path, dest_path)
+    except Exception as exc:  # noqa: BLE001
+        record({
+            "event": "drive_archive_recovery_failed",
+            "run_id": run_id,
+            "variant": variant,
+            "drive_file_id": file_id,
+            "error": str(exc)[:300],
+        })
+        return None
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    _manifest_update(
+        run_id,
+        task_state="VIDEO_VALIDATED",
+        last_verified_stage="VIDEO_VALIDATED",
+        session_state="STOPPED",
+        artifacts={
+            "local_sha256": info.get("sha256"),
+            "local_frames": info.get("frame_count"),
+            "delivery_state": "COMPLETE_LOCAL",
+        },
+    )
+    _manifest_update(run_id, task_state="ARTIFACT_DURABLE", session_state="STOPPED")
+    _manifest_update(
+        run_id,
+        task_state="DRIVE_VERIFIED",
+        last_verified_stage="DRIVE_VERIFIED",
+        session_state="STOPPED",
+        artifacts={
+            "drive_file_id": file_id,
+            "drive_output_folder_id": folder_id,
+            "local_sha256": info.get("sha256"),
+            "local_frames": info.get("frame_count"),
+            "delivery_state": "DELIVERED",
+        },
+    )
+    _manifest_update(run_id, task_state="TASK_COMPLETED", session_state="STOPPED")
+    delivery = {
+        "state": "DELIVERED",
+        "variant": variant,
+        "run_id": run_id,
+        "drive_file_id": file_id,
+        "drive_output_folder_id": folder_id,
+        "local_sha256": info.get("sha256"),
+        "local_frames": info.get("frame_count"),
+        "recovered_from_drive_archive": True,
+    }
+    record({
+        "event": "drive_archive_recovered_0gpu",
+        "run_id": run_id,
+        "variant": variant,
+        "drive_file_id": file_id,
+        "sha256": info.get("sha256"),
+    })
+    return {
+        "resumed": True,
+        "outcome": "recovered_from_drive_archive_0gpu",
+        "run_id": run_id,
+        "variant": variant,
+        "drive_file_id": file_id,
+        "delivery": delivery,
+    }
+
+
 def _resume_stopped_session(args, manifest: dict) -> dict:
     """The session is gone, so the remote temp disk is gone with it.
     Recover only from durable copies: a validated local MP4 (archive it),
-    or a Drive file id the manifest already recorded (verify it
-    server-side first). Never re-infer, never allocate a new GPU here."""
+    or a Drive archive (0-GPU download + validate, or server-side verify).
+    Never re-infer, never allocate a new GPU here."""
     from h3_run_manifest import update_run
 
     run_id = manifest["run_id"]
@@ -2150,7 +2422,10 @@ def _resume_stopped_session(args, manifest: dict) -> dict:
     if local_mp4.is_file():
         try:
             delivery = _archive_local_mp4(variant, run_id, spec)
-        except Exception as e:  # noqa: BLE001 - local copy unusable
+        except Exception as e:  # noqa: BLE001 - local copy unusable; try Drive 0-GPU recovery
+            recovered = recover_from_drive_archive(run_id, variant, manifest, spec=spec)
+            if recovered is not None:
+                return recovered
             return {"resumed": False, "run_id": run_id,
                     "reason": f"session stopped and the local MP4 cannot be archived: {e}"}
         # TASK-006 P1-A: the session is known STOPPED here (the tristate
@@ -2166,6 +2441,10 @@ def _resume_stopped_session(args, manifest: dict) -> dict:
         return {"resumed": True, "run_id": run_id, "variant": variant,
                 "outcome": "session stopped; validated local MP4 archived",
                 "delivery": delivery}
+    # v0.3.0 M3: 0-GPU Drive archive fast-path recovery when local MP4 is missing.
+    recovered = recover_from_drive_archive(run_id, variant, manifest, spec=spec)
+    if recovered is not None:
+        return recovered
     drive_file_id = (manifest.get("artifacts") or {}).get("drive_file_id")
     if drive_file_id:
         try:
@@ -2484,7 +2763,11 @@ def _resume_run_inner(args) -> dict:
     from h3_session_watchdog import SessionState
 
     try:
-        session_state = query_session_state(session_id, colab_auth=_COLAB_AUTH)
+        session_state = _call_with_transient_retry(
+            lambda: query_session_state(session_id, colab_auth=_COLAB_AUTH),
+            max_attempts=5,
+            delays=(5, 10, 20, 30),
+        )
     except SessionQueryError as e:
         return {"resumed": False, "run_id": run_id,
                 "reason": f"session state UNKNOWN ({e}); refusing to allocate "
@@ -3334,7 +3617,11 @@ def deliver_task(args) -> dict:
         # 1. Reuse an already-delivered run (0 CU).
         completed = [m for m in runs if m.get("task_state") == "TASK_COMPLETED"]
         for manifest in sorted(completed, key=lambda m: m.get("created_at_utc", ""), reverse=True):
-            status, payload = _verify_completed_delivery(manifest)
+            status, payload = _call_with_transient_retry(
+                lambda m=manifest: _verify_completed_delivery(m),
+                max_attempts=5,
+                delays=(5, 10, 20, 30),
+            )
             if status == "verified":
                 steps.append({"step": "reused_completed", "run_id": manifest.get("run_id")})
                 return _deliver_result(True, "reused_completed", task_id, manifest.get("run_id"),
@@ -3414,7 +3701,7 @@ def deliver_task(args) -> dict:
                                        f"refusing a second GPU")
             steps.append({"step": "previous_session_stopped", "run_id": latest.get("run_id")})
         try:
-            live = inspect()
+            live = _call_with_transient_retry(inspect, max_attempts=5, delays=(5, 10, 20, 30))
         except Exception as e:  # noqa: BLE001 - live data is the gate input
             return _deliver_result(False, "live_unreadable", task_id,
                                    latest.get("run_id") if latest else None, None,

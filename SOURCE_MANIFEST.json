@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 28485,
-      "sha256": "b8610a3017ccb3c61ebb3c130c8ad96739f5746be297fe5edc7080c94bfd82d0",
+      "size_bytes": 30604,
+      "sha256": "b3971fc56fb62e71634845411086cd4625c36c2d52931e2e86f90a849a462b4e",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 60636,
-      "sha256": "8c452e45d4a770ed84f44fc93370fdc0f58e577716c8e991ce0051041ba3e754",
+      "size_bytes": 61014,
+      "sha256": "da8873b2f8b7e0ed14712f113be97247f6e03029bfe13ef4c5b915d16272eed8",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 22169,
-      "sha256": "6915b853e4694f539efc69bce85589b459e73f4e28784eb4ae0fa0b67c71c823",
+      "size_bytes": 23906,
+      "sha256": "106d3b322584e29d2e4117bcc7f2b387f416967c51d8a16ee6a58bbc27ee615c",
       "role": "Documentation / evidence"
     },
     {
@@ -665,8 +665,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 225199,
-      "sha256": "ece83353ebce8aba0bd0390380360b4990b0fe30c8b23dffcc7769c69b05b1b0",
+      "size_bytes": 236641,
+      "sha256": "1a6649f2c6498851fe2d31df5414be8ef2cba049da319ce552e69db96be279ca",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -689,8 +689,8 @@
     },
     {
       "path": "h3_drive_token.py",
-      "size_bytes": 4546,
-      "sha256": "d82d42b6982fd1491a46dfefcb0d75e4e8fe880ca5054fdbe9c1def6f2754bb4",
+      "size_bytes": 6582,
+      "sha256": "88537f1cfd8a5628dce2efdfb1a35d1d06c10a3bf748d06cedbf5518a1f2d02b",
       "role": "Supporting file"
     },
     {
@@ -1315,6 +1315,12 @@
       "path": "tests/test_v030_m2_bundled_bootstrap.py",
       "size_bytes": 12801,
       "sha256": "6d486c1fcc5b6e7470c1d06654fbd0139743bb4a9a2991f288f302d8b0fed91d",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m3_self_healing.py",
+      "size_bytes": 19540,
+      "sha256": "cb27e55e477abf9d44eddc8b220ac34b4a8f71a91b65b3afd1812e5061203edd",
       "role": "Tests"
     },
     {

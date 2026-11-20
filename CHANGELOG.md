@@ -2,6 +2,42 @@
 
 ## Unreleased — v0.3.0 development (TASK-VERSION-ROADMAP-011)
 
+### M3 — host disconnect self-healing & Drive 0-GPU recovery (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.3.0 M3 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `_call_with_transient_retry`
+(5 attempts, 5/10/20/30 s backoff, injectable sleep/on_retry) retries
+transient network/TLS failures only — type-based
+(ConnectionError/TimeoutError/ssl.SSLError) plus the h3_budget
+transport classifier and the TLS/timeout phrases; auth, quota,
+permission and input errors raise on the first attempt. Wired into
+host polling (`poll_worker`), inspection (`_inspect_live`, keeping
+the legacy bounded loop for non-network CLI errors), the resume
+session-state query, and the deliver gates (`_verify_completed_delivery`,
+`inspect()`). `h3_drive_token.ensure_token_freshness(min_remaining_sec=900)`
+refreshes the user ADC silently when expired/invalid/near expiry
+(service accounts refused, same as `_mint_token`; never logs token
+material) and is wired into the 0-CU preflight as `token_freshness`.
+`recover_from_drive_archive` recovers a finished video at 0 CU when
+the host disconnects after the GPU stopped: it resolves the Drive
+file from the manifest `drive_file_id` (size/MD5 checked against the
+remote-upload evidence) or from `Muse-H3-Video-Outputs/<run_id>/<variant>.mp4`
+via `list_named`, downloads to a temp file, validates with
+`validate_final_video`, atomically moves it into place, and advances
+the manifest VIDEO_VALIDATED → ARTIFACT_DURABLE → DRIVE_VERIFIED →
+TASK_COMPLETED; a failed validation never leaves a partial file.
+`_resume_stopped_session` tries it before the metadata-only server
+verify, and after a failed local-MP4 archive. Never re-infers, never
+allocates a GPU.
+
+Tests: `tests/test_v030_m3_self_healing.py` (17: retry semantics,
+archive recovery via file id / folder lookup / corrupt / Drive down,
+resume wiring incl. download-failure fallback to server verify,
+token freshness incl. service-account refusal, poll-worker retry).
+Full offline suite: 1003 tests, 0 failures. Live GPU verification:
+NOT_VERIFIED.
+
 ### M2 — two-stage bundled bootstrap (2026-11-20)
 
 Muse-original reimplementation of the upstream v0.3.0 M2 behaviour
