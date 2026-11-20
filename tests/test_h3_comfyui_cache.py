@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 import h3_remote_worker
 from h3_remote_worker import (
-    _LAST_CMD_FAILURE,
+    _cmd_failure_get,
     _sanitize_text,
     clone_comfyui_atomic,
     comfyui_commit,
@@ -64,7 +64,7 @@ class TestGitFailureRecord(unittest.TestCase):
                      "import sys; sys.stderr.write('fatal: boom\\n'); "
                      "raise SystemExit(3)"])
         self.assertEqual(cm.exception.returncode, 3)
-        detail = h3_remote_worker._LAST_CMD_FAILURE
+        detail = _cmd_failure_get()
         self.assertIsNotNone(detail)
         self.assertEqual(detail["returncode"], 3)
         self.assertIn("fatal: boom", detail["stderr"])
@@ -85,9 +85,9 @@ class TestGitFailureRecord(unittest.TestCase):
     def test_last_cmd_failure_clears_on_success(self):
         with self.assertRaises(subprocess.CalledProcessError):
             run_cmd([sys.executable, "-c", "raise SystemExit(1)"])
-        self.assertIsNotNone(h3_remote_worker._LAST_CMD_FAILURE)
+        self.assertIsNotNone(_cmd_failure_get())
         run_cmd([sys.executable, "-c", "pass"])
-        self.assertIsNone(h3_remote_worker._LAST_CMD_FAILURE)
+        self.assertIsNone(_cmd_failure_get())
 
 
 class TestAtomicClone(unittest.TestCase):

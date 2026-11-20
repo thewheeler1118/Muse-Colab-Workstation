@@ -6,7 +6,7 @@ cache manifest.
 Must NOT be considered production-verified until ComfyUI API workflow is exported/validated.
 """
 from __future__ import annotations
-import base64,hashlib,json,os,re,shutil,subprocess,sys,tarfile,tempfile,time,urllib.request,urllib.error,uuid
+import base64,concurrent.futures,hashlib,json,os,re,shutil,subprocess,sys,tarfile,tempfile,threading,time,urllib.request,urllib.error,uuid
 from pathlib import Path
 
 ROOT=Path('/content/muse_h3')
@@ -55,7 +55,12 @@ _JOB_RUN_ID = ""
 _JOB_VARIANT = ""
 # Token id of the last renewal request sent to the controller, so a
 # long download asks once per token instead of on every chunk.
+# v0.2.0 F3: the dual-track setup runs two downloaders on two threads
+# against one provider, so the check-and-set below is serialized by
+# _TOKEN_REFRESH_LOCK — without it two threads expiring at once would
+# both see a stale id and send duplicate requests.
 _LAST_REFRESH_REQUEST_TOKEN_ID = None
+_TOKEN_REFRESH_LOCK = threading.Lock()
 
 
 def _request_token_refresh(provider, scope="drive.readonly") -> None:
@@ -69,9 +74,10 @@ def _request_token_refresh(provider, scope="drive.readonly") -> None:
     global _LAST_REFRESH_REQUEST_TOKEN_ID
     try:
         token_id = provider.token_id if provider is not None else None
-        if token_id is not None and token_id == _LAST_REFRESH_REQUEST_TOKEN_ID:
-            return
-        _LAST_REFRESH_REQUEST_TOKEN_ID = token_id
+        with _TOKEN_REFRESH_LOCK:
+            if token_id is not None and token_id == _LAST_REFRESH_REQUEST_TOKEN_ID:
+                return
+            _LAST_REFRESH_REQUEST_TOKEN_ID = token_id
         if _JOB_RUN_ID and _JOB_VARIANT:
             write_job_state(ROOT, _JOB_RUN_ID, _JOB_VARIANT,
                             WORKER_PHASE_TO_JOB_STAGE.get(_LAST_STAGE, _LAST_STAGE),
@@ -107,19 +113,123 @@ def _sanitize_text(text):
     return re.sub(r'(://[^/\s:]+:)[^/\s@]+@', r'\1***@', text)
 
 
-# Detail of the most recent run_cmd failure, if any. Cleared at the start
-# of every run_cmd call, so it only ever describes the failure that is
-# currently propagating. worker_failure_info merges it into the structured
-# WORKER_FAILED_JSON line, so a Git failure is recorded with its sanitized
-# stdout/stderr, exit code, command stage and exception type in one place.
-_LAST_CMD_FAILURE = None
+# Detail of the most recent run_cmd failure on THIS thread, if any.
+# Cleared at the start of every run_cmd call, so it only ever describes
+# the failure that is currently propagating. worker_failure_info merges
+# it into the structured WORKER_FAILED_JSON line, so a Git failure is
+# recorded with its sanitized stdout/stderr, exit code, command stage
+# and exception type in one place.
+#
+# v0.2.0 F3: this is thread-local, not a module global. The dual-track
+# setup runs two tracks concurrently; a global would let one track's
+# run_cmd clobber the other's record. The failing track's record is
+# snapshotted in its own thread at catch time and carried to the main
+# thread on SetupTrackFailed (see run_setup_parallel); worker_failure_info
+# prefers the record carried on the exception, then this thread's own.
+_CMD_FAILURE_STATE = threading.local()
+
+
+def _cmd_failure_get():
+    return getattr(_CMD_FAILURE_STATE, "record", None)
+
+
+def _cmd_failure_set(record):
+    _CMD_FAILURE_STATE.record = record
 
 
 def worker_failure_info(stage: str, exc: BaseException) -> dict:
     info = {"stage": stage, "error_type": type(exc).__name__, "error": str(exc)[:1500]}
-    if _LAST_CMD_FAILURE:
-        info["cmd_failure"] = _LAST_CMD_FAILURE
+    cmd_failure = getattr(exc, "cmd_failure", None) or _cmd_failure_get()
+    if cmd_failure:
+        info["cmd_failure"] = cmd_failure
     return info
+
+
+class SetupTrackFailed(RuntimeError):
+    """A dual-track setup stage failed (v0.2.0 F3). Carries the failing
+    stage name, the original exception, and that track's command-failure
+    record (snapshotted in the failing thread, so it survives the trip
+    back to the main thread where WORKER_FAILED_JSON is printed)."""
+
+    def __init__(self, stage: str, exc: BaseException, cmd_failure=None):
+        super().__init__(f"setup track failed: {stage}: {exc}")
+        self.stage = stage
+        self.exc = exc
+        self.cmd_failure = cmd_failure
+
+
+class _SetupAborted(RuntimeError):
+    """Raised by the abort-checking progress callback when the shared
+    setup abort event is set (v0.2.0 F3)."""
+
+
+def _abort_progress(on_progress, abort_event):
+    """Wrap a download progress callback so it aborts when the shared
+    setup event is set (v0.2.0 F3).
+
+    The downloader invokes the callback per chunk (single-stream) and
+    per shard report (concurrent path). A raise aborts the concurrent
+    path promptly — the callback error is re-raised after the pool —
+    and exhausts retries on the single-stream path; either way the
+    download stops and the earliest failure (the track that set the
+    event) is the one run_setup_parallel reports. This is deliberately
+    independent of the downloader's abort_event parameter (added on
+    the F1 branch, not yet on main): the callback mechanism works
+    against both downloader versions.
+    """
+    if abort_event is None:
+        return on_progress
+
+    def _checked(done, total_bytes):
+        if abort_event.is_set():
+            raise _SetupAborted("setup aborted: sibling track failed")
+        if on_progress is not None:
+            on_progress(done, total_bytes)
+
+    return _checked
+
+
+def run_setup_parallel(tracks, abort_event=None):
+    """Run the setup tracks concurrently (v0.2.0 F3).
+
+    ``tracks`` is a list of ``(stage_name, zero-arg callable)`` — the
+    two setup stages, ``ensure_comfy`` and ``restore_weights``. They run
+    on a ``ThreadPoolExecutor(max_workers=2)`` against the shared
+    ``abort_event``: the first failure sets the event so the surviving
+    track's in-flight Drive download aborts promptly, and the failure
+    is reported with the stage that actually failed.
+
+    Returns None when every track succeeds. Raises SetupTrackFailed for
+    the earliest failure (by catch time; ties break in track order).
+    Both tracks are always awaited before raising, so no track is left
+    running when the caller handles the failure. A surviving track
+    stuck in a step that cannot observe the abort event (pip install,
+    git clone) still runs to its own bounded timeout, exactly as it
+    would on the sequential path — the parallel path never extends a
+    per-operation timeout, it only overlaps the two tracks.
+    """
+    if abort_event is None:
+        abort_event = threading.Event()
+    results = {}
+
+    def _run_one(index, stage, fn):
+        try:
+            fn()
+            results[index] = (stage, None, None, None)
+        except BaseException as e:  # noqa: BLE001 — recorded, re-raised by caller
+            results[index] = (stage, e, _cmd_failure_get(), time.monotonic())
+            abort_event.set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_run_one, i, stage, fn) for i, (stage, fn) in enumerate(tracks)]
+        for f in futures:
+            f.result()
+    failures = [(i, r) for i, r in sorted(results.items()) if r[1] is not None]
+    if failures:
+        # Earliest failure wins (by catch time); ties break in track order.
+        failures.sort(key=lambda item: (item[1][3], item[0]))
+        _, (stage, exc, cmd_failure, _caught_at) = failures[0]
+        raise SetupTrackFailed(stage, exc, cmd_failure)
 
 def require_inside(path:Path, root:Path):
     if not path.resolve().is_relative_to(root.resolve()):raise ValueError('unsafe path')
@@ -188,10 +298,10 @@ def run_cmd(args,timeout=1200,cwd=None):
     of ComfyUI failed with exit 128 and git's own fatal message was lost
     (inherited stdio was not captured by the exec channel), leaving only
     the exit code to diagnose from. The failure detail is also stashed in
-    _LAST_CMD_FAILURE so worker_failure_info carries it in the structured
-    WORKER_FAILED_JSON line (sanitized, truncated)."""
-    global _LAST_CMD_FAILURE
-    _LAST_CMD_FAILURE = None
+    the calling thread's command-failure record so worker_failure_info
+    carries it in the structured WORKER_FAILED_JSON line (sanitized,
+    truncated)."""
+    _cmd_failure_set(None)
     print('STAGE_CMD',args[0],flush=True)
     try:
         proc = subprocess.run(args,cwd=cwd,check=True,timeout=timeout,
@@ -202,12 +312,12 @@ def run_cmd(args,timeout=1200,cwd=None):
             print(proc.stderr,flush=True)
         return proc
     except subprocess.CalledProcessError as e:
-        _LAST_CMD_FAILURE = {
+        _cmd_failure_set({
             "cmd": _sanitize_text(" ".join(str(a) for a in args)),
             "returncode": e.returncode,
             "stdout": _sanitize_text(e.stdout or "")[-2000:],
             "stderr": _sanitize_text(e.stderr or "")[-2000:],
-        }
+        })
         print('CMD_FAILED',args[0],'exit',e.returncode,flush=True)
         if e.stdout:
             print(_sanitize_text(e.stdout),flush=True)
@@ -529,7 +639,152 @@ def post_json(url,data,timeout=30):
         except Exception:body=''
         raise RuntimeError(f'POST {url} failed HTTP {e.code}: {body[:2000]}') from e
 
-def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_provider=None):
+# ---- v0.2.0 F3: offline wheelhouse install (worker side) ----
+# F2 (controller) publishes a deterministic wheelhouse bundle to Drive
+# and passes its descriptor through drive_download["wheelhouses"] as a
+# one-entry list {file_id, size, sha256, archive, commit, python_tag}.
+# This section consumes that entry: download the archive with the same
+# DriveDownloader transport as the model restore, extract it with
+# tar-member validation, verify WHEELHOUSE_META.json against the entry,
+# and install with pip --no-index --find-links. Any failure of the
+# offline path falls back to the plain PyPI install and emits the
+# structured WHEELHOUSE_FALLBACK_PYPI event; the fallback itself never
+# fails the run — a failed plain install still raises (fail closed).
+WHEELHOUSE_META_NAME = "WHEELHOUSE_META.json"
+WHEELHOUSE_DIR_IN_ARCHIVE = "wheelhouse"
+# Generous cap on total extracted bytes: a published bundle is a few
+# hundred MB; anything larger is not a wheelhouse.
+_WHEELHOUSE_MAX_EXTRACT_BYTES = 2 * 1024 ** 3
+
+
+def _runtime_python_tag() -> str:
+    return f"py{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _select_wheelhouse_entry(drive_download):
+    """Pick the wheelhouse entry for this runtime, or None.
+
+    Returns (entry, reason): entry is the first entry whose python_tag
+    matches this interpreter; reason explains a skip (None when an
+    entry was selected). An entry without a python_tag is treated as
+    unusable — the tag is the only guard against installing wheels
+    built for another interpreter."""
+    entries = (drive_download or {}).get("wheelhouses") or []
+    if not entries:
+        return None, "no wheelhouse entry"
+    tag = _runtime_python_tag()
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("python_tag") == tag:
+            return entry, None
+    return None, f"no wheelhouse entry for {tag}"
+
+
+def _safe_extract_tar(archive_path, dest_dir):
+    """Extract a .tar.gz into dest_dir, rejecting unsafe members.
+
+    Absolute paths, ``..`` components, symlinks, hardlinks, device
+    nodes and anything escaping dest_dir are refused. Total extracted
+    size is capped. Raises on the first bad member; nothing is left
+    half-extracted (the caller removes dest_dir on failure)."""
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with tarfile.open(archive_path, "r:gz") as tf:
+        members = tf.getmembers()
+        for m in members:
+            if m.issym() or m.islnk() or m.isdev():
+                raise ValueError(f"unsafe tar member (link/device): {m.name}")
+            name = m.name.replace("\\", "/")
+            if name.startswith("/") or name.startswith("~"):
+                raise ValueError(f"unsafe tar member (absolute path): {m.name}")
+            parts = [p for p in name.split("/") if p not in ("", ".")]
+            if ".." in parts:
+                raise ValueError(f"unsafe tar member (traversal): {m.name}")
+            target = (dest / "/".join(parts)).resolve()
+            if not str(target).startswith(str(dest.resolve()) + os.sep) and target != dest.resolve():
+                raise ValueError(f"unsafe tar member (escapes dest): {m.name}")
+            total += m.size
+            if total > _WHEELHOUSE_MAX_EXTRACT_BYTES:
+                raise ValueError("wheelhouse extraction exceeds size cap")
+        tf.extractall(dest)
+
+
+def _download_and_prepare_wheelhouse(entry, token_provider, abort_event=None):
+    """Download a wheelhouse archive from Drive, extract and verify it.
+
+    Returns the directory holding the wheels (the extracted
+    ``wheelhouse/`` subdir). Raises on any problem; the caller falls
+    back to PyPI. The archive's WHEELHOUSE_META.json must agree with
+    the entry on ``commit`` and ``python_tag``."""
+    if token_provider is None:
+        raise RuntimeError("wheelhouse download requested but no token provider supplied")
+    from h3_drive_download import DriveDownloader
+
+    archive = entry.get("archive") or "comfyui-wheelhouse.tar.gz"
+    dl_dir = ROOT / "drive_downloads"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = dl_dir / archive
+    downloader = DriveDownloader(token_provider)
+    downloader.download_file(
+        entry["file_id"], int(entry["size"]), entry["sha256"], archive_path,
+        on_progress=_abort_progress(None, abort_event),
+        on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
+    extract_dir = ROOT / "wheelhouse"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    try:
+        _safe_extract_tar(archive_path, extract_dir)
+    except Exception:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise
+    meta_path = extract_dir / WHEELHOUSE_DIR_IN_ARCHIVE / WHEELHOUSE_META_NAME
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError(f"wheelhouse META unreadable: {type(e).__name__}") from e
+    if not isinstance(meta, dict) or meta.get("commit") != entry.get("commit"):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError("wheelhouse META commit does not match the download entry")
+    if entry.get("python_tag") and meta.get("python_tag") != entry.get("python_tag"):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError("wheelhouse META python_tag does not match the download entry")
+    wheels_dir = extract_dir / WHEELHOUSE_DIR_IN_ARCHIVE
+    if not wheels_dir.is_dir():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        raise ValueError("wheelhouse archive has no wheel directory")
+    print("WHEELHOUSE_VERIFIED", entry.get("archive"), meta.get("python_tag"), flush=True)
+    return wheels_dir
+
+
+def _install_requirements(requirements, drive_download=None, token_provider=None, abort_event=None):
+    """Install requirements, preferring the offline wheelhouse (F3).
+
+    Plain PyPI install when there is no usable wheelhouse entry.
+    Offline install failure (download, extract, verify, or pip) falls
+    back to plain PyPI and emits WHEELHOUSE_FALLBACK_PYPI with the
+    reason; the plain install's own failure still raises."""
+    entry, reason = _select_wheelhouse_entry(drive_download)
+    if entry is None:
+        if (drive_download or {}).get("wheelhouses"):
+            print("WHEELHOUSE_FALLBACK_PYPI",
+                  json.dumps({"reason": reason, "archive": None}, ensure_ascii=False), flush=True)
+        run_cmd([sys.executable, "-m", "pip", "install", "-r", str(requirements)], timeout=1200)
+        return
+    try:
+        wheels_dir = _download_and_prepare_wheelhouse(entry, token_provider, abort_event=abort_event)
+        run_cmd([sys.executable, "-m", "pip", "install", "--no-index",
+                 "--find-links", str(wheels_dir), "-r", str(requirements)], timeout=1200)
+    except Exception as e:
+        print("WHEELHOUSE_FALLBACK_PYPI",
+              json.dumps({"reason": f"{type(e).__name__}: {str(e)[:300]}",
+                          "archive": entry.get("archive")}, ensure_ascii=False), flush=True)
+        run_cmd([sys.executable, "-m", "pip", "install", "-r", str(requirements)], timeout=1200)
+        return
+    print("WHEELHOUSE_INSTALL_OK", entry.get("archive"), flush=True)
+
+
+def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_provider=None,abort_event=None):
     """Install the pinned ComfyUI source, then its Python dependencies.
 
     Order: (1) already-installed pinned commit -> reuse; (2) Drive source
@@ -548,7 +803,11 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
     transport as the model restore) into a local directory first, and
     restore_comfyui_from_cache verifies it exactly as it verified the
     mounted-cache archive. A download failure is a cache failure and
-    falls through to git clone, as before."""
+    falls through to git clone, as before.
+
+    v0.2.0 F3: dependency install prefers the offline wheelhouse (see
+    _install_requirements) and the Drive download observes the shared
+    abort_event, so a failing sibling track stops this one promptly."""
     if not git_ref:
         raise RuntimeError('No pinned ComfyUI commit/ref in manifest; refuse moving main')
     if (comfy/'.git').exists() and verify_comfyui_commit(comfy, git_ref):
@@ -564,6 +823,7 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
                 downloader.download_file(
                     entry['file_id'], int(entry['size']), entry['sha256'],
                     dl_dir / entry['archive'],
+                    on_progress=_abort_progress(None, abort_event),
                     on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
                 restore_comfyui_from_cache(
                     dl_dir, comfy, entry['sha256'], entry['commit'],
@@ -581,6 +841,8 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
                 # Keep the original error on the record; fall through to git.
                 print('COMFYUI_CACHE_FAILED', type(e).__name__, str(e)[:500], flush=True)
         if not restored:
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError('setup aborted: sibling track failed before ComfyUI clone')
             clone_comfyui_atomic(comfy, git_ref)
     installed = comfyui_commit(comfy)
     if installed != git_ref:
@@ -588,12 +850,18 @@ def ensure_comfy(comfy:Path,git_ref:str,cache=None,drive_download=None,token_pro
     print('COMFY_REF', installed, flush=True)
     requirements = comfy / 'requirements.txt'
     if pip_install_needed(requirements):
-        run_cmd([sys.executable,'-m','pip','install','-r',str(requirements)],timeout=1200)
+        _install_requirements(requirements, drive_download=drive_download,
+                              token_provider=token_provider, abort_event=abort_event)
     else:
         print('PIP_INSTALL_SKIPPED', 'all requirements already satisfied', flush=True)
 
-def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu=None,drive_download=None,token_provider=None):
+def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu=None,drive_download=None,token_provider=None,abort_event=None):
     validate_model_cache_manifest(manifest)
+    # v0.2.0 F3: a sibling track that already failed aborts this one
+    # before any expensive check runs, so its failure is not masked by
+    # a capacity or download error raised here.
+    if abort_event is not None and abort_event.is_set():
+        raise RuntimeError('setup aborted: sibling track failed before weight restore')
     # TASK-006 P0-B: noninteractive download path. Each model file is
     # downloaded straight to its NVMe destination with Range resume and
     # a full SHA-256 verify inside the downloader; the existing
@@ -628,9 +896,11 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
             downloader.download_file(
                 entry['file_id'], int(item['size']), item['sha256'], dst,
                 expected_md5=item.get('server_md5'),
-                on_progress=lambda done, total_bytes, rel=relative: _download_progress(
-                    rel, done, total, copy_start, projected, rate_cu_h, budget_cu,
-                    next_milestone),
+                on_progress=_abort_progress(
+                    lambda done, total_bytes, rel=relative: _download_progress(
+                        rel, done, total, copy_start, projected, rate_cu_h, budget_cu,
+                        next_milestone),
+                    abort_event),
                 on_token_expiring=lambda tid, rem: _request_token_refresh(token_provider))
             print('CACHE_VERIFIED_NVME',relative,flush=True)
         return
@@ -639,6 +909,8 @@ def restore_weights(comfy:Path,cache:Path,manifest:dict,rate_cu_h=None,budget_cu
     check_restore_capacity(comfy,total,rate_cu_h=rate_cu_h,budget_cu=budget_cu)
     projected=False
     for item in manifest['files']:
+        if abort_event is not None and abort_event.is_set():
+            raise RuntimeError('setup aborted: sibling track failed during weight restore')
         relative=Path(item['path'])
         src=cache/relative
         require_inside(src,cache)
@@ -1158,10 +1430,30 @@ def main():
         # in ensure_comfy (git clone exit 128) BEFORE the old try block,
         # so no WORKER_FAILED_JSON was printed and the stage had to be
         # inferred from the persisted traceback instead.
-        set_stage('ensure_comfy')
-        ensure_comfy(comfy,task['comfy_ref'],task.get('comfyui_cache'),drive_download=drive_download,token_provider=token_provider)
+        # v0.2.0 F3: the two setup stages run concurrently on two
+        # threads against one shared token provider and abort event.
+        # A failure names its own stage: run_setup_parallel raises
+        # SetupTrackFailed, the stage is recorded, and the outer
+        # handler prints WORKER_FAILED_JSON with that stage plus the
+        # failing track's command record.
+        set_stage('setup_parallel')
+        setup_abort = threading.Event()
+        try:
+            run_setup_parallel([
+                ('ensure_comfy', lambda: ensure_comfy(
+                    comfy, task['comfy_ref'], task.get('comfyui_cache'),
+                    drive_download=drive_download, token_provider=token_provider,
+                    abort_event=setup_abort)),
+                ('restore_weights', lambda: restore_weights(
+                    comfy, cache, manifest, rate_cu_h=task.get('rate_cu_h'),
+                    budget_cu=task.get('session_budget_cu'),
+                    drive_download=drive_download, token_provider=token_provider,
+                    abort_event=setup_abort)),
+            ], abort_event=setup_abort)
+        except SetupTrackFailed as e:
+            set_stage(e.stage)
+            raise
         set_stage('restore_weights')
-        restore_weights(comfy,cache,manifest,rate_cu_h=task.get('rate_cu_h'),budget_cu=task.get('session_budget_cu'),drive_download=drive_download,token_provider=token_provider)
         (comfy/'input').mkdir(exist_ok=True)
         shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
         shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')

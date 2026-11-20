@@ -72,6 +72,42 @@ Tests: new `tests/test_comfyui_wheelhouse.py` (19 tests, offline).
 Full offline suite: 763 tests, 0 failures. Live GPU verification:
 NOT_VERIFIED (no GPU run under this change).
 
+### F3 — Dual-track parallel setup + wheelhouse-first install (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.2.0 F3 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). `h3_remote_worker.py`:
+
+- `ensure_comfy()` and `restore_weights()` now run concurrently via
+  `ThreadPoolExecutor(max_workers=2)` with a shared `abort_event`
+  (`run_setup_parallel`). The first failure sets the event; the
+  surviving track's in-flight Drive download aborts through its
+  progress callback (`_abort_progress` raises `_SetupAborted`) and
+  the failure is reported with the stage that actually failed
+  (`SetupTrackFailed`, carried into `WORKER_FAILED_JSON`).
+- Thread-safe token refresh: `_request_token_refresh` serializes its
+  once-per-token-id throttle with a lock, so two tracks expiring at
+  once ask the controller once.
+- Thread-local command failure tracking: the `run_cmd` failure record
+  is per-thread now (`_cmd_failure_get`); the failing track's record
+  travels with the failure to the main thread. Existing tests updated
+  to the new accessor (same behaviour: set on failure, cleared on
+  success).
+- Wheelhouse-first install: when `drive_download["wheelhouses"]`
+  carries an entry for this interpreter, the worker downloads the
+  bundle with the standard Drive transport, extracts it with
+  tar-member validation (absolute paths, `..`, symlinks/hardlinks,
+  device nodes, escape rejected), verifies `WHEELHOUSE_META.json`
+  against the entry (`commit` + `python_tag`), and installs with
+  `pip install --no-index --find-links`. Any offline-path failure
+  falls back to plain PyPI and emits structured
+  `WHEELHOUSE_FALLBACK_PYPI`; a failed plain install still raises.
+
+Tests: new `tests/test_remote_worker_v020.py` (25 tests, offline fake
+transport). Full offline suite: 818 tests, 0 failures. Live GPU
+verification: NOT_VERIFIED (no GPU run under this change).
+
+
 ### Muse Adapter (Stage 1)
 
 
