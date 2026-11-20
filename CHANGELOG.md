@@ -2,6 +2,55 @@
 
 ## Unreleased — v0.3.0 development (TASK-VERSION-ROADMAP-011)
 
+### M4 — controlled warm session pool, default OFF (2026-11-20)
+
+Muse-original reimplementation of the upstream v0.3.0 M4 behaviour
+spec (no upstream code copied — upstream has no license; see
+`docs/upstream/PORTING_LEDGER.md`). The pool is OFF by default:
+`--keep-warm-ttl` accepts 0 (disabled) or 60–900 s, validated in the
+controller, the wrapper, and the task dict. A healthy run may arm a
+warm lease instead of stopping: the arm expiry is the minimum of
+now + TTL, session start + 14400 s, and the session budget deadline;
+the lease records `comfy_ref`, the model-manifest SHA-256, the spent
+CU, and the rate, and the run manifest moves to session
+`WARM_POOLED` with `warm_lease_armed: true`. Any arm failure falls
+back to the normal stop — never a live session left unaccounted for.
+A later run reuses a pooled session only after all five gates pass:
+matching `comfy_ref` and manifest SHA-256, lifetime headroom
+(elapsed + 2400 s ≤ 14400 s), session budget
+(spent + new-task estimate + 0.75 CU reserve ≤ 25.0 CU), a live
+`query_session_state` == ACTIVE, and a fresh `MUSE_WARM_HEALTH_OK`
+from `h3_warm_health_probe.py` (`/object_info` must expose the four
+MiniMax-H3 node types). Reuse dispatches a lightweight Stage-2
+bundle (`_dispatch_warm_stage2`: worker, launcher, task, refs,
+workflow, fail-soft upload block — no Stage-1 probe, the models are
+already in the NVMe store); the worker skips setup when the resident
+ComfyUI is alive with the pinned commit and all models present, and
+scrubs ephemeral token files when a warm run ends. The manifest
+`TASK_COMPLETED` gate accepts `WARM_POOLED` + armed (never an
+unarmed pooled session); `record_warm_session_stopped` moves a
+pooled run to STOPPED idempotently. Cross-task reclamation lives in
+Muse's own `h3_shutdown_executor.py --stop-warm` (+
+`verify_shutdown.sh --stop-warm`): expired warm leases are overdue
+as `warm_ttl_expired`, `--stop-warm` stops them as `manual_stop_warm`
+regardless of task scope, and confirmed stops update the pooled
+manifests. The upstream macOS guardian scripts were NOT copied (no
+Mac runtime dependency under the North Star) and no guardian was
+installed. Reliability metric D now requires session STOPPED +
+`GPU_STOP_CONFIRMED`, and `compute_reliability` reports
+`warm_session_hits` + `warm_pooled_active_runs`.
+
+Tests: `tests/test_v030_m4_warm_infra.py` (21: registry normalize /
+mark / claim / find / confirm-clears-warm, manifest gate + idempotent
+stop recording, reliability warm counts + metric-D exclusion,
+executor warm audit + stop-warm-only, probe success / missing node /
+non-dict) and `tests/test_v030_m4_controller_worker.py` (22: TTL
+boundaries, all five claim gates, worker warm helpers, ChainHarness
+arm-pools / arm-failure-falls-back-to-stop / TTL-0-cold-stop /
+reuse-without-allocating / unhealthy-probe-refuses-reuse). Full
+offline suite: 1046 tests, 0 failures. Live GPU verification:
+NOT_VERIFIED — no warm session was ever created.
+
 ### M3 — host disconnect self-healing & Drive 0-GPU recovery (2026-11-20)
 
 Muse-original reimplementation of the upstream v0.3.0 M3 behaviour

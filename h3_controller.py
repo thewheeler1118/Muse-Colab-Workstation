@@ -261,6 +261,18 @@ def _download_drive_file(file_id: str, dest: Path, drive=None) -> Path:
     return dest
 
 
+def _file_sha256(path: Path) -> str:
+    """SHA-256 hex of a local file (v0.3.0 M4: warm-lease identity —
+    the cache manifest's digest must match the lease's)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fp:
+        for chunk in iter(lambda: fp.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """True for retryable network/TLS failures only (v0.3.0 M3).
 
@@ -3117,7 +3129,8 @@ def _run_bootstrap(args, session: str, run_dir: Path, budget_sec: int,
             "rate_cu_h": live_rate,
             "session_budget_cu": round(budget_sec * float(live_rate) / 3600.0, 3),
             "comfyui_cache": _comfyui_cache_task(),
-            "drive_source": drive_source}
+            "drive_source": drive_source,
+            "keep_warm_ttl_sec": _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))}
     if drive_source == "download":
         # The worker downloads from Drive with the delivered
         # short-lived token; drive_cache_dir is kept as the
@@ -3276,7 +3289,8 @@ def _run_bootstrap_bundled(args, session: str, run_dir: Path, budget_sec: int,
             "session_budget_cu": round(budget_sec * float(live_rate) / 3600.0, 3),
             "comfyui_cache": _comfyui_cache_task(),
             "drive_source": "download",
-            "drive_download": drive_download}
+            "drive_download": drive_download,
+            "keep_warm_ttl_sec": _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))}
     if drive_upload is not None:
         task["drive_upload"] = drive_upload
     task_path = RUNS / f"task_{session}.json"
@@ -3376,6 +3390,23 @@ MIN_ATTEMPT_WALL_SEC = 2400
 DEADLINE_MARGIN_SEC = 300
 SESSION_STOP_WAIT_ATTEMPTS = 3
 SESSION_STOP_WAIT_INTERVAL_SEC = 10
+
+# v0.3.0 M4: warm-pool TTL bounds (seconds). 0 disables the pool;
+# a live TTL is 60..900 s. The session's 14400 s lifetime cap and the
+# 25.0 CU per-session budget always bound the actual expiry.
+WARM_TTL_MIN_SEC = 60
+WARM_TTL_MAX_SEC = 900
+
+
+def _validate_keep_warm_ttl(value) -> int:
+    """Validate --keep-warm-ttl: 0 (pool disabled) or 60..900 seconds."""
+    try:
+        ttl = int(0 if value is None else value)
+    except (TypeError, ValueError):
+        raise ValueError(f"--keep-warm-ttl must be an integer (0 or {WARM_TTL_MIN_SEC}..{WARM_TTL_MAX_SEC}), got {value!r}") from None
+    if ttl == 0 or WARM_TTL_MIN_SEC <= ttl <= WARM_TTL_MAX_SEC:
+        return ttl
+    raise ValueError(f"--keep-warm-ttl must be 0 or {WARM_TTL_MIN_SEC}..{WARM_TTL_MAX_SEC}, got {ttl}")
 
 # Substrings that mark an error as deterministic — retrying it would
 # only burn CU: account/permission problems, reference/model SHA-256
@@ -3795,6 +3826,269 @@ def deliver_task(args) -> dict:
                                max_attempts, steps)
 
 
+def _try_claim_warm_session(
+    args,
+    spec: TaskSpec,
+    ledger: dict,
+    run_dir: Path,
+    pre: dict,
+    start: float,
+) -> dict | None:
+    """Look up and claim a healthy warm-pooled GPU session (v0.3.0 M4).
+
+    Enforces all 5 gates:
+    (a) comfy_ref and model_manifest_sha256 match
+    (b) query_session_state(sid) == ACTIVE
+    (c) elapsed_lifetime + MIN_ATTEMPT_WALL_SEC <= MAX_SESSION_SECONDS (14400s)
+    (d) session_budget_spent_cu + est_new_task_cu + CLEANUP_RESERVE_CU (0.75) <= PER_SESSION_BUDGET_CU (25.0)
+    (e) remote h3_warm_health_probe.py prints MUSE_WARM_HEALTH_OK
+
+    Any failure returns None (never raises): the caller falls back to
+    the cold allocation path, or fails closed when a session is still
+    active and unclaimed.
+    """
+    from h3_gpu_lease_registry import current_owner_id
+    from h3_session_watchdog import SessionState, query_session_state, update_session_deadline
+
+    registry = _lease_registry()
+    if not hasattr(registry, "find_warm_leases"):
+        return None
+    try:
+        # Fast path: pure local check before invoking `colab whoami`.
+        if not registry.find_warm_leases():
+            return None
+        owner = current_owner_id(_COLAB_AUTH)
+        candidates = registry.find_warm_leases(owner_id=owner)
+    except Exception:  # noqa: BLE001
+        return None
+    if not candidates:
+        return None
+
+    manifest_sha = _file_sha256(Path(args.cache_manifest)) if Path(args.cache_manifest).is_file() else None
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    for lease in candidates:
+        sid = lease.get("session_id")
+        if not sid:
+            continue
+        # Gate (a): comfy_ref & model_manifest_sha256 match
+        if lease.get("comfy_ref") != args.comfy_ref:
+            continue
+        if manifest_sha and lease.get("model_manifest_sha256") != manifest_sha:
+            continue
+        # Gate (c): elapsed_lifetime + MIN_ATTEMPT_WALL_SEC <= MAX_SESSION_SECONDS
+        created_raw = lease.get("created_at_utc") or lease.get("started_at_utc")
+        elapsed_sec = 0.0
+        if created_raw:
+            try:
+                created_dt = datetime.datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=datetime.timezone.utc)
+                elapsed_sec = max(0.0, (now - created_dt).total_seconds())
+            except ValueError:
+                continue
+        if elapsed_sec + MIN_ATTEMPT_WALL_SEC > MAX_SESSION_SECONDS:
+            continue
+        # Gate (d): session_budget_spent_cu + est_new_task_cu + CLEANUP_RESERVE_CU <= 25.0 CU
+        rate = float(lease.get("rate_cu_h") or pre.get("rate") or getattr(args, "max_rate_cu_h", 14.0))
+        if rate <= 0:
+            rate = float(getattr(args, "max_rate_cu_h", 14.0))
+        spent_cu = float(lease.get("session_budget_spent_cu") or 0.0)
+        est_new_task_cu = round(MIN_ATTEMPT_WALL_SEC / 3600.0 * rate, 4)
+        if spent_cu + est_new_task_cu + CLEANUP_RESERVE_CU > PER_SESSION_BUDGET_CU:
+            continue
+        # Gate (b): live session state == ACTIVE
+        try:
+            state = _call_with_transient_retry(
+                lambda s=sid: query_session_state(s, colab_auth=_COLAB_AUTH),
+                max_attempts=3,
+                delays=(2, 5),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if state != SessionState.ACTIVE:
+            continue
+        # Gate (e): remote :8188/object_info health probe
+        try:
+            probe = exec_script(sid, ROOT / "h3_warm_health_probe.py", timeout=60)
+        except Exception:  # noqa: BLE001
+            continue
+        if "MUSE_WARM_HEALTH_OK" not in (probe or {}).get("stdout", ""):
+            continue
+        # Compute remaining allowed wall time for this session
+        try:
+            budget_sec = allowed_runtime_seconds(
+                rate, pre["cu_balance"], ledger,
+                session_spent_cu=spent_cu, unbilled_cu=0.0,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        remaining_lifetime = max(0, int(MAX_SESSION_SECONDS - elapsed_sec))
+        budget_sec = min(budget_sec, remaining_lifetime, getattr(args, "max_wall_sec", MAX_SESSION_SECONDS))
+        if budget_sec < 300:
+            continue
+        new_deadline = (now + datetime.timedelta(seconds=budget_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        claimed = registry.claim_warm_lease(
+            sid,
+            args.run_id,
+            args.production_task_id,
+            new_deadline,
+        )
+        if claimed is None:
+            continue
+        try:
+            update_session_deadline(sid, new_deadline)
+        except Exception:  # noqa: BLE001
+            pass
+        record({
+            "event": "warm_session_claimed",
+            "session": sid,
+            "run_id": args.run_id,
+            "production_task_id": args.production_task_id,
+            "budget_sec": budget_sec,
+            "rate_cu_h": rate,
+            "session_budget_spent_cu": spent_cu,
+        })
+        return {
+            "session": sid,
+            "lease": claimed,
+            "budget_sec": budget_sec,
+            "rate_cu_h": rate,
+            "deadline_utc": new_deadline,
+            "session_spent_cu": spent_cu,
+            "gpu_model": claimed.get("gpu_model") or lease.get("gpu_model") or "G4",
+            "started_at_utc": created_raw or now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    return None
+
+
+def _dispatch_warm_stage2(
+    args,
+    session: str,
+    spec: TaskSpec,
+    run_dir: Path,
+    budget_sec: int,
+    live_rate: float,
+    start: float,
+) -> dict:
+    """Lightweight Stage-2 bundle dispatch for a reused warm session
+    (v0.3.0 M4). No Stage-1 probe: the models are already in the NVMe
+    store and the health probe (gate (e)) already proved the resident
+    ComfyUI is alive. The bundle carries the task, the worker, the
+    launcher, the refs and the submitted workflow — plus the Drive
+    upload block (fail-soft) when it can be built."""
+    import h3_drive_token
+
+    run_id = args.run_id
+    variant = spec.output_prefix
+    boot_t0 = time.monotonic()
+    ref1_path = getattr(args, "_ref_image_1_path", None)
+    ref2_path = getattr(args, "_ref_image_2_path", None)
+    if ref1_path is None or ref2_path is None:
+        refs = _materialize_ref_images(spec, run_dir)
+        ref1_path, ref2_path = refs["ref_image_1"], refs["ref_image_2"]
+        args._ref_image_1_path, args._ref_image_2_path = ref1_path, ref2_path
+
+    api = validate_comfy_workflow(args.workflow_api, spec)
+    submitted_path = run_dir / f"workflow_{variant}_submitted.json"
+    submitted_path.write_text(json.dumps(api, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    drive_upload = None
+    tok_upload_path = None
+    try:
+        drive_upload = _build_drive_upload_block(run_id, variant)
+        tok_upload_doc = h3_drive_token.mint_file_token()
+        tok_upload_path = run_dir / "drive_upload_token.json"
+        h3_drive_token.write_token_file(tok_upload_path, tok_upload_doc)
+    except Exception as e:  # noqa: BLE001 - fail-soft
+        drive_upload = None
+        tok_upload_path = None
+        record({"event": "drive_upload_block_failed", "session": session,
+                "run_id": run_id, "error_type": type(e).__name__,
+                "error": str(e)[:300]})
+
+    elapsed = time.monotonic() - start
+    keep_warm_ttl = _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))
+    task = {
+        "variant": variant,
+        "run_id": run_id,
+        "drive_cache_dir": "/content/nvme_models/h3",
+        "comfy_ref": args.comfy_ref,
+        "production_task_id": getattr(args, "production_task_id", PRODUCTION_TASK_ID),
+        "task_spec": spec.to_dict(),
+        "inference_timeout_sec": min(1800, max(100, int(budget_sec - elapsed - 120))),
+        "rate_cu_h": live_rate,
+        "session_budget_cu": round(budget_sec * float(live_rate) / 3600.0, 3),
+        "comfyui_cache": _comfyui_cache_task(),
+        "drive_source": "download",
+        "drive_download": None,
+        "warm_session_reused": True,
+        "keep_warm_ttl_sec": keep_warm_ttl,
+    }
+    if drive_upload is not None:
+        task["drive_upload"] = drive_upload
+    task_path = RUNS / f"task_{session}.json"
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+
+    stage2_tar = run_dir / "bootstrap_stage2.tar.gz"
+    try:
+        entries: list[tuple[Path, str, int | None]] = [
+            (ROOT / "h3_job_state.py", "h3_job_state.py", None),
+            (ROOT / "h3_remote_worker.py", "h3_remote_worker.py", None),
+            (ROOT / "h3_worker_launcher.py", "h3_worker_launcher.py", None),
+            (task_path, "task.json", None),
+            (Path(ref1_path), "poster.jpg", None),
+            (Path(ref1_path), "ref_image_1.jpg", None),
+            (Path(ref2_path), "ref_image_2.jpg", None),
+            (submitted_path, "workflow_submitted.json", None),
+        ]
+        if drive_upload is not None and tok_upload_path is not None:
+            entries.append((ROOT / "h3_drive_upload.py", "h3_drive_upload.py", None))
+            entries.append((tok_upload_path, "drive_upload_token.json", 0o600))
+        build_bootstrap_tar(stage2_tar, entries)
+        run_cli(["upload", "-s", session, str(stage2_tar), REMOTE + "/bootstrap_stage2.tar.gz"], timeout=300)
+    finally:
+        if stage2_tar.exists():
+            try:
+                stage2_tar.unlink()
+            except OSError:
+                pass
+        if tok_upload_path is not None and tok_upload_path.exists():
+            try:
+                tok_upload_path.unlink()
+            except OSError:
+                pass
+
+    boot_wall = round(time.monotonic() - boot_t0, 3)
+    _manifest_update(
+        run_id,
+        task_state="WORKER_STARTED",
+        heartbeat=True,
+        artifacts={"warm_session_reused": True},
+        bootstrap={
+            "mode": "warm_reuse",
+            "bootstrap_wall_sec": boot_wall,
+            "cli_round_trips": 2,
+        },
+    )
+    record({
+        "event": "warm_session_reused",
+        "session": session,
+        "run_id": run_id,
+        "bootstrap_wall_sec": boot_wall,
+    })
+    return {
+        "drive_download": None,
+        "drive_upload": drive_upload,
+        "task": task,
+        "renewal_state": {"count": 0, "last_token_id": None},
+        "bundled": True,
+        "cli_round_trips": 2,
+        "bootstrap_wall_sec": boot_wall,
+    }
+
+
 def _run_variant_inner(args) -> dict:
     global _EXEC_LOG_DIR, LEDGER_PATH, PRODUCTION_TASK_ID
     # TASK-007: one run is one TaskSpec. --task-spec loads it; --variant
@@ -3892,46 +4186,84 @@ def _run_variant_inner(args) -> dict:
     pre = inspect()
     if pre["cu_balance"] is None:
         raise RuntimeError("Cannot parse CU balance; abort")
-    ensure_no_foreign_sessions(pre)
-    # Watchdog reconciliation: any managed session still active blocks a
-    # new allocation. An unconfirmable leftover is a hard stop, never a
-    # reason to run a second GPU in parallel — and never a reason to stop
-    # a session that is not one of ours.
-    from h3_session_watchdog import reconcile_on_startup
+    # v0.3.0 M4: warm-pool reuse is allowed ONLY when every active
+    # session in pre["sessions"] is our own valid warm-idle lease. Any
+    # foreign or non-warm-owned active session fails closed immediately.
+    run_dir = RUNS / args.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    start = time.monotonic()
+    warm_claim = None
+    pre_sessions = pre.get("sessions") or []
+    if pre_sessions:
+        owned_warm_ids: set[str] = set()
+        if drive_source == "download":
+            try:
+                from h3_gpu_lease_registry import current_owner_id
 
-    rec = reconcile_on_startup(_COLAB_AUTH)
-    if rec.get("managed_active_sessions"):
-        detail = rec.get("managed_active_detail") or [
-            {"session_id": s} for s in rec["managed_active_sessions"]]
-        lines = []
-        for d in detail:
-            est = d.get("unbilled_estimate_cu")
-            # TASK-006 P1-B: name an allocating record explicitly — its
-            # controller died mid-allocation, so the operator stops it
-            # or resumes its run; it is never silently adopted.
-            allocating = " [ALLOCATING — controller died mid-allocation]" \
-                if d.get("allocating") else ""
-            lines.append(
-                f"{d.get('session_id')} (run {d.get('run_id')}, task {d.get('production_task_id')}, "
-                f"deadline {d.get('deadline_utc')}, unbilled estimate "
-                f"{est if est is not None else 'unconfirmable'} CU){allocating}")
-        raise RuntimeError(
-            "CRITICAL_ORPHAN_GPU_SESSION: managed GPU session(s) still active; refusing to allocate "
-            "another GPU in parallel. Stop them first (never stop non-project sessions): "
-            + "; ".join(lines))
+                reg = _lease_registry()
+                if hasattr(reg, "find_warm_leases") and reg.find_warm_leases():
+                    owner = current_owner_id(_COLAB_AUTH)
+                    owned_warm_ids = {
+                        l["session_id"]
+                        for l in reg.find_warm_leases(owner_id=owner)
+                        if l.get("session_id")
+                    }
+            except Exception:  # noqa: BLE001 - fail closed on any registry/owner error
+                owned_warm_ids = set()
+
+        def _pre_sess_name(s) -> str:
+            return s.get("name", "") if isinstance(s, dict) else str(s)
+
+        if any(_pre_sess_name(s) not in owned_warm_ids for s in pre_sessions):
+            ensure_no_foreign_sessions(pre)
+        if drive_source == "download":
+            warm_claim = _try_claim_warm_session(args, spec, ledger, run_dir, pre, start)
+        if warm_claim is None:
+            # Warm claim declined (budget >= 25 CU, manifest mismatch, or
+            # unhealthy :8188): never allocate a 2nd GPU while an active
+            # session is still running.
+            ensure_no_foreign_sessions(pre)
+    else:
+        ensure_no_foreign_sessions(pre)
+
+    if warm_claim is None:
+        # Watchdog reconciliation: any managed session still active blocks a
+        # new allocation. An unconfirmable leftover is a hard stop, never a
+        # reason to run a second GPU in parallel — and never a reason to stop
+        # a session that is not one of ours.
+        from h3_session_watchdog import reconcile_on_startup
+
+        rec = reconcile_on_startup(_COLAB_AUTH)
+        if rec.get("managed_active_sessions"):
+            detail = rec.get("managed_active_detail") or [
+                {"session_id": s} for s in rec["managed_active_sessions"]]
+            lines = []
+            for d in detail:
+                est = d.get("unbilled_estimate_cu")
+                # TASK-006 P1-B: name an allocating record explicitly — its
+                # controller died mid-allocation, so the operator stops it
+                # or resumes its run; it is never silently adopted.
+                allocating = " [ALLOCATING — controller died mid-allocation]" \
+                    if d.get("allocating") else ""
+                lines.append(
+                    f"{d.get('session_id')} (run {d.get('run_id')}, task {d.get('production_task_id')}, "
+                    f"deadline {d.get('deadline_utc')}, unbilled estimate "
+                    f"{est if est is not None else 'unconfirmable'} CU){allocating}")
+            raise RuntimeError(
+                "CRITICAL_ORPHAN_GPU_SESSION: managed GPU session(s) still active; refusing to allocate "
+                "another GPU in parallel. Stop them first (never stop non-project sessions): "
+                + "; ".join(lines))
     if drive_source == "mount":
         probe = run_cli(['drivemount', '--help'], timeout=20, check=False)
         if probe["returncode"] != 0:
             raise RuntimeError("Official Colab drivemount unavailable")
         if not sys.stdin.isatty():
             raise RuntimeError("Official drivemount requires interactive terminal; no TTY, abort BEFORE GPU allocation")
-    else:
+    elif warm_claim is None:
         # Noninteractive path: prove the download chain (mint + metadata
         # read with the minted token) BEFORE any paid GPU exists.
         verify_drive_download_preflight(args)
 
-    run_dir = RUNS / args.run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
     # From here on, every remote exec result is persisted to this run dir.
     _EXEC_LOG_DIR = run_dir
     out_dir = OUTPUT_ROOT / args.run_id
@@ -3952,15 +4284,35 @@ def _run_variant_inner(args) -> dict:
     gpu_info = None
     chosen_key = None
     attempts = []
-    start = time.monotonic()
+    warm_pooled = False
+    warm_expires_at_utc = None
+    session_started_at_utc = None
+    session_budget_deadline_utc = None
+    live_rate_observed = None
+    session_spent_prior_cu = 0.0
     session_spent_start = float(ledger.get("max_observed_spent_cu", 0.0))
     try:
+        if warm_claim is not None:
+            session = warm_claim["session"]
+            chosen_key = warm_claim["gpu_model"]
+            created = True
+            allocation_attempted = True
+            session_started_at_utc = warm_claim["started_at_utc"]
+            session_budget_deadline_utc = warm_claim["deadline_utc"]
+            live_rate_observed = warm_claim["rate_cu_h"]
+            session_spent_prior_cu = float(warm_claim.get("session_spent_cu") or 0.0)
+            budget_sec = int(warm_claim["budget_sec"])
+            gpu_info = {"gpu": chosen_key, "warm_reused": True}
+            _manifest_update(args.run_id, task_state="GPU_ALLOCATED",
+                             session_id=session, session_state="ACTIVE")
         # Allocation loop (v0.3.0 M1): outer elastic backoff rounds
         # wrapping the inner GPU_ATTEMPT_PLAN = (G4, G4 retry,
         # A100_HIGH_MEM). Capacity failures exhaust the inner plan, then
         # back off (15s / 45s / 90s ±20%) before the next round; fatal,
         # quota and unknown errors fail fast with no retry. Transport
         # errors retry the same G4 once and never trigger A100 fallback.
+        # (Skipped entirely when a warm session was claimed: the loop
+        # below runs zero rounds, and the guard after it is warm-aware.)
         # Empty POSTs carry data=b'{}' via the vendored CLI patch (see
         # cli_post_body_patch_present / V3_CLI_PROXY_PATCH.md); without it
         # the egress proxy strips Content-Length: 0 and Google returns 411.
@@ -3972,7 +4324,7 @@ def _run_variant_inner(args) -> dict:
         # a record reconcile can resolve, not an invisible billing GPU.
         # The post-probe update replaces this deadline with the
         # budget-derived value at the actual live rate.
-        allocation_rounds = resolve_allocation_rounds(args)
+        allocation_rounds = 0 if warm_claim is not None else resolve_allocation_rounds(args)
         # Sleep injection for offline tests: args may carry sleep_fn /
         # jitter_fn (the fault-injection harness passes them); production
         # uses the module-level sleep_fn (time.sleep) and random jitter.
@@ -4111,7 +4463,7 @@ def _run_variant_inner(args) -> dict:
                     f"GPU allocation failed ({chosen_key}): {round_last_capacity_err[1][:500]}; "
                     f"exhausted {allocation_rounds} round(s)"
                 )
-        if not created or session is None:
+        if warm_claim is None and (not created or session is None):
             raise RuntimeError("GPU allocation did not complete")
         # TASK-006 P1-B: confirm the pre-registered record. The CLI
         # returned, so the session is live and billable from here; the
@@ -4125,6 +4477,12 @@ def _run_variant_inner(args) -> dict:
             raise RuntimeError(
                 f"pre-registered session record for {session} vanished; "
                 "refusing to proceed with an unregistered GPU")
+        if warm_claim is None:
+            # Cold path: the session's true start comes from the
+            # pre-registered record. (Warm path: the claim already
+            # carries the original start, which the arm tail needs
+            # for the 14400 s lifetime cap.)
+            session_started_at_utc = session_rec.get("started_at_utc")
         # Watchdog record + background watcher. The pre-registration
         # deadline (most conservative, from the highest max rate) stands
         # until the GPU probe below, when it is replaced with the
@@ -4159,44 +4517,53 @@ def _run_variant_inner(args) -> dict:
                 raise
             raise RuntimeError(f"WATCHDOG_NOT_RUNNING: watchdog failed to start: {e}") from e
         try:
-            # GPU hardware probe before any expensive work.
-            gpu_info = probe_actual_gpu(session, chosen_key)
-            record({"event": "gpu_probed", "session": session, **gpu_info})
-            live = _inspect_live(args.run_id)
-            if live["rate"] is None or live["rate"] <= 0 or live["rate"] > args.max_rate_cu_h:
-                raise RuntimeError("Unknown/excessive live CU/hr rate")
-            # Reconcile ledger with the live balance after allocation.
-            ledger = reconcile_budget(ledger, live["cu_balance"], LEDGER_PATH)
-            # Unbilled-session estimate: the posted balance lags the real
-            # burn, so gate on the effective balance too (item 7). At this
-            # point only ~1-2 min have elapsed, so the estimate is small;
-            # the watchdog applies the same estimate on every poll.
-            unbilled = estimate_unbilled_cu(session_rec.get("started_at_utc"), live["rate"])
-            record({"event": "unbilled_estimate", "session": session, "unbilled_cu": unbilled,
-                    "rate_cu_h": live["rate"], "posted_balance_cu": live["cu_balance"]})
-            budget_sec = allowed_runtime_seconds(live["rate"], live["cu_balance"], ledger,
-                                                 session_spent_cu=unbilled, unbilled_cu=unbilled)
-            budget_sec = min(budget_sec, args.max_wall_sec)
-            if budget_sec < 300:
-                raise RuntimeError("Budget cannot cover minimal task + cleanup reserve")
-            # Replace the conservative initial watchdog deadline with the
-            # budget-derived wall time at the actual live rate.
-            from h3_session_watchdog import update_session_deadline
+            if warm_claim is None:
+                # GPU hardware probe before any expensive work.
+                gpu_info = probe_actual_gpu(session, chosen_key)
+                record({"event": "gpu_probed", "session": session, **gpu_info})
+                live = _inspect_live(args.run_id)
+                if live["rate"] is None or live["rate"] <= 0 or live["rate"] > args.max_rate_cu_h:
+                    raise RuntimeError("Unknown/excessive live CU/hr rate")
+                live_rate_observed = live["rate"]
+                # Reconcile ledger with the live balance after allocation.
+                ledger = reconcile_budget(ledger, live["cu_balance"], LEDGER_PATH)
+                # Unbilled-session estimate: the posted balance lags the real
+                # burn, so gate on the effective balance too (item 7). At this
+                # point only ~1-2 min have elapsed, so the estimate is small;
+                # the watchdog applies the same estimate on every poll.
+                unbilled = estimate_unbilled_cu(session_rec.get("started_at_utc"), live["rate"])
+                record({"event": "unbilled_estimate", "session": session, "unbilled_cu": unbilled,
+                        "rate_cu_h": live["rate"], "posted_balance_cu": live["cu_balance"]})
+                budget_sec = allowed_runtime_seconds(live["rate"], live["cu_balance"], ledger,
+                                                     session_spent_cu=unbilled, unbilled_cu=unbilled)
+                budget_sec = min(budget_sec, args.max_wall_sec)
+                if budget_sec < 300:
+                    raise RuntimeError("Budget cannot cover minimal task + cleanup reserve")
+                # Replace the conservative initial watchdog deadline with the
+                # budget-derived wall time at the actual live rate.
+                from h3_session_watchdog import update_session_deadline
 
-            new_deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=budget_sec)
-            update_session_deadline(session, new_deadline.isoformat())
-            # TASK-006 P0-C: finalise the lease deadline for the backup
-            # executor (fail-closed since TASK-007: a local write failure
-            # raises into the outer finally, which stops the session;
-            # only a Drive mirror failure degrades to a warning).
-            _update_gpu_lease_deadline(session, new_deadline.isoformat())
-            record({"event": "watchdog_deadline_updated", "session": session,
-                    "budget_sec": budget_sec, "rate_cu_h": live["rate"],
-                    "deadline_utc": new_deadline.isoformat()})
-            # TASK-006 P1-B: the bootstrap sequence lives in
-            # _run_bootstrap (durable per-step state, resumable).
-            boot = _run_bootstrap(args, session, run_dir, budget_sec,
-                                live["rate"], start)
+                new_deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=budget_sec)
+                session_budget_deadline_utc = new_deadline.isoformat()
+                update_session_deadline(session, session_budget_deadline_utc)
+                # TASK-006 P0-C: finalise the lease deadline for the backup
+                # executor (fail-closed since TASK-007: a local write failure
+                # raises into the outer finally, which stops the session;
+                # only a Drive mirror failure degrades to a warning).
+                _update_gpu_lease_deadline(session, session_budget_deadline_utc)
+                record({"event": "watchdog_deadline_updated", "session": session,
+                        "budget_sec": budget_sec, "rate_cu_h": live["rate"],
+                        "deadline_utc": session_budget_deadline_utc})
+                # TASK-006 P1-B: the bootstrap sequence lives in
+                # _run_bootstrap (durable per-step state, resumable).
+                boot = _run_bootstrap(args, session, run_dir, budget_sec,
+                                    live["rate"], start)
+            else:
+                # Warm reuse: no probe, no bootstrap — the health probe
+                # already proved the resident ComfyUI, and the models are
+                # in the NVMe store. Dispatch the light Stage-2 bundle.
+                boot = _dispatch_warm_stage2(args, session, spec, run_dir, budget_sec,
+                                             live_rate_observed, start)
             renewal_state = boot["renewal_state"]
             # Recoverable control plane (TASK-005 §4.2): short-start the
             # detached worker, then poll its durable state file. The old
@@ -4296,46 +4663,116 @@ def _run_variant_inner(args) -> dict:
         # own errors internally).
         _exc = sys.exc_info()
         if allocation_attempted and session is not None:
-            stop_result = stop_and_verify_session(session)
-            stop_ok = stop_result["stopped_confirmed"]
-            if watchdog_proc is not None:
-                if stop_ok:
-                    try:
-                        watchdog_proc.terminate()
-                    except Exception:
-                        pass
+            # v0.3.0 M4: on healthy completion with --keep-warm-ttl > 0, arm
+            # a bounded warm lease instead of stopping immediately. Fail-closed:
+            # ANY error falls back to stop_and_verify_session(session).
+            keep_warm_ttl = _validate_keep_warm_ttl(getattr(args, "keep_warm_ttl", 0))
+            if _exc[0] is None and production_result is not None and keep_warm_ttl > 0:
+                try:
+                    from h3_session_watchdog import update_session_deadline
+
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                    candidates_dt = [now_dt + datetime.timedelta(seconds=keep_warm_ttl)]
+                    if session_started_at_utc:
+                        st_dt = datetime.datetime.fromisoformat(str(session_started_at_utc).replace("Z", "+00:00"))
+                        if st_dt.tzinfo is None:
+                            st_dt = st_dt.replace(tzinfo=datetime.timezone.utc)
+                        candidates_dt.append(st_dt + datetime.timedelta(seconds=MAX_SESSION_SECONDS))
+                    if session_budget_deadline_utc:
+                        bd_dt = datetime.datetime.fromisoformat(str(session_budget_deadline_utc).replace("Z", "+00:00"))
+                        if bd_dt.tzinfo is None:
+                            bd_dt = bd_dt.replace(tzinfo=datetime.timezone.utc)
+                        candidates_dt.append(bd_dt)
+                    exp_dt = min(candidates_dt)
+                    if exp_dt <= now_dt:
+                        raise RuntimeError("Warm TTL deadline already exhausted by session lifetime/budget")
+                    warm_expires_at_utc = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    update_session_deadline(session, warm_expires_at_utc)
+                    elapsed_run_cu = estimate_unbilled_cu(session_started_at_utc, live_rate_observed, now=now_dt)
+                    total_session_spent_cu = round(max(session_spent_prior_cu, elapsed_run_cu), 4)
+                    manifest_sha = _file_sha256(Path(args.cache_manifest)) if Path(args.cache_manifest).is_file() else None
+                    registry = _lease_registry()
+                    marked = registry.mark_warm_idle(
+                        session,
+                        warm_ttl_sec=keep_warm_ttl,
+                        warm_expires_at_utc=warm_expires_at_utc,
+                        session_budget_spent_cu=total_session_spent_cu,
+                        run_id=args.run_id,
+                        comfy_ref=args.comfy_ref,
+                        model_manifest_sha256=manifest_sha,
+                        rate_cu_h=live_rate_observed,
+                    )
+                    if marked is None:
+                        raise RuntimeError(f"LeaseRegistry.mark_warm_idle returned None for {session}")
+                    warm_pooled = True
+                    stop_ok = True
+                    record({
+                        "event": "warm_session_pooled",
+                        "session": session,
+                        "run_id": args.run_id,
+                        "production_task_id": args.production_task_id,
+                        "warm_ttl_sec": keep_warm_ttl,
+                        "warm_expires_at_utc": warm_expires_at_utc,
+                        "session_budget_spent_cu": total_session_spent_cu,
+                    })
+                    _manifest_update(
+                        args.run_id,
+                        session_state="WARM_POOLED",
+                        artifacts={
+                            "warm_lease_armed": True,
+                            "warm_expires_at_utc": warm_expires_at_utc,
+                        },
+                    )
+                except Exception as warm_exc:  # noqa: BLE001 - fail-closed to immediate stop
+                    warm_pooled = False
+                    record({
+                        "event": "warm_pool_arm_failed_stopping",
+                        "session": session,
+                        "run_id": args.run_id,
+                        "error": str(warm_exc)[:300],
+                    })
+
+            if not warm_pooled:
+                stop_result = stop_and_verify_session(session)
+                stop_ok = stop_result["stopped_confirmed"]
+                if watchdog_proc is not None:
+                    if stop_ok:
+                        try:
+                            watchdog_proc.terminate()
+                        except Exception:
+                            pass
+                    else:
+                        # Leave the watchdog alive: it still enforces the
+                        # deadline/hard-stop for a session whose stop could
+                        # not be confirmed. The managed record stays `active`
+                        # (stop_and_verify_session marks it only on a
+                        # confirmed STOPPED), so reconcile/resume keep seeing
+                        # this session as a live, billable GPU.
+                        record({"event": "watchdog_left_running",
+                                "session": session, "run_id": args.run_id,
+                                "production_task_id": args.production_task_id,
+                                "stop_state": stop_result.get("state"),
+                                "reason": "stop not confirmed; watchdog keeps deadline protection"})
+                record({"event": "finished", "session": session, "variant": variant, "stop_verified": stop_ok,
+                        "run_id": args.run_id, "production_task_id": args.production_task_id,
+                        "stop_state": stop_result.get("state"),
+                        "record_marked": stop_result.get("record_marked", False),
+                        "allocation_attempted": allocation_attempted, "elapsed_sec": round(time.monotonic() - start, 1)})
+                # Durable manifest terminal update for the GPU phase (TASK-005
+                # §4.1): on the success path this records GPU_STOP_CONFIRMED;
+                # on any failure path it records FAILED with the real error.
+                # The Drive tail below runs only after this finally.
+                if _exc[0] is not None:
+                    _manifest_update(args.run_id, task_state="FAILED",
+                                     session_state="STOPPED" if stop_ok else "UNKNOWN",
+                                     last_error=f"{_exc[0].__name__}: {_exc[1]}"[:500])
+                elif stop_ok:
+                    _manifest_update(args.run_id, task_state="GPU_STOP_CONFIRMED",
+                                     session_state="STOPPED")
                 else:
-                    # Leave the watchdog alive: it still enforces the
-                    # deadline/hard-stop for a session whose stop could
-                    # not be confirmed. The managed record stays `active`
-                    # (stop_and_verify_session marks it only on a
-                    # confirmed STOPPED), so reconcile/resume keep seeing
-                    # this session as a live, billable GPU.
-                    record({"event": "watchdog_left_running",
-                            "session": session, "run_id": args.run_id,
-                            "production_task_id": args.production_task_id,
-                            "stop_state": stop_result.get("state"),
-                            "reason": "stop not confirmed; watchdog keeps deadline protection"})
-            record({"event": "finished", "session": session, "variant": variant, "stop_verified": stop_ok,
-                    "run_id": args.run_id, "production_task_id": args.production_task_id,
-                    "stop_state": stop_result.get("state"),
-                    "record_marked": stop_result.get("record_marked", False),
-                    "allocation_attempted": allocation_attempted, "elapsed_sec": round(time.monotonic() - start, 1)})
-            # Durable manifest terminal update for the GPU phase (TASK-005
-            # §4.1): on the success path this records GPU_STOP_CONFIRMED;
-            # on any failure path it records FAILED with the real error.
-            # The Drive tail below runs only after this finally.
-            if _exc[0] is not None:
-                _manifest_update(args.run_id, task_state="FAILED",
-                                 session_state="STOPPED" if stop_ok else "UNKNOWN",
-                                 last_error=f"{_exc[0].__name__}: {_exc[1]}"[:500])
-            elif stop_ok:
-                _manifest_update(args.run_id, task_state="GPU_STOP_CONFIRMED",
-                                 session_state="STOPPED")
-            else:
-                _manifest_update(args.run_id, task_state="FAILED",
-                                 session_state="UNKNOWN",
-                                 last_error="Stop not verified; run FAILED regardless of generated files")
+                    _manifest_update(args.run_id, task_state="FAILED",
+                                     session_state="UNKNOWN",
+                                     last_error="Stop not verified; run FAILED regardless of generated files")
     if allocation_attempted and not created:
         raise RuntimeError("GPU allocation did not complete; repeated session checks found no allocation, but delayed assignment remains possible. Recheck sessions later.")
     if not stop_ok:
@@ -4532,6 +4969,9 @@ def main():
                              "legacy uploads one file at a time. Bundled applies "
                              "to the download source only; the mount source "
                              "always uses legacy.")
+    parser.add_argument("--keep-warm-ttl", type=int, default=0,
+                        help="v0.3.0 M4: keep GPU session warm after healthy completion for N seconds "
+                             "(0 disables; valid 0 or 60..900).")
     parser.add_argument("--max-rate-cu-h", type=float, default=14.0)
     parser.add_argument("--max-wall-sec", type=int, default=MAX_SESSION_SECONDS)
     parser.add_argument("--poll-interval-sec", type=int, default=60,
@@ -4548,6 +4988,10 @@ def main():
         parser.add_argument("--" + flag, action="store_true")
     a = parser.parse_args()
     _COLAB_AUTH = a.colab_auth
+    try:
+        a.keep_warm_ttl = _validate_keep_warm_ttl(a.keep_warm_ttl)
+    except ValueError as e:
+        parser.error(str(e))
     try:
         a.allocation_rounds = resolve_allocation_rounds(a)
     except ValueError as e:

@@ -77,6 +77,45 @@ def _utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _parse_utc(value):
+    """Parse an ISO-8601 timestamp to an aware UTC datetime (v0.3.0 M4).
+    Returns None for missing/unparseable values; naive values are read
+    as UTC."""
+    import datetime
+
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=datetime.timezone.utc)
+        return value
+    try:
+        dt = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _normalize_lease(lease: dict) -> dict:
+    """Apply backward-compatible v0.3.0 warm-pool defaults to a lease
+    dict (v0.3.0 M4). Leases written before M4 lack the warm fields;
+    they read as not warm, with zero prior spend."""
+    if not isinstance(lease, dict):
+        return lease
+    lease.setdefault("warm_idle", False)
+    lease.setdefault("warm_expires_at_utc", None)
+    lease.setdefault("warm_ttl_sec", 0)
+    lease.setdefault("session_budget_spent_cu", 0.0)
+    if not isinstance(lease.get("warm_run_ids"), list):
+        lease["warm_run_ids"] = []
+    lease.setdefault("comfy_ref", None)
+    lease.setdefault("model_manifest_sha256", None)
+    lease.setdefault("rate_cu_h", None)
+    return lease
+
+
 def owner_id_for(email: str) -> str:
     """First 16 hex chars of SHA-256 of the casefolded email.
 
@@ -159,6 +198,8 @@ class LeaseRegistry:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not isinstance(data.get("leases"), list):
             raise RuntimeError(f"lease registry corrupt: {self.path}")
+        for lease in data["leases"]:
+            _normalize_lease(lease)
         return data
 
     def _save_local(self, doc: dict) -> None:
@@ -264,7 +305,10 @@ class LeaseRegistry:
                        production_task_id: str, gpu_model: str,
                        stop_deadline_utc: str, budget_cap_cu: float,
                        owner_id: str, started_at_utc: str | None = None,
-                       max_wall_sec=None) -> dict:
+                       max_wall_sec=None, *,
+                       comfy_ref: str | None = None,
+                       model_manifest_sha256: str | None = None,
+                       rate_cu_h: float | None = None) -> dict:
         """Create (or re-create) a lease. The local write is REQUIRED
         and raises on failure; the mirror write is best-effort. The
         initial deadline is NOT final: the executor never stops a lease
@@ -300,6 +344,14 @@ class LeaseRegistry:
                 "stop_attempts": 0,
                 "last_stop_error": None,
                 "next_retry_at_utc": None,
+                "warm_idle": False,
+                "warm_expires_at_utc": None,
+                "warm_ttl_sec": 0,
+                "session_budget_spent_cu": 0.0,
+                "warm_run_ids": [],
+                "comfy_ref": comfy_ref,
+                "model_manifest_sha256": model_manifest_sha256,
+                "rate_cu_h": float(rate_cu_h) if rate_cu_h is not None else None,
             }
             leases.append(lease)
             return lease
@@ -354,7 +406,12 @@ class LeaseRegistry:
                 lease["last_confirmed_state"] = "STOPPED"
                 lease["stopped_at_utc"] = _utc_now()
                 lease["executor_claim"] = None
+                lease["warm_idle"] = False
+                lease["warm_expires_at_utc"] = None
                 lease["version"] = int(lease.get("version") or 0) + 1
+            else:
+                lease["warm_idle"] = False
+                lease["warm_expires_at_utc"] = None
             lease["last_audit_at_utc"] = _utc_now()
             return lease
 
@@ -362,6 +419,118 @@ class LeaseRegistry:
         if lease is not None:
             self._mirror_write_best_effort(doc)
         return lease is not None
+
+    def mark_warm_idle(self, session_id: str, *,
+                       warm_ttl_sec: int,
+                       warm_expires_at_utc: str,
+                       session_budget_spent_cu: float,
+                       run_id: str | None = None,
+                       comfy_ref: str | None = None,
+                       model_manifest_sha256: str | None = None,
+                       rate_cu_h: float | None = None) -> dict | None:
+        """Mark an ACTIVE lease as warm-idle with a final TTL deadline
+        (v0.3.0 M4). Local write is required (raises on failure); Drive
+        mirror sync is best-effort. Returns the updated lease, or None
+        if absent or not ACTIVE."""
+        def _mark_warm(doc, leases):
+            lease = next((x for x in leases
+                          if x.get("session_id") == session_id), None)
+            if lease is None or lease.get("last_confirmed_state") != "ACTIVE":
+                return None
+            lease["warm_idle"] = True
+            lease["stop_deadline_utc"] = warm_expires_at_utc
+            lease["deadline_final"] = True
+            lease["warm_expires_at_utc"] = warm_expires_at_utc
+            lease["warm_ttl_sec"] = int(warm_ttl_sec)
+            lease["session_budget_spent_cu"] = float(session_budget_spent_cu)
+            warm_runs = list(lease.get("warm_run_ids") or [])
+            rid = run_id or lease.get("run_id")
+            if rid and rid not in warm_runs:
+                warm_runs.append(rid)
+            lease["warm_run_ids"] = warm_runs
+            if comfy_ref is not None:
+                lease["comfy_ref"] = comfy_ref
+            if model_manifest_sha256 is not None:
+                lease["model_manifest_sha256"] = model_manifest_sha256
+            if rate_cu_h is not None:
+                lease["rate_cu_h"] = float(rate_cu_h)
+            lease["last_audit_at_utc"] = _utc_now()
+            lease["version"] = int(lease.get("version") or 0) + 1
+            return lease
+
+        doc, lease = self._mutate(_mark_warm)
+        if lease is not None:
+            self._mirror_write_best_effort(doc)
+        return lease
+
+    def claim_warm_lease(self, session_id: str, new_run_id: str,
+                         new_production_task_id: str,
+                         new_stop_deadline_utc: str) -> dict | None:
+        """Claim an ACTIVE warm-idle lease for a new run (v0.3.0 M4).
+        Transitions warm_idle -> False, clears warm_expires_at_utc,
+        updates run_id / production_task_id / stop_deadline_utc (with
+        deadline_final=True), and appends new_run_id to warm_run_ids.
+        Local write is required; Drive mirror sync is best-effort.
+        Returns the claimed lease or None if absent, not ACTIVE, or
+        not warm_idle."""
+        def _claim_warm(doc, leases):
+            lease = next((x for x in leases
+                          if x.get("session_id") == session_id), None)
+            if lease is None or lease.get("last_confirmed_state") != "ACTIVE":
+                return None
+            if lease.get("warm_idle") is not True:
+                return None
+            lease["warm_idle"] = False
+            lease["warm_expires_at_utc"] = None
+            lease["run_id"] = new_run_id
+            lease["production_task_id"] = new_production_task_id
+            lease["stop_deadline_utc"] = new_stop_deadline_utc
+            lease["deadline_final"] = True
+            warm_runs = list(lease.get("warm_run_ids") or [])
+            if new_run_id and new_run_id not in warm_runs:
+                warm_runs.append(new_run_id)
+            lease["warm_run_ids"] = warm_runs
+            lease["last_audit_at_utc"] = _utc_now()
+            lease["version"] = int(lease.get("version") or 0) + 1
+            return lease
+
+        doc, lease = self._mutate(_claim_warm)
+        if lease is not None:
+            self._mirror_write_best_effort(doc)
+        return lease
+
+    def find_warm_leases(self, now=None,
+                         owner_id: str | None = None) -> list[dict]:
+        """Return ACTIVE warm_idle=True leases whose warm_expires_at_utc
+        is strictly in the future (`now < warm_expires_at_utc`),
+        filtered by `owner_id` when supplied, sorted newest first
+        (v0.3.0 M4)."""
+        import datetime
+
+        now_dt = _parse_utc(now) if now is not None else datetime.datetime.now(
+            datetime.timezone.utc)
+        if now_dt is None:
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+        out: list[dict] = []
+        for lease in self.list_leases():
+            if lease.get("last_confirmed_state") != "ACTIVE":
+                continue
+            if lease.get("warm_idle") is not True:
+                continue
+            if owner_id is not None and lease.get("owner_id") != owner_id:
+                continue
+            exp_dt = _parse_utc(lease.get("warm_expires_at_utc"))
+            if exp_dt is None or now_dt >= exp_dt:
+                continue
+            out.append(lease)
+        out.sort(
+            key=lambda x: (
+                str(x.get("started_at_utc") or ""),
+                str(x.get("last_audit_at_utc") or ""),
+            ),
+            reverse=True,
+        )
+        return out
 
     def note_stop_attempt(self, session_id: str, error_type: str | None,
                           retry_after_sec: int = 300) -> dict | None:
@@ -463,6 +632,8 @@ class LeaseRegistry:
                 remote = None
             if isinstance(remote, dict) and isinstance(
                     remote.get("leases"), list):
+                for lease in remote["leases"]:
+                    _normalize_lease(lease)
                 with _state_lock(self.path):
                     local = self._load_local()
                     if int(remote.get("version") or 0) > int(

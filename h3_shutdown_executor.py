@@ -86,13 +86,20 @@ def _executor_id() -> str:
 def audit_leases(registry: LeaseRegistry, now: datetime.datetime | None = None,
                  owner_id: str | None = None,
                  production_task_id: str | None = None,
-                 query_fn=None) -> dict:
+                 query_fn=None,
+                 force_stop_warm: bool = False) -> dict:
     """Read-only report: which leases are overdue, which would be
     stopped, which are skipped and why. Makes zero CLI stop calls.
 
     `production_task_id` scopes the pass: a lease from another task is
     skipped as out_of_task_scope and can never reach the stop loop.
     None means no filtering (audit callers that only report).
+
+    Warm-idle leases (v0.3.0 M4): any non-STOPPED lease with
+    `warm_idle=True` where `force_stop_warm=True` OR `now >=
+    warm_expires_at_utc` bypasses `production_task_id` filtering and is
+    appended to `overdue` with `reason="manual_stop_warm"` or
+    `"warm_ttl_expired"` and `warm_idle=True`.
 
     Emergency cap (TASK-007): a lease whose deadline never finalised
     is normally never stopped — except past its absolute physical cap
@@ -112,6 +119,31 @@ def audit_leases(registry: LeaseRegistry, now: datetime.datetime | None = None,
         state = lease.get("last_confirmed_state")
         if state == "STOPPED":
             skipped.append({"session_id": sid, "reason": "already_stopped"})
+            continue
+        if lease.get("warm_idle") is True:
+            if force_stop_warm:
+                entry = dict(lease)
+                entry["reason"] = "manual_stop_warm"
+                entry["warm_idle"] = True
+                overdue.append(entry)
+                continue
+            warm_exp = _parse_utc(
+                lease.get("warm_expires_at_utc") or lease.get("stop_deadline_utc"))
+            if warm_exp is None:
+                skipped.append({"session_id": sid, "reason": "unparseable_deadline"})
+                continue
+            if now >= warm_exp:
+                retry_at = _parse_utc(lease.get("next_retry_at_utc"))
+                if retry_at is not None and now < retry_at:
+                    skipped.append({"session_id": sid, "reason": "retry_not_due"})
+                    continue
+                entry = dict(lease)
+                entry["reason"] = "warm_ttl_expired"
+                entry["warm_idle"] = True
+                overdue.append(entry)
+                continue
+            skipped.append({"session_id": sid, "reason": "not_yet_due",
+                            "warm_idle": True})
             continue
         if production_task_id is not None and \
                 lease.get("production_task_id") != production_task_id:
@@ -183,10 +215,33 @@ def audit_leases(registry: LeaseRegistry, now: datetime.datetime | None = None,
                      "gpu_model": x.get("gpu_model"),
                      "stop_deadline_utc": x.get("stop_deadline_utc"),
                      "stop_attempts": x.get("stop_attempts"),
+                     **({"warm_idle": True} if x.get("warm_idle") else {}),
                      **({"reason": x["reason"]} if x.get("reason") else {})}
                     for x in overdue],
         "skipped": skipped,
     }
+
+
+def _record_warm_manifests_stopped(manifest_root: Path, lease: dict,
+                                   session_id: str) -> None:
+    """Best-effort update of WARM_POOLED run manifests to STOPPED after
+    a confirmed shutdown (v0.3.0 M4)."""
+    run_ids = list(dict.fromkeys(
+        [r for r in (lease.get("warm_run_ids") or []) if r]
+        + ([lease["run_id"]] if lease.get("run_id") else [])
+    ))
+    if not run_ids:
+        return
+    try:
+        import h3_run_manifest
+    except Exception:  # noqa: BLE001 - best-effort only
+        return
+    for rid in run_ids:
+        try:
+            h3_run_manifest.record_warm_session_stopped(
+                manifest_root, rid, session_id=session_id)
+        except Exception:  # noqa: BLE001 - best-effort only
+            pass
 
 
 def run_executor(registry: LeaseRegistry, confirm_stop: bool = False,
@@ -194,21 +249,28 @@ def run_executor(registry: LeaseRegistry, confirm_stop: bool = False,
                  now: datetime.datetime | None = None,
                  stop_fn=None, owner_id_fn=None,
                  production_task_id: str | None = None,
-                 query_fn=None) -> dict:
+                 query_fn=None,
+                 stop_warm_only: bool = False,
+                 force_stop_warm: bool = False,
+                 manifest_root: Path | None = None) -> dict:
     """One backup-executor pass. Returns the report dict (also printed
     as JSON by main). `stop_fn` defaults to the watchdog's stop_session;
     tests inject a fake. `owner_id_fn` defaults to current_owner_id.
     `production_task_id` scopes the pass to one task (audit filter +
-    stop filter); a stop pass without it is refused outright (exit_hint
-    2, nothing stopped) — the executor must never stop a session from
-    a task it was not told to cover. `query_fn` is the live-state query
-    for the emergency path (tests inject a fake)."""
+    stop filter); a normal stop pass without it is refused outright
+    (exit_hint 2, nothing stopped) — the executor must never stop a
+    session from a task it was not told to cover. When `stop_warm_only`
+    or `force_stop_warm` is True, `production_task_id=None` is allowed
+    and the pass acts ONLY on `warm_idle=True` leases while preserving
+    owner_id verification, lease claims, and 3-state STOPPED confirmation.
+    `query_fn` is the live-state query for the emergency path (tests inject a fake)."""
     now = now or _now()
     executor_id = executor_id or _executor_id()
     stop_fn = stop_fn or _default_stop
     owner_id_fn = owner_id_fn or current_owner_id
+    warm_mode = bool(stop_warm_only or force_stop_warm)
 
-    if confirm_stop and production_task_id is None:
+    if confirm_stop and production_task_id is None and not warm_mode:
         return {"action": "stop",
                 "checked_at_utc": now.isoformat(),
                 "executor_id": executor_id,
@@ -229,7 +291,19 @@ def run_executor(registry: LeaseRegistry, confirm_stop: bool = False,
 
     report = audit_leases(registry, now=now, owner_id=own_owner_id,
                           production_task_id=production_task_id,
-                          query_fn=query_fn)
+                          query_fn=query_fn,
+                          force_stop_warm=force_stop_warm)
+    if warm_mode:
+        warm_overdue = []
+        for item in report["overdue"]:
+            if item.get("warm_idle"):
+                warm_overdue.append(item)
+            else:
+                report["skipped"].append({
+                    "session_id": item.get("session_id"),
+                    "reason": "skipped_non_warm_in_warm_mode",
+                })
+        report["overdue"] = warm_overdue
     report["action"] = "stop" if confirm_stop else "audit"
     report["executor_id"] = executor_id
     report["stopped"] = []
@@ -240,6 +314,7 @@ def run_executor(registry: LeaseRegistry, confirm_stop: bool = False,
                           "re-run with --confirm-stop to act")
         return report
 
+    m_root = manifest_root or ROOT
     stopped_count = 0
     for entry in report["overdue"]:
         if stopped_count >= max_stops:
@@ -250,6 +325,10 @@ def run_executor(registry: LeaseRegistry, confirm_stop: bool = False,
         lease = registry.get_lease(sid)
         if lease is None:
             report["pending"].append({**entry, "reason": "lease_vanished"})
+            continue
+        if warm_mode and lease.get("warm_idle") is not True:
+            report["skipped"].append(
+                {"session_id": sid, "reason": "no_longer_warm_idle"})
             continue
         if lease.get("owner_id") != own_owner_id:
             report["refused"].append(
@@ -274,6 +353,8 @@ def run_executor(registry: LeaseRegistry, confirm_stop: bool = False,
                      "error": type(e).__name__})
                 registry.release_claim(sid, executor_id)
                 continue
+            if lease.get("warm_idle") or lease.get("warm_run_ids"):
+                _record_warm_manifests_stopped(m_root, lease, sid)
             report["stopped"].append(
                 {**entry, "attempts": (result or {}).get("attempts")})
             stopped_count += 1
@@ -315,9 +396,12 @@ def main(argv=None) -> int:
                         help="Max leases stopped in one pass (default 3).")
     parser.add_argument("--production-task-id", default=None,
                         help="Scope this pass to one production task. "
-                             "REQUIRED for stop --confirm-stop (a stop pass "
-                             "without it is refused outright); in audit "
-                             "mode it filters the report to that task.")
+                             "REQUIRED for stop --confirm-stop (unless "
+                             "--stop-warm is set); in audit "
+                             "mode it filters non-warm leases to that task.")
+    parser.add_argument("--stop-warm", action="store_true",
+                        help="Target warm-pooled idle sessions immediately "
+                             "(cross-task; acts ONLY on warm_idle=True leases).")
     parser.add_argument("--registry", default=str(LeaseRegistry().path),
                         help="Local registry file path.")
     parser.add_argument("--no-mirror", action="store_true",
@@ -325,7 +409,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.mode == "stop" and args.confirm_stop \
-            and not args.production_task_id:
+            and not args.production_task_id and not args.stop_warm:
         print(json.dumps({"action": "stop",
                           "error": "production_task_id is required for "
                                    "stop --confirm-stop",
@@ -345,7 +429,9 @@ def main(argv=None) -> int:
     try:
         report = run_executor(registry, confirm_stop=confirm,
                               max_stops=args.max_stops,
-                              production_task_id=args.production_task_id)
+                              production_task_id=args.production_task_id,
+                              stop_warm_only=args.stop_warm,
+                              force_stop_warm=args.stop_warm)
     except Exception as e:  # noqa: BLE001 - report the failure, do not crash bare
         print(json.dumps({"action": args.mode, "error": type(e).__name__,
                           "detail": "executor pass failed"}, indent=2))

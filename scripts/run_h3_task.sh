@@ -34,6 +34,7 @@
 #   --task-spec SPEC | --variant A|B --run-id ID --production-task-id ID [--authorize-new-task]
 #   [--task-deadline-utc UTC] [--auto-recover] [--max-task-attempts N]
 #   [--allocation-rounds N] [--bootstrap-mode bundled|legacy]
+#   [--keep-warm-ttl SEC]
 # The controller itself enforces: 30 CU task budget, 25 CU per-session cap,
 # G4_THEN_A100_HIGHMEM policy, pinned ComfyUI commit, and (TASK-006 P0-B)
 # the noninteractive Drive download preflight before allocation. The
@@ -45,7 +46,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 CONFIRM_LIVE=0; VARIANT=""; TASK_SPEC=""; RUN_ID=""; TASK_ID=""; AUTHORIZE_NEW_TASK=0
-DELIVER=0; AUTO_RECOVER=0; MAX_ATTEMPTS=""; TASK_DEADLINE=""; ALLOCATION_ROUNDS=""; BOOTSTRAP_MODE=""
+DELIVER=0; AUTO_RECOVER=0; MAX_ATTEMPTS=""; TASK_DEADLINE=""; ALLOCATION_ROUNDS=""; BOOTSTRAP_MODE=""; KEEP_WARM_TTL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --confirm-live) CONFIRM_LIVE=1; shift ;;
@@ -59,6 +60,7 @@ while [ $# -gt 0 ]; do
     --max-task-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
     --allocation-rounds) ALLOCATION_ROUNDS="$2"; shift 2 ;;
     --bootstrap-mode) BOOTSTRAP_MODE="$2"; shift 2 ;;
+    --keep-warm-ttl) KEEP_WARM_TTL="$2"; shift 2 ;;
     --task-deadline-utc) TASK_DEADLINE="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -89,6 +91,16 @@ if [ -n "$BOOTSTRAP_MODE" ]; then
   case "$BOOTSTRAP_MODE" in
     bundled|legacy) ;;
     *) echo "REFUSED: --bootstrap-mode must be bundled or legacy" >&2; exit 2 ;;
+  esac
+fi
+if [ -n "$KEEP_WARM_TTL" ]; then
+  case "$KEEP_WARM_TTL" in
+    0) ;;
+    *) if [ "$KEEP_WARM_TTL" -ge 60 ] 2>/dev/null && [ "$KEEP_WARM_TTL" -le 900 ] 2>/dev/null; then
+         :
+       else
+         echo "REFUSED: --keep-warm-ttl must be 0 or 60..900" >&2; exit 2
+       fi ;;
   esac
 fi
 # --run-id is required for a single run; the deliver loop derives a
@@ -140,6 +152,7 @@ if [ -n "$TASK_DEADLINE" ]; then EXTRA+=(--task-deadline-utc "$TASK_DEADLINE"); 
 if [ -n "$MAX_ATTEMPTS" ]; then EXTRA+=(--max-task-attempts "$MAX_ATTEMPTS"); fi
 if [ -n "$ALLOCATION_ROUNDS" ]; then EXTRA+=(--allocation-rounds "$ALLOCATION_ROUNDS"); fi
 if [ -n "$BOOTSTRAP_MODE" ]; then EXTRA+=(--bootstrap-mode "$BOOTSTRAP_MODE"); fi
+if [ -n "$KEEP_WARM_TTL" ]; then EXTRA+=(--keep-warm-ttl "$KEEP_WARM_TTL"); fi
 if [ "$DELIVER" -eq 1 ]; then
   exec "$PY" h3_controller.py deliver --execute --confirm-gpu --authorize-task-gpu --allow-g4 --allow-a100-highmem --fresh-inference --production-task-id "$TASK_ID" "${EXTRA[@]}"
 fi

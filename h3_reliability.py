@@ -552,10 +552,12 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
     allocated = [m for m in terminal if m.get("session_id")]
     verified_shutdowns = sum(
         1 for m in allocated
-        if "GPU_STOP_CONFIRMED" in _audit_stages(root, m["run_id"]))
+        if m.get("session_state") == "STOPPED"
+        and "GPU_STOP_CONFIRMED" in _audit_stages(root, m["run_id"]))
     metric_d = _metric(
         verified_shutdowns, len(allocated),
-        "GPU_STOP_CONFIRMED in audit log / terminal runs with a session",
+        "GPU_STOP_CONFIRMED in audit log and session_state STOPPED / "
+        "terminal runs with a session",
         unknown_reason="no terminal run in scope allocated a GPU")
 
     e_numerator = 0
@@ -644,12 +646,24 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
                 unknown_reason="no run in scope reported cold-start metrics"),
         }
 
+    warm_session_hits = sum(
+        1 for m in manifests
+        if (m.get("coldstart_metrics") or {}).get("warm_session_reused") is True
+        or (m.get("artifacts") or {}).get("warm_session_reused") is True
+    )
+    warm_pooled_active_runs = sum(
+        1 for m in manifests
+        if m.get("session_state") == "WARM_POOLED"
+    )
+
     return {
         "root": str(root),
         "sample_scope": {"production_task_id": production_task_id,
                          "since": since, "until": until},
         "sample_size": len(terminal),
         "runs_sampled": len(manifests),
+        "warm_session_hits": warm_session_hits,
+        "warm_pooled_active_runs": warm_pooled_active_runs,
         "observation_dates": [created[0], created[-1]] if created else None,
         "breakdown": {"completed": len(completed), "failed": len(failed),
                       "awaiting_archive": len(awaiting),

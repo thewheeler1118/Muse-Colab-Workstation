@@ -41,8 +41,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 30604,
-      "sha256": "b3971fc56fb62e71634845411086cd4625c36c2d52931e2e86f90a849a462b4e",
+      "size_bytes": 33565,
+      "sha256": "d29bc93e87e89a95c18cb970844267cfbdd644505b5011f4f2ed311b1695a611",
       "role": "Supporting file"
     },
     {
@@ -461,8 +461,8 @@
     },
     {
       "path": "docs/module_inventory.md",
-      "size_bytes": 61014,
-      "sha256": "da8873b2f8b7e0ed14712f113be97247f6e03029bfe13ef4c5b915d16272eed8",
+      "size_bytes": 62934,
+      "sha256": "ef59543b0fa7d9b74baca0e2a8d2c0f9b2aceba3a3352a6f300c43b92e2ed4d2",
       "role": "Module inventory (this table's source of truth for hashes)"
     },
     {
@@ -569,8 +569,8 @@
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 23906,
-      "sha256": "106d3b322584e29d2e4117bcc7f2b387f416967c51d8a16ee6a58bbc27ee615c",
+      "size_bytes": 27858,
+      "sha256": "0a7854353501bafa6d2786ec6af14cda0dbb29ea0739a994bdfa75f4d85bc16d",
       "role": "Documentation / evidence"
     },
     {
@@ -665,8 +665,8 @@
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 236641,
-      "sha256": "1a6649f2c6498851fe2d31df5414be8ef2cba049da319ce552e69db96be279ca",
+      "size_bytes": 257116,
+      "sha256": "e0e9d0a8da4c1836d562cfaec926fde84d55d4131ced389bdb25ababe89cb6f4",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -713,8 +713,8 @@
     },
     {
       "path": "h3_gpu_lease_registry.py",
-      "size_bytes": 27925,
-      "sha256": "7a321caccd53d39eb2f259b76d53bf9c3b3769e1c90357dd5013963692999111",
+      "size_bytes": 35401,
+      "sha256": "8bb3024f1619cc3c46e82b4044c69065f824ca281b1722fcce0fcaf554796a3f",
       "role": "Supporting file"
     },
     {
@@ -767,14 +767,14 @@
     },
     {
       "path": "h3_reliability.py",
-      "size_bytes": 30305,
-      "sha256": "4821e8730fd5537acbf5e92a51771284e633ddaa98c68aa2814070dbc1bbc163",
+      "size_bytes": 30838,
+      "sha256": "f31edbf5bd1ec5008b54e51cbc4cee87f120254a2d196bd9526f8ef184b9c331",
       "role": "Supporting file"
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 93649,
-      "sha256": "b639870083642b4a53f429d51e6300ce40dc47ca58c4bc26d8668cf7767d5141",
+      "size_bytes": 98556,
+      "sha256": "4137c14160038af9e53af4befab411c50a80c5797506787a2563059cffa3f9a0",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -785,8 +785,8 @@
     },
     {
       "path": "h3_run_manifest.py",
-      "size_bytes": 24415,
-      "sha256": "6da8987868377abd210e752e39a9986a4ed2e2851c585d936de97b7077c39b12",
+      "size_bytes": 27241,
+      "sha256": "efbd9f7b5cab9347c9e599498a264da010b9a34efc5f2dca919c75540f0a8b86",
       "role": "Supporting file"
     },
     {
@@ -797,8 +797,8 @@
     },
     {
       "path": "h3_shutdown_executor.py",
-      "size_bytes": 16181,
-      "sha256": "548e46ed7ca5d1bc7725c0ae505379e1c98e2d757cf3dce83fa08c00dce65e56",
+      "size_bytes": 20179,
+      "sha256": "dc60fb4bb2c85225e544e5a8d758e84ab1498c61e62cc2e66d650bf1d52e9060",
       "role": "Supporting file"
     },
     {
@@ -818,6 +818,12 @@
       "size_bytes": 10613,
       "sha256": "254c9fcf04f7c0a173fc0214a6fe4947038370d8d2193010741804d59b297cec",
       "role": "Local final-video validation + poster-tail PSNR QA"
+    },
+    {
+      "path": "h3_warm_health_probe.py",
+      "size_bytes": 1619,
+      "sha256": "94792031e92d8935e92d7b474188e2720cb444f1615f739f63361430337aaad2",
+      "role": "Supporting file"
     },
     {
       "path": "h3_worker_launcher.py",
@@ -983,8 +989,8 @@
     },
     {
       "path": "scripts/run_h3_task.sh",
-      "size_bytes": 8069,
-      "sha256": "76b73134e1723c54baa2463555f4f5f6cd07be6d7deee96ff45ecbe797b028d7",
+      "size_bytes": 8534,
+      "sha256": "72e7848636a02401eafc5e39825d548cd4b6e8a879f101dd985aa226e45ebbfc",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1013,8 +1019,8 @@
     },
     {
       "path": "scripts/verify_shutdown.sh",
-      "size_bytes": 1155,
-      "sha256": "f4e6e45b2c3494ccd9731a63850fe8e3a335b02d9732b0bfd5df0f2a6eada065",
+      "size_bytes": 2009,
+      "sha256": "35ed527219444cee909609d1066b28711e5979449801e149c7f7e49e337e2cc9",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1151,8 +1157,8 @@
     },
     {
       "path": "tests/test_fault_injection.py",
-      "size_bytes": 61042,
-      "sha256": "fd29c60a0801e4a77754eabdd3a219eaa3bea43d07aa46e573349c888d3bb395",
+      "size_bytes": 61835,
+      "sha256": "35f312cbd20dcbe97ab58fa6fd7a9b63caf95259df4da93a7fe456b252d0522f",
       "role": "Tests"
     },
     {
@@ -1321,6 +1327,18 @@
       "path": "tests/test_v030_m3_self_healing.py",
       "size_bytes": 19540,
       "sha256": "cb27e55e477abf9d44eddc8b220ac34b4a8f71a91b65b3afd1812e5061203edd",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m4_controller_worker.py",
+      "size_bytes": 18927,
+      "sha256": "2e272604b8904e5d60581d73d73fcdb7784a0ffdcfdf9f281d8d515eafc74e15",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v030_m4_warm_infra.py",
+      "size_bytes": 23056,
+      "sha256": "9c34c0c65ed85a4ac49e337cf99fcf10bb11d9951dc6dc3b5f6f93d18dc35761",
       "role": "Tests"
     },
     {

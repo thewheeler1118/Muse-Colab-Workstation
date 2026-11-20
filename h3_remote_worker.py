@@ -909,14 +909,18 @@ HIGH_VRAM_THRESHOLD_MIB = 76800
 HIGH_VRAM_FLAGS = ('--highvram', '--disable-mmap')
 
 
-def build_coldstart_metrics(setup_started: float, vram_mib=None) -> dict:
+def build_coldstart_metrics(setup_started: float, vram_mib=None, *,
+                            warm_session_reused: bool = False) -> dict:
     """Assemble the v0.2.0 F5 cold-start report from the module-global
     recordings (per-track wall times, wheelhouse hit, restore counts).
     Only timings, counts, flags and the detected VRAM — never tokens,
     paths, or credentials. ``setup_started`` is the monotonic time the
     parallel setup began; per-track times come from
-    ``_SETUP_TRACK_TIMINGS`` (missing when a track never ran)."""
-    return {
+    ``_SETUP_TRACK_TIMINGS`` (missing when a track never ran). When
+    ``warm_session_reused`` is True (v0.3.0 M4), the report carries
+    ``"warm_session_reused": True``; when False, the key set is the
+    exact v0.2.0 one."""
+    payload = {
         "setup_seconds": round(time.monotonic() - setup_started, 3),
         "comfy_install_seconds": _SETUP_TRACK_TIMINGS.get("ensure_comfy"),
         "restore_seconds": _SETUP_TRACK_TIMINGS.get("restore_weights"),
@@ -925,15 +929,20 @@ def build_coldstart_metrics(setup_started: float, vram_mib=None) -> dict:
         "models_downloaded": _RESTORE_COUNTS["downloaded"],
         "vram_mib": vram_mib,
     }
+    if warm_session_reused:
+        payload["warm_session_reused"] = True
+    return payload
 
 
 def emit_coldstart_metrics(setup_started: float, run_id: str, variant: str,
-                           vram_mib=None) -> dict:
+                           vram_mib=None, *,
+                           warm_session_reused: bool = False) -> dict:
     """Print ``COLDSTART_METRICS_JSON`` and persist the same report in
     the job state, so the controller can read it on its next poll.
     Returns the metrics dict. Never raises for a bookkeeping failure:
     a metrics write must not kill a worker whose setup succeeded."""
-    metrics = build_coldstart_metrics(setup_started, vram_mib=vram_mib)
+    metrics = build_coldstart_metrics(setup_started, vram_mib=vram_mib,
+                                      warm_session_reused=warm_session_reused)
     try:
         print("COLDSTART_METRICS_JSON", json.dumps(metrics, ensure_ascii=False), flush=True)
         write_job_state(ROOT, run_id, variant, _LAST_STAGE or "restore_weights",
@@ -1258,6 +1267,80 @@ def wait_health(server, proc,deadline):
         except (urllib.error.URLError,TimeoutError,ConnectionError):pass
         time.sleep(4)
     raise TimeoutError('ComfyUI /object_info start timeout')
+
+
+def check_warm_comfy_alive(server: str, timeout: float = 5.0) -> dict | None:
+    """Check whether a resident ComfyUI server on ``server`` is alive and
+    exposes all required MiniMax-H3 nodes (v0.3.0 M4). Returns the parsed
+    ``/object_info`` dict when healthy, or ``None`` otherwise."""
+    try:
+        info = get_json(server.rstrip("/") + "/object_info", timeout=timeout)
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    for typ in ("MiniMaxH3ReferenceToVideo", "SaveVideo", "UNETLoader", "CLIPLoader"):
+        if typ not in info:
+            return None
+    return info
+
+
+def _all_models_present_in_comfy(comfy: Path, manifest: dict) -> bool:
+    """True when all pinned model files from ``manifest`` are present and
+    match their expected byte size under ``comfy / 'models'`` (v0.3.0 M4).
+    Size-only: the files were SHA-256 verified when linked into the store
+    (F4); a size match here proves the resident tree is intact."""
+    files = manifest.get("files") or []
+    if len(files) < 4:
+        return False
+    models_dir = comfy / "models"
+    for item in files:
+        rel = item.get("path")
+        expected_size = item.get("size")
+        if not rel or expected_size is None:
+            return False
+        target = models_dir / rel
+        try:
+            if not target.is_file() or target.stat().st_size != int(expected_size):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _cleanup_ephemeral_tokens(root: Path) -> None:
+    """Best-effort delete ephemeral Drive token files after a warm run
+    (v0.3.0 M4): the pooled session must never keep a live token on disk
+    past the run that minted it."""
+    for pattern in ("drive_token*.json", "drive_upload_token.json"):
+        for tok in root.glob(pattern):
+            try:
+                tok.unlink()
+            except OSError:
+                pass
+
+
+def _terminate_comfy_pid(root: Path) -> None:
+    """Terminate a persisted ComfyUI PID from ``root / 'comfyui.pid'``
+    (v0.3.0 M4). Best-effort; the pid file is always unlinked."""
+    import signal
+
+    pid_file = root / "comfyui.pid"
+    if not pid_file.is_file():
+        return
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        pid = None
+    if pid is not None and pid > 1:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        pid_file.unlink()
+    except OSError:
+        pass
 
 # Control-after-generate modes, serialized by the frontend as extra input
 # keys on primitive nodes (e.g. PrimitiveInt {"value": 20, "fixed": "fixed"}).
@@ -1714,6 +1797,8 @@ def main():
     proc=None
     object_info=None
     api=None
+    run_succeeded=False
+    keep_warm_ttl_sec=int(task.get('keep_warm_ttl_sec') or 0)
     try:
         # The whole body is inside the try now: 2026-11-12 the worker died
         # in ensure_comfy (git clone exit 128) BEFORE the old try block,
@@ -1728,37 +1813,64 @@ def main():
         set_stage('setup_parallel')
         setup_started = time.monotonic()
         setup_abort = threading.Event()
-        try:
-            run_setup_parallel([
-                ('ensure_comfy', lambda: ensure_comfy(
-                    comfy, task['comfy_ref'], task.get('comfyui_cache'),
-                    drive_download=drive_download, token_provider=token_provider,
-                    abort_event=setup_abort)),
-                ('restore_weights', lambda: restore_weights(
-                    comfy, cache, manifest, rate_cu_h=task.get('rate_cu_h'),
-                    budget_cu=task.get('session_budget_cu'),
-                    drive_download=drive_download, token_provider=token_provider,
-                    abort_event=setup_abort)),
-            ], abort_event=setup_abort)
-        except SetupTrackFailed as e:
-            set_stage(e.stage)
-            raise
-        set_stage('restore_weights')
-        (comfy/'input').mkdir(exist_ok=True)
-        shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
-        shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
-        set_stage('comfyui_start')
-        # v0.2.0 F5: detect VRAM once — the flags and the cold-start
-        # report share the same reading.
-        vram_mib = detect_gpu_vram_mib()
-        vram_flags = comfy_vram_flags(vram_mib)
-        print('COMFY_VRAM_FLAGS', ' '.join(vram_flags) or '(none)', flush=True)
-        emit_coldstart_metrics(setup_started, _JOB_RUN_ID, _JOB_VARIANT, vram_mib=vram_mib)
-        proc=subprocess.Popen([sys.executable,'main.py','--listen','127.0.0.1','--port','8188']+vram_flags,cwd=comfy,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
-        set_stage('object_info_validation')
-        object_info=wait_health(server,proc,time.monotonic()+180)
-        info=object_info
-        print('COMFYUI_HEALTH_OK',flush=True)
+        # v0.3.0 M4: check whether a warm resident ComfyUI server is already
+        # running with the exact pinned commit and all 4 model files intact.
+        warm_object_info = check_warm_comfy_alive(server)
+        warm_reused = (
+            warm_object_info is not None
+            and comfyui_commit(comfy) == task['comfy_ref']
+            and _all_models_present_in_comfy(comfy, manifest)
+        )
+        if warm_reused:
+            print('WARM_SESSION_REUSED', task['comfy_ref'], flush=True)
+            (comfy/'input').mkdir(exist_ok=True)
+            shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
+            shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
+            set_stage('object_info_validation')
+            object_info=warm_object_info
+            info=object_info
+            vram_mib = detect_gpu_vram_mib()
+            vram_flags = comfy_vram_flags(vram_mib)
+            print('COMFY_VRAM_FLAGS', ' '.join(vram_flags) or '(none)', flush=True)
+            emit_coldstart_metrics(setup_started, _JOB_RUN_ID, _JOB_VARIANT,
+                                   vram_mib=vram_mib, warm_session_reused=True)
+            print('COMFYUI_HEALTH_OK',flush=True)
+        else:
+            try:
+                run_setup_parallel([
+                    ('ensure_comfy', lambda: ensure_comfy(
+                        comfy, task['comfy_ref'], task.get('comfyui_cache'),
+                        drive_download=drive_download, token_provider=token_provider,
+                        abort_event=setup_abort)),
+                    ('restore_weights', lambda: restore_weights(
+                        comfy, cache, manifest, rate_cu_h=task.get('rate_cu_h'),
+                        budget_cu=task.get('session_budget_cu'),
+                        drive_download=drive_download, token_provider=token_provider,
+                        abort_event=setup_abort)),
+                ], abort_event=setup_abort)
+            except SetupTrackFailed as e:
+                set_stage(e.stage)
+                raise
+            set_stage('restore_weights')
+            (comfy/'input').mkdir(exist_ok=True)
+            shutil.copy2(ref1,comfy/'input'/'muse_ref_1.jpg')
+            shutil.copy2(ref2,comfy/'input'/'muse_ref_2.jpg')
+            set_stage('comfyui_start')
+            # v0.2.0 F5: detect VRAM once — the flags and the cold-start
+            # report share the same reading.
+            vram_mib = detect_gpu_vram_mib()
+            vram_flags = comfy_vram_flags(vram_mib)
+            print('COMFY_VRAM_FLAGS', ' '.join(vram_flags) or '(none)', flush=True)
+            emit_coldstart_metrics(setup_started, _JOB_RUN_ID, _JOB_VARIANT, vram_mib=vram_mib)
+            proc=subprocess.Popen([sys.executable,'main.py','--listen','127.0.0.1','--port','8188']+vram_flags,cwd=comfy,stdout=logfile,stderr=subprocess.STDOUT,start_new_session=True)
+            try:
+                (ROOT/'comfyui.pid').write_text(str(proc.pid),encoding='utf-8')
+            except OSError:
+                pass
+            set_stage('object_info_validation')
+            object_info=wait_health(server,proc,time.monotonic()+180)
+            info=object_info
+            print('COMFYUI_HEALTH_OK',flush=True)
         raw=json.loads((ROOT/'workflow_api.json').read_text())
         api=patch_api_workflow_for_spec(raw,spec,'muse_ref_1.jpg','muse_ref_2.jpg',run_id=run_id)
         validate_api_against_object_info(api,info)
@@ -1829,6 +1941,7 @@ def main():
         try:write_job_state(ROOT,run_id,version,'VIDEO_READY',output=info,extra={'remote_upload':remote_upload} if remote_upload is not None else None)
         except Exception:pass
         print('MUSE_H3_DONE_JSON:'+json.dumps(info,ensure_ascii=False),flush=True)
+        run_succeeded=True
     except Exception as e:
         try:write_job_state(ROOT,run_id,version,'FAILED',error=worker_failure_info(_LAST_STAGE,e))
         except Exception:pass
@@ -1845,9 +1958,15 @@ def main():
                 pass
         raise
     finally:
-        if proc is not None:
-            proc.terminate()
-            try:proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:proc.kill()
+        if run_succeeded and keep_warm_ttl_sec > 0:
+            # v0.3.0 M4: keep resident ComfyUI :8188 alive for the warm TTL
+            # window, but scrub ephemeral Drive tokens from disk.
+            _cleanup_ephemeral_tokens(ROOT)
+        else:
+            if proc is not None:
+                proc.terminate()
+                try:proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:proc.kill()
+            _terminate_comfy_pid(ROOT)
         logfile.close()
 if __name__=='__main__':main()

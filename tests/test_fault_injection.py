@@ -226,6 +226,7 @@ class ChainHarness:
         self.stop_failures = []
         self.probe_output = "RTX PRO 6000 Blackwell, 97808"
         self.job_probe_states = []
+        self.warm_probe_ok = True
         self.download_exc = None
         self.archive_plan = []
         self.env_exc = None
@@ -450,6 +451,18 @@ class ChainHarness:
                 {"run_id": RUN_ID, "variant": "A", "pid": 123,
                  "state_file": "/content/muse_h3/MUSE_H3_JOB_STATE.json",
                  "log_file": "/content/muse_h3/worker.log"}), "stderr": ""}
+        if name == "h3_warm_health_probe.py":
+            # v0.3.0 M4 warm-pool gate (e): the resident ComfyUI health
+            # probe. warm_probe_ok=False simulates a dead/unhealthy
+            # resident server (empty stdout -> no MUSE_WARM_HEALTH_OK).
+            if self.warm_probe_ok:
+                return {"returncode": 0, "stdout":
+                        "MUSE_WARM_HEALTH_OK " + json.dumps(
+                            {"ok": True, "node_count": 4,
+                             "required_nodes": ["MiniMaxH3ReferenceToVideo",
+                                                "SaveVideo", "UNETLoader",
+                                                "CLIPLoader"]}), "stderr": ""}
+            return {"returncode": 0, "stdout": "", "stderr": ""}
         return {"returncode": 0, "stdout": "", "stderr": ""}
 
     def _fake_download(self, session, variant, run_id, spec=None):
