@@ -19,6 +19,7 @@ Rules (TASK-VERSION-ROADMAP-011 Stage 1):
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # Repo-relative paths that must never hold a real task spec.
@@ -73,6 +74,22 @@ def resolve_production_dir(explicit: Path | str | None = None) -> Path:
     return path.resolve()
 
 
+def _refuse_if_under_denied(path: Path, root_resolved: Path,
+                            addressed_as) -> None:
+    """Raise if *path* lies under one of the denied repo prefixes."""
+    try:
+        rel = path.relative_to(root_resolved)
+    except ValueError:
+        return
+    rel_posix = rel.as_posix()
+    for prefix in _DENIED_TASK_SPEC_PREFIXES:
+        if rel_posix == prefix.rstrip("/") or rel_posix.startswith(prefix):
+            raise ValueError(
+                "real task specs are denied under repo "
+                f"config/tasks/: {addressed_as}"
+            )
+
+
 def locate_task_spec_file(path: Path | str, repo_root: Path | str | None = None) -> Path:
     """Validate and resolve an external task-spec JSON path.
 
@@ -80,28 +97,35 @@ def locate_task_spec_file(path: Path | str, repo_root: Path | str | None = None)
     end in ``.json``, and must not live under the repo's
     ``config/tasks/`` (real task data is denied there by manifest
     policy). Returns the resolved absolute path.
+
+    The repo root is always determined — ``repo_root`` when given,
+    otherwise this checkout (``locate_repo_root()`` with no argument).
+    There is no "no root" mode: skipping the root also skipped the
+    ``config/tasks/`` denial on the ``to_wrapper_args()`` call path,
+    which is how a real task file could have been accepted.
+
+    The denial is checked on BOTH the resolved path and the
+    as-addressed path (lexically normalized, symlinks NOT resolved).
+    That closes the parent-directory symlink bypass in both
+    directions: a ``config/tasks/`` component that is a symlink to
+    somewhere outside the repo (resolved path escapes the denial),
+    and a path addressed outside the repo whose parent is a symlink
+    into ``config/tasks/`` (resolved path lands inside it).
     """
-    root = locate_repo_root(repo_root) if repo_root is not None else None
+    root = locate_repo_root(repo_root)
+    root_resolved = Path(root).resolve()
     candidate = Path(path).expanduser()
     if candidate.is_symlink():
         raise ValueError(f"task-spec path must not be a symlink: {path}")
     if candidate.suffix.lower() != ".json":
         raise ValueError(f"task-spec path must end in .json: {path}")
     resolved = candidate.resolve()
-    if root is not None:
-        root_resolved = Path(root).resolve()
-        try:
-            rel = resolved.relative_to(root_resolved)
-        except ValueError:
-            rel = None
-        if rel is not None:
-            rel_posix = rel.as_posix()
-            for prefix in _DENIED_TASK_SPEC_PREFIXES:
-                if rel_posix == prefix.rstrip("/") or rel_posix.startswith(prefix):
-                    raise ValueError(
-                        "real task specs are denied under repo "
-                        f"config/tasks/: {path}"
-                    )
+    _refuse_if_under_denied(resolved, root_resolved, path)
+    # As-addressed path: os.path.abspath normalizes "." / ".."
+    # lexically without following symlinks, so a symlinked parent
+    # cannot smuggle a config/tasks/ address past the check.
+    addressed = Path(os.path.abspath(candidate))
+    _refuse_if_under_denied(addressed, root_resolved, path)
     if not resolved.is_file():
         raise FileNotFoundError(f"task-spec file not found: {path}")
     if resolved.is_symlink():

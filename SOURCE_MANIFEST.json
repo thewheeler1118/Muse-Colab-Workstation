@@ -59,8 +59,8 @@
     },
     {
       "path": "adapters/muse/README.md",
-      "size_bytes": 3330,
-      "sha256": "b782a1ab5b8eaa046fda47219eb35cb0185fddd88c51b5c51e7051e0394b205f",
+      "size_bytes": 4133,
+      "sha256": "1509535456644a040339c224c87934687467cffadc54b86aa6382c84534dcb07",
       "role": "Supporting file"
     },
     {
@@ -71,20 +71,20 @@
     },
     {
       "path": "adapters/muse/adapter.py",
-      "size_bytes": 8956,
-      "sha256": "23c60d718076e1ac10ebca88899b630ca5d15a2071a47513ef67dd9a5d4e2558",
+      "size_bytes": 13897,
+      "sha256": "afb48bb3bc6afb15041be56b95134f95ab9189c2c3bc9630ec6663c0cb43e18a",
       "role": "Supporting file"
     },
     {
       "path": "adapters/muse/paths.py",
-      "size_bytes": 4674,
-      "sha256": "7006714615085b6a0f931660115b8284c83d158c21dbf61faab8321a17d4ac3f",
+      "size_bytes": 5851,
+      "sha256": "d1190f1d8a1a3f939992fe179ed215e6416727a1625278223c640600939a2772",
       "role": "Supporting file"
     },
     {
       "path": "adapters/muse/redact.py",
-      "size_bytes": 2094,
-      "sha256": "71166b7d5f6db5fa340757ccfecedc35af986373e6c7791ac64837b5e0570be6",
+      "size_bytes": 4870,
+      "sha256": "fe6610c744596236c2c1855b636756e0518122bbbb69d2fbc27a440f68c52ac4",
       "role": "Supporting file"
     },
     {
@@ -1157,8 +1157,8 @@
     },
     {
       "path": "tests/test_muse_adapter.py",
-      "size_bytes": 12074,
-      "sha256": "1879b0b7ca8867cbb87b8244a95c50dbfba9303545c72f996940b74f650a7503",
+      "size_bytes": 24690,
+      "sha256": "648ae78794c66a2f575f5a61f917e041d19e388854c534d9d0ee593192c2a82f",
       "role": "Tests"
     },
     {

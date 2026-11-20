@@ -27,19 +27,32 @@ running me".
    Without `confirm_live=True` the mapping refuses.
 4. Handles Muse conversation messages and status reports
    (`status_report`): budget constants, run id, delivered MP4
-   reference, shutdown result. All free text is redacted first.
+   reference, shutdown result. The whole report is deep-redacted
+   first (`redact_value`): credential-shaped strings anywhere —
+   notes, nested `shutdown` / `budget` dicts, lists — and any value
+   under a credential-named key is replaced wholesale.
 5. Locates the correct production directory and external task files
    (`adapters/muse/paths.py`): the production directory must be
    supplied explicitly and must contain `RELEASE_COMMIT`; the
    adapter never guesses it and never writes to it. Task-spec files
    must be external JSON files, not symlinks, and never under the
-   repo's `config/tasks/` (denied by manifest policy).
+   repo's `config/tasks/` (denied by manifest policy) — even when no
+   repo root is passed explicitly, and even when a parent directory
+   is a symlink (the denial is checked on both the resolved and the
+   as-addressed path).
 6. Reports budget, run id, MP4 and shutdown results (see 4).
 7. On Muse agent restart, checks existing task state FIRST
    (`check_existing_task_state`): read-only scan of
    `model_cache/run_manifests/*.json` for the task id. It launches
    nothing and resumes nothing; the newest found state must be
-   reviewed with the user before any new attempt.
+   reviewed with the user before any new attempt. The result is
+   tri-state — `FOUND` / `CONFIRMED_ABSENT` / `UNKNOWN`: absence is
+   only confirmed when every search root was read cleanly (a missing
+   root, an unreadable or corrupt manifest, or incomplete coverage
+   all mean `UNKNOWN`, which blocks any new GPU request on the basis
+   of the check). Multiple manifests sort newest-first by reliable
+   time (`updated_at_utc`, else `created_at_utc`); file mtime is
+   never used.
 8. Records approvals and audit results, but never writes a
    credential value to a log (`adapters/muse/redact.py`).
 

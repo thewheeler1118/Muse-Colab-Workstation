@@ -40,7 +40,7 @@ from h3_budget import (  # noqa: E402
 from h3_task_spec import TaskSpec, load_task_spec  # noqa: E402
 
 from .paths import locate_task_spec_file  # noqa: E402
-from .redact import redact_text  # noqa: E402
+from .redact import redact_value  # noqa: E402
 
 BUDGET_TASK_CU = PROJECT_BUDGET_CU
 BUDGET_SESSION_CU = PER_SESSION_BUDGET_CU
@@ -148,6 +148,35 @@ def load_validated_task_spec(path: Path | str) -> TaskSpec:
     return load_task_spec(locate_task_spec_file(path))
 
 
+def _parse_manifest_time(data: dict):
+    """Reliable time for one manifest: (datetime|None, source).
+
+    The only reliable times are ISO-8601 UTC timestamps inside the
+    manifest itself — ``updated_at_utc`` (most recent activity) first,
+    then ``created_at_utc``. File mtime is NOT reliable (copies and
+    restores change it) and is never used: a manifest with no
+    parseable timestamp sorts after every timestamped one and is
+    flagged ``time_source="none"``.
+    """
+    import datetime
+
+    for field in ("updated_at_utc", "created_at_utc"):
+        raw = data.get(field)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        text = raw.strip()
+        try:
+            parsed = datetime.datetime.fromisoformat(
+                text[:-1] + "+00:00" if text.endswith("Z") else text
+            )
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc), field
+    return None, "none"
+
+
 def check_existing_task_state(
     production_task_id: str,
     search_roots: list[Path | str] | None = None,
@@ -160,45 +189,136 @@ def check_existing_task_state(
     found; launches nothing, resumes nothing, creates no GPU, and
     never reads credential, ledger-balance, or log contents — only
     manifest identity fields (run_id, task id, status, output name).
-    Callers must present the newest found state to the user before
-    any new attempt is authorized.
+
+    The result is tri-state (``state``):
+
+    - ``FOUND`` — at least one matching manifest. Callers must
+      present the newest found state to the user before any new
+      attempt is authorized.
+    - ``CONFIRMED_ABSENT`` — every search root was read cleanly and
+      no manifest matches. Only this state allows a new GPU request
+      to be considered (still only with explicit user approval).
+    - ``UNKNOWN`` — absence cannot be confirmed: no valid search
+      root was supplied, a root could not be read, a manifest file
+      could not be read or parsed, or coverage was otherwise
+      incomplete. ``allow_new_gpu_request`` is False: nothing may
+      request a new GPU on the basis of this check until the
+      coverage problem is resolved.
+
+    With several matching manifests they are sorted newest-first by
+    reliable time (``updated_at_utc``, else ``created_at_utc`` from
+    the manifest content); manifests with no parseable timestamp sort
+    last, flagged ``time_source="none"``.
     """
     if not production_task_id or not str(production_task_id).strip():
         raise ValueError("production_task_id is required for a restart check")
     roots = [Path(r) for r in (search_roots or [])]
     found: list[dict] = []
+    coverage: list[dict] = []
+    problems: list[str] = []
+    if not roots:
+        problems.append(
+            "no search roots provided: no directory was searched, so "
+            "absence cannot be confirmed"
+        )
     for root in roots:
-        manifest_dir = root / "model_cache" / "run_manifests"
-        if not manifest_dir.is_dir():
+        if not root.is_dir():
+            coverage.append(
+                {"root": str(root), "status": "unusable",
+                 "manifests_read": 0}
+            )
+            problems.append(f"search root is not a readable directory: {root}")
             continue
+        manifest_dir = root / "model_cache" / "run_manifests"
+        if manifest_dir.exists() and not manifest_dir.is_dir():
+            coverage.append(
+                {"root": str(root), "status": "unusable",
+                 "manifests_read": 0}
+            )
+            problems.append(
+                f"manifest path is not a directory: {manifest_dir}"
+            )
+            continue
+        if not manifest_dir.is_dir():
+            coverage.append(
+                {"root": str(root), "status": "no_manifest_dir",
+                 "manifests_read": 0}
+            )
+            continue
+        read = 0
         for manifest_path in sorted(manifest_dir.glob("*.json")):
             try:
                 data = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
+            except (ValueError, OSError) as exc:
+                problems.append(
+                    f"unreadable manifest {manifest_path.name}: {exc}"
+                )
                 continue
             if not isinstance(data, dict):
+                problems.append(
+                    f"manifest is not a JSON object: {manifest_path.name}"
+                )
                 continue
+            read += 1
             task_id = data.get("production_task_id") or data.get("task_id")
             if task_id != production_task_id:
                 continue
+            sort_time, time_source = _parse_manifest_time(data)
             found.append(
                 {
                     "run_id": data.get("run_id"),
                     "production_task_id": task_id,
                     "status": data.get("status"),
                     "manifest": manifest_path.name,
+                    "sort_time": (
+                        sort_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if sort_time is not None else None
+                    ),
+                    "time_source": time_source,
                 }
             )
-    return {
-        "production_task_id": production_task_id,
-        "manifests_found": len(found),
-        "manifests": found,
-        "action": (
+        coverage.append(
+            {"root": str(root), "status": "searched", "manifests_read": read}
+        )
+    # Newest first by reliable time; untimestamped manifests last,
+    # in filename order (deterministic either way).
+    timed = sorted(
+        (m for m in found if m["sort_time"] is not None),
+        key=lambda m: m["manifest"],
+    )
+    timed.sort(key=lambda m: m["sort_time"], reverse=True)
+    untimed = sorted(
+        (m for m in found if m["sort_time"] is None),
+        key=lambda m: m["manifest"],
+    )
+    found = timed + untimed
+    if found:
+        state = "FOUND"
+        action = (
             "review the newest manifest with the user before authorizing "
             "any new attempt; never auto-resume a GPU session"
-            if found
-            else "no existing state found for this task id"
-        ),
+        )
+    elif problems:
+        state = "UNKNOWN"
+        action = (
+            "state is UNKNOWN — do NOT request a new GPU on the basis "
+            "of this check; resolve first: " + "; ".join(problems)
+        )
+    else:
+        state = "CONFIRMED_ABSENT"
+        action = (
+            "no existing state found for this task id (all search roots "
+            "read clean); a new attempt still needs explicit user approval"
+        )
+    return {
+        "production_task_id": production_task_id,
+        "state": state,
+        "manifests_found": len(found),
+        "manifests": found,
+        "coverage": coverage,
+        "problems": problems,
+        "allow_new_gpu_request": state == "CONFIRMED_ABSENT",
+        "action": action,
     }
 
 
@@ -214,9 +334,13 @@ def status_report(
     """Build a redacted status report for a Muse conversation message.
 
     Contains only identifiers and outcomes: budget constants, run id,
-    delivered MP4 reference, and shutdown result. Any credential-shaped
-    substring in *note* (or in the shutdown detail) is redacted; no
-    raw log text is ever embedded.
+    delivered MP4 reference, and shutdown result. The whole report is
+    deep-redacted (``redact_value``): credential-shaped substrings
+    anywhere — in the note, in nested ``shutdown`` / ``budget``
+    dicts, in lists — are replaced, and any value under a
+    credential-named key is replaced wholesale. No raw log text is
+    ever embedded. ``token_id`` values stay visible by design (they
+    are truncated hashes, not tokens).
     """
     report = {
         "production_task_id": production_task_id,
@@ -224,9 +348,9 @@ def status_report(
         "budget": budget if budget is not None else assert_budget_constants(),
         "mp4_drive_file": mp4_drive_file,
         "shutdown": shutdown,
-        "note": redact_text(note),
+        "note": note,
     }
-    return report
+    return redact_value(report)
 
 
 # Backwards-compatible alias used by early drafts of the adapter docs.
