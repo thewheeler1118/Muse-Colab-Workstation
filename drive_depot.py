@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse, datetime as dt, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
 from auth_support import resolve_colab_executable
 from pathlib import Path
-from h3_contract import MODEL_FILES, sha256_file
+from h3_contract import MODEL_FILES, is_example_drive_id, resolve_drive_id, sha256_file
 from drive_api import file_digests, get_file_evidence, verify_uploaded_file
 
 ROOT=Path(__file__).resolve().parent
@@ -45,9 +45,14 @@ REQUIRED=tuple(sorted(MODEL_FILES))
 FOLDER_MIME='application/vnd.google-apps.folder'
 # Historical Drive file IDs from 2026-11-09 H3 report. A 404 means
 # inaccessible, NOT proven deleted. Reuse ONLY after checking HF/local hash.
+# Desensitized (TASK-RELEASE-V032 R4): the committed defaults are
+# EXAMPLE_* placeholders; live runs resolve the real IDs from
+# H3_DRIVE_ID_LEGACY_* env vars or model_cache/local_drive_ids.json
+# (gitignored, 0600). A placeholder means "not configured": the legacy
+# copy is skipped, never attempted against the placeholder.
 LEGACY_VAE_IDS={
-    'vae/minimax_h3_video_vae_int8_convrot.safetensors':'1j40DmcsWEmyHFjRiTjYYOIhZAuTX-iOA',
-    'vae/minimax_h3_audio_vae_fp32.safetensors':'1NMhFPyq7qVSmZWJZg506LArud39lMTCF',
+    'vae/minimax_h3_video_vae_int8_convrot.safetensors':resolve_drive_id('LEGACY_VIDEO_VAE'),
+    'vae/minimax_h3_audio_vae_fp32.safetensors':resolve_drive_id('LEGACY_AUDIO_VAE'),
 }
 
 
@@ -249,7 +254,7 @@ def maybe_copy_verified_legacy_vae(service, source:Path, target_folder:str, name
     scope is necessary for access to historical other-app-created files.
     """
     legacy_id=LEGACY_VAE_IDS.get(rel)
-    if not legacy_id or list_named(service,target_folder,name):return False
+    if not legacy_id or is_example_drive_id(legacy_id) or list_named(service,target_folder,name):return False
     try:
         old=get_file_evidence(service,legacy_id)
     except Exception as e:
@@ -928,10 +933,192 @@ def smoke(service,root_id:str)->dict:
             'size':entry['size'],'server_md5_verified':True,'no_gpu_created':True}
 
 
+# --- Read-only Drive ACL audit (TASK-RELEASE-V032 R4) -----------------
+# audit-acl checks that no audited object is shared with "anyone"
+# (public link access). It uses ONLY read-only Drive API calls:
+# files.get (metadata), files.list (children of audited folders) and
+# permissions.list. It never creates, updates, deletes or shares
+# anything. Any type == "anyone" permission fails closed (raises
+# RuntimeError / CLI exit 2). No targets resolvable, an unreadable
+# permissions response, or any API error also fails closed — an audit
+# that cannot see the ACLs must never print ACL_PRIVATE_VERIFIED.
+#
+# Audited objects (resolved at runtime, never hardcoded):
+#   * model depot root folder + the READY manifest document
+#     (model_cache/depot_config.json, or H3_DRIVE_ID_DEPOT_ROOT)
+#   * all four model weight files (model_cache/verified_manifest.json)
+#   * the finished-video archive folder Muse-H3-Video-Outputs
+#     (found by name under Drive root) + its run folders + their files
+#   * the ComfyUI source / wheelhouse cache folder
+#     Muse-H3-ComfyUI-Source (found by name) + its files (the wheelhouse
+#     bundles live inside it as files, so they are covered as children)
+#   * the lease-mirror folder Muse-H3-Lease-Registry (found by name) +
+#     its files (incl. h3_gpu_leases.json)
+# Folders are found by NAME (list_named, read-only) so no real folder
+# ID has to be committed. EXAMPLE_* placeholders are never audited:
+# they are not real assets and a permissions call on one would be
+# meaningless.
+
+class AclAuditUnavailable(RuntimeError):
+    """The audit could not resolve any target or could not read an ACL.
+    Distinct from an exposure: the caller must treat this as "unknown",
+    never as "private"."""
+
+
+AUDIT_FOLDER_NAMES = ("Muse-H3-Video-Outputs", "Muse-H3-ComfyUI-Source",
+                      "Muse-H3-Lease-Registry")
+
+
+def _list_children(service, folder_id: str) -> list:
+    """Direct children of a folder (read-only files.list, one page)."""
+    result = service.files().list(
+        q=f"'{folder_id}' in parents and trashed = false",
+        spaces='drive', pageSize=100,
+        fields='files(id,name,mimeType)',
+        supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+    if not isinstance(result, dict) or not isinstance(result.get('files'), list):
+        raise AclAuditUnavailable(
+            'Drive files.list returned an unusable response for a folder')
+    return result['files']
+
+
+def audit_targets(service) -> list:
+    """Resolve the (label, file_id) audit targets from local gitignored
+    config, the local ID file / env vars, and read-only name lookup.
+    Returns [] when nothing is resolvable (fresh checkout)."""
+    targets = []
+    seen = set()
+
+    def add(label, file_id):
+        if not file_id or is_example_drive_id(file_id) or file_id in seen:
+            return
+        seen.add(file_id)
+        targets.append((label, file_id))
+
+    if CFG.exists():
+        try:
+            cfg = read_json(CFG)
+        except Exception:
+            cfg = {}
+        add('depot_root', cfg.get('drive_root_folder_id'))
+        remote = cfg.get('remote_manifest') or {}
+        if isinstance(remote, dict):
+            add('ready_manifest', remote.get('drive_file_id'))
+    else:
+        add('depot_root', resolve_drive_id('DEPOT_ROOT'))
+    if READY.exists():
+        try:
+            manifest = read_json(READY)
+        except Exception:
+            manifest = {}
+        for entry in manifest.get('files', []) or []:
+            if isinstance(entry, dict):
+                add('model:' + str(entry.get('path', '')), entry.get('drive_file_id'))
+    for name in AUDIT_FOLDER_NAMES:
+        try:
+            found = list_named(service, 'root', name)
+        except Exception as e:
+            raise AclAuditUnavailable(
+                f'Could not look up Drive folder {name!r} by name: {e}')
+        for folder in found:
+            folder_id = folder.get('id')
+            add('folder:' + name, folder_id)
+            if not folder_id:
+                continue
+            for child in _list_children(service, folder_id):
+                child_id = child.get('id')
+                add(f'{name}/{child.get("name", "")}', child_id)
+                # Archive run folders: audit the delivered files inside
+                # each run folder too (one extra level, bounded to 100
+                # children per folder by _list_children).
+                if name == 'Muse-H3-Video-Outputs' and child.get('mimeType') == FOLDER_MIME:
+                    for grandchild in _list_children(service, child_id):
+                        add(f'{name}/{child.get("name", "")}/{grandchild.get("name", "")}',
+                            grandchild.get('id'))
+    return targets
+
+
+def _read_permissions(service, file_id: str) -> list:
+    result = service.permissions().list(
+        fileId=file_id, fields='permissions(id,type,role)',
+        supportsAllDrives=True).execute()
+    if not isinstance(result, dict) or not isinstance(result.get('permissions'), list):
+        raise AclAuditUnavailable(
+            f'Drive permissions.list returned an unusable response for {file_id!r}')
+    return result['permissions']
+
+
+def audit_acl(service, targets=None) -> dict:
+    """Audit every target's permissions (read-only). Returns
+    {'status': 'ACL_PRIVATE_VERIFIED', 'checked': [...], 'exposed': []}.
+    Raises RuntimeError('ACL_EXPOSED: ...') on any type == 'anyone'
+    permission, and AclAuditUnavailable when no target can be resolved
+    or an ACL cannot be read. Callers must treat either raise as a
+    failed audit, never as a pass."""
+    if targets is None:
+        targets = audit_targets(service)
+    targets = list(targets)
+    if not targets:
+        raise AclAuditUnavailable(
+            'No Drive ACL audit targets resolvable: no local depot config '
+            '(model_cache/depot_config.json / verified_manifest.json), no '
+            'H3_DRIVE_ID_* / local_drive_ids.json entries, and no named '
+            'folders found. Run the audit on the operator machine that '
+            'holds the depot config.')
+    checked = []
+    exposed = []
+    for label, file_id in targets:
+        meta = service.files().get(
+            fileId=file_id, fields='id,name,mimeType,trashed',
+            supportsAllDrives=True).execute()
+        if not isinstance(meta, dict):
+            raise AclAuditUnavailable(
+                f'Drive files.get returned an unusable response for {label!r}')
+        perms = _read_permissions(service, file_id)
+        entry = {'label': label, 'file_id': file_id,
+                 'name': meta.get('name'),
+                 'permissions': [{'type': p.get('type'), 'role': p.get('role')}
+                                 for p in perms if isinstance(p, dict)]}
+        checked.append(entry)
+        if any(p.get('type') == 'anyone' for p in perms if isinstance(p, dict)):
+            exposed.append(entry)
+    if exposed:
+        names = ', '.join(f"{e['label']} ({e.get('name') or e['file_id']})"
+                          for e in exposed)
+        raise RuntimeError(
+            f'ACL_EXPOSED: {len(exposed)} object(s) shared with anyone '
+            f'(public link access): {names}. Revoke the public permission '
+            f'before any further use.')
+    return {'status': 'ACL_PRIVATE_VERIFIED', 'checked': checked,
+            'exposed': [], 'targets': len(checked)}
+
+
+def run_audit_acl(service, targets=None) -> int:
+    """CLI-friendly wrapper: 0 when every target is private, 2 when any
+    object is exposed or the audit cannot run. Prints one machine-
+    readable status line first (ACL_PRIVATE_VERIFIED / ACL_EXPOSED /
+    ACL_AUDIT_UNAVAILABLE)."""
+    try:
+        report = audit_acl(service, targets=targets)
+    except AclAuditUnavailable as e:
+        print(f'ACL_AUDIT_UNAVAILABLE: {e}', flush=True)
+        return 2
+    except RuntimeError as e:
+        if str(e).startswith('ACL_EXPOSED'):
+            print(str(e), flush=True)
+            return 2
+        print(f'ACL_AUDIT_FAILED: {e}', flush=True)
+        return 2
+    print(f"ACL_PRIVATE_VERIFIED: {report['targets']} target(s) checked, "
+          f"0 exposed (depot root, model files, video archive, ComfyUI "
+          f"cache, lease mirror)", flush=True)
+    return 0
+
+
 def cli():
     p=argparse.ArgumentParser(description='Muse independent Drive H3 model depot; ZERO Colab GPU allocations '
                                             '(except remote-seed, which launches one temporary session)')
-    p.add_argument('action',choices=('account-check','init','smoke','seed','remote-seed','verify'))
+    p.add_argument('action',choices=('account-check','init','smoke','seed','remote-seed','verify','audit-acl'))
     p.add_argument('--colab-auth',choices=('oauth2','adc'),default='oauth2')
     p.add_argument('--allow-drive-write',action='store_true')
     p.add_argument('--allow-large-transfer',action='store_true')
@@ -967,6 +1154,11 @@ def cli():
         elif a.action=='remote-seed':
             config=read_json(CFG)
             result=remote_seed(s,config['drive_root_folder_id'],a.hf_revision)
+        elif a.action=='audit-acl':
+            # Read-only ACL audit (R4). The account check above already
+            # ran; a non-zero return fails closed. Never prints a
+            # success line the audit did not earn.
+            return run_audit_acl(s)
         else:result=verify_ready(s,ok)
         print(json.dumps(result,ensure_ascii=False,indent=2))
     except Exception as e:

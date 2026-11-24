@@ -19,9 +19,12 @@ How to work in this repo. Read this before changing anything.
    flat at the repo root so imports keep working. No package refactor in
    a drive-by commit; no stub modules under `workstation/`.
 5. **No credentials in git, ever.** No tokens, refresh tokens, cookies,
-   passwords, proxy auth, ADC files, ledgers, or session state. Drive
-   file IDs and hashes are fine (non-credential references). Run the
-   secret scan before every commit.
+   passwords, proxy auth, ADC files, ledgers, or session state. Real
+   Google Drive file/folder IDs are not committed either (v0.3.2 R4):
+   committed code/docs use `EXAMPLE_*` placeholders and live runs resolve
+   the real IDs from gitignored `model_cache/local_drive_ids.json` (0600)
+   or `H3_DRIVE_ID_*` env vars. Hashes (SHA-256/MD5) are fine
+   (non-credential references). Run the secret scan before every commit.
 6. **No third-party runtime.** No `colab-dfs-ext`, no Mac GPU relay, no
    Antigravity runtime, no model substitution without a pinned revision
    and its own PR (ADRs 004–005).

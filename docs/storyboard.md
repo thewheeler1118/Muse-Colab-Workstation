@@ -1,6 +1,6 @@
 # 少年壮志不言愁 — 原始 Drive 剧本摘录（2026-11-02）
 
-原始 Drive file ID: `1TTv-xyLsSLSvTL1jy9ewOFM4qXUKBwpP`。完整原文请以 Google Drive 中的 3,305 字节文件为准。
+原始 Drive file ID: `EXAMPLE_DRIVE_STORY_ID`。完整原文请以 Google Drive 中的 3,305 字节文件为准。
 
 主题：深圳马可波罗 vs 浙江稠州金租，11月3日 19:35，咪咕视频。Q 版动漫，与参考海报角色一致；竖屏 9:16。无对白，斗牛士红布与公牛冲锋，结尾海报绝对定格 2 秒，无任何其他内容。
 

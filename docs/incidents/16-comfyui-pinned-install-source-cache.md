@@ -4,7 +4,7 @@ STATUS: CONFIRMED_FIXED
 
 ## What happened
 
-ComfyUI is pinned to commit 61e524bdba7a4e193b45c2697f1af83c1beb86d6. The worker prefers the Drive source cache (tarball 12,670,714 B, sha256 3dca94e6…, Drive folder 1MJXkdxXl4EMdKKMf2edpyRJLzQkYT86D) with SHA verification, falling back to git clone; verify_comfyui_commit enforces the pinned commit. The A run restored from cache and validated /object_info.
+ComfyUI is pinned to commit 61e524bdba7a4e193b45c2697f1af83c1beb86d6. The worker prefers the Drive source cache (tarball 12,670,714 B, sha256 3dca94e6…, Drive folder EXAMPLE_DRIVE_COMFYUI_CACHE_FOLDER_ID) with SHA verification, falling back to git clone; verify_comfyui_commit enforces the pinned commit. The A run restored from cache and validated /object_info.
 
 ## Evidence
 
