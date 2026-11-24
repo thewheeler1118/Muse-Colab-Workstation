@@ -144,6 +144,117 @@ class AuthorizationTest(unittest.TestCase):
             Authorization(production_task_id="  ")
 
 
+class AuthorizationExtendedParamsTest(unittest.TestCase):
+    """TASK-RELEASE-V032 R5: explicit M1/M2/M4 wrapper options.
+
+    allocation_rounds None or 1..5, bootstrap_mode None or
+    bundled|legacy, keep_warm_ttl 0 (OFF, the default) or 60..900.
+    Every boundary is pinned: the values just inside and just
+    outside each range, plus bool / non-int / wrong-case rejections
+    (the adapter is stricter than the controller's int()/lower()
+    coercions by design — a wrong-typed value is refused at 0 CU,
+    never coerced into a live run).
+    """
+
+    def _spec_file(self, tmp: Path) -> Path:
+        path = tmp / "spec.json"
+        path.write_text(json.dumps(_valid_spec_dict()), encoding="utf-8")
+        return path
+
+    def _args(self, **auth_kwargs):
+        with tempfile.TemporaryDirectory() as d:
+            spec_path = self._spec_file(Path(d))
+            auth = Authorization(
+                production_task_id=FAKE_TASK_ID, confirm_live=True,
+                **auth_kwargs)
+            return to_wrapper_args(auth, spec_path)
+
+    def _flag_value(self, args, flag):
+        self.assertIn(flag, args)
+        return args[args.index(flag) + 1]
+
+    def test_allocation_rounds_boundaries_accepted_and_mapped(self):
+        for rounds in (1, 5):
+            args = self._args(allocation_rounds=rounds)
+            self.assertEqual(
+                self._flag_value(args, "--allocation-rounds"), str(rounds))
+
+    def test_allocation_rounds_out_of_range_rejected(self):
+        for rounds in (0, 6, -1):
+            with self.assertRaises(ValueError, msg=f"rounds={rounds}"):
+                Authorization(
+                    production_task_id=FAKE_TASK_ID,
+                    allocation_rounds=rounds)
+
+    def test_allocation_rounds_rejects_bool_and_non_int(self):
+        for rounds in (True, False, "3", 2.5, [3]):
+            with self.assertRaises(ValueError, msg=f"rounds={rounds!r}"):
+                Authorization(
+                    production_task_id=FAKE_TASK_ID,
+                    allocation_rounds=rounds)
+
+    def test_allocation_rounds_none_omits_flag(self):
+        args = self._args(allocation_rounds=None)
+        self.assertNotIn("--allocation-rounds", args)
+
+    def test_bootstrap_mode_accepted_and_mapped(self):
+        for mode in ("bundled", "legacy"):
+            args = self._args(bootstrap_mode=mode)
+            self.assertEqual(
+                self._flag_value(args, "--bootstrap-mode"), mode)
+
+    def test_bootstrap_mode_rejects_other_values(self):
+        for mode in ("Bundled", "BUNDLED", "warm", "", "bundled ", 1, True):
+            with self.assertRaises(ValueError, msg=f"mode={mode!r}"):
+                Authorization(
+                    production_task_id=FAKE_TASK_ID, bootstrap_mode=mode)
+
+    def test_bootstrap_mode_none_omits_flag(self):
+        args = self._args(bootstrap_mode=None)
+        self.assertNotIn("--bootstrap-mode", args)
+
+    def test_keep_warm_ttl_boundaries_accepted_and_mapped(self):
+        for ttl in (0, 60, 900):
+            args = self._args(keep_warm_ttl=ttl)
+            self.assertEqual(
+                self._flag_value(args, "--keep-warm-ttl"), str(ttl))
+
+    def test_keep_warm_ttl_out_of_range_rejected(self):
+        for ttl in (59, 901, -1, 1):
+            with self.assertRaises(ValueError, msg=f"ttl={ttl}"):
+                Authorization(
+                    production_task_id=FAKE_TASK_ID, keep_warm_ttl=ttl)
+
+    def test_keep_warm_ttl_rejects_bool_and_non_int(self):
+        for ttl in (True, False, "60", 60.0, None):
+            with self.assertRaises(ValueError, msg=f"ttl={ttl!r}"):
+                Authorization(
+                    production_task_id=FAKE_TASK_ID, keep_warm_ttl=ttl)
+
+    def test_keep_warm_ttl_defaults_to_zero_and_maps_explicit_off(self):
+        # The warm pool is OFF unless explicitly enabled: the default
+        # is 0, and 0 is mapped explicitly (never omitted into an
+        # ambiguous default).
+        auth = Authorization(production_task_id=FAKE_TASK_ID)
+        self.assertEqual(auth.keep_warm_ttl, 0)
+        self.assertIsNone(auth.allocation_rounds)
+        self.assertIsNone(auth.bootstrap_mode)
+        args = self._args()
+        self.assertEqual(self._flag_value(args, "--keep-warm-ttl"), "0")
+        self.assertNotIn("--allocation-rounds", args)
+        self.assertNotIn("--bootstrap-mode", args)
+
+    def test_all_three_params_map_together(self):
+        args = self._args(allocation_rounds=3, bootstrap_mode="legacy",
+                          keep_warm_ttl=300)
+        self.assertEqual(
+            self._flag_value(args, "--allocation-rounds"), "3")
+        self.assertEqual(
+            self._flag_value(args, "--bootstrap-mode"), "legacy")
+        self.assertEqual(
+            self._flag_value(args, "--keep-warm-ttl"), "300")
+
+
 class BudgetConstantsTest(unittest.TestCase):
     def test_budget_constants_unchanged(self):
         budget = assert_budget_constants()
