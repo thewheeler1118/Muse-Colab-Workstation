@@ -629,7 +629,14 @@ def run_cli(cmd, timeout=90, check=True):
     # ReadTimeout (read timeout=10) even though the runtime was healthy.
     # Raise it for every CLI subprocess; COLAB_CLI_REQUEST_TIMEOUT does
     # the same for the assign/usage requests in client.py.
-    env = {**os.environ, "REQUEST_TIMEOUT": "120", "COLAB_CLI_REQUEST_TIMEOUT": "180"}
+    # v0.3.2 R6: COLAB_CLI_ASSIGN_RETRIES defaults to "0". The vendored
+    # CLI retries a failed /tun/m/assign internally (default 3, 30s each
+    # + 10/20/40s backoff), so a 503 would sit inside the CLI for
+    # minutes before the controller ever sees it. With 0 the 503 returns
+    # to the controller at once, which fast-forwards G4 -> A100_HIGH_MEM
+    # within the same round. An operator-set value is passed through.
+    env = {**os.environ, "REQUEST_TIMEOUT": "120", "COLAB_CLI_REQUEST_TIMEOUT": "180",
+           "COLAB_CLI_ASSIGN_RETRIES": os.environ.get("COLAB_CLI_ASSIGN_RETRIES", "0")}
     p = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout, check=False, env=env)
     result = {"args": cmd, "returncode": p.returncode, "stdout": redact_sensitive_text(p.stdout), "stderr": redact_sensitive_text(p.stderr)}
     if check and p.returncode != 0:
@@ -5040,6 +5047,11 @@ def _run_variant_inner(args) -> dict:
         # back off (15s / 45s / 90s ±20%) before the next round; fatal,
         # quota and unknown errors fail fast with no retry. Transport
         # errors retry the same G4 once and never trigger A100 fallback.
+        # v0.3.2 R6: a CAPACITY_TRANSIENT (503) on the FIRST G4 attempt
+        # fast-forwards within the round straight to A100_HIGH_MEM —
+        # the second G4 attempt is skipped, never spent on the same
+        # empty pool. Round-level backoff and the total round count
+        # are unchanged.
         # (Skipped entirely when a warm session was claimed: the loop
         # below runs zero rounds, and the guard after it is warm-aware.)
         # Empty POSTs carry data=b'{}' via the vendored CLI patch (see
@@ -5084,7 +5096,18 @@ def _run_variant_inner(args) -> dict:
                 effective_deadline = None
         for round_idx in range(allocation_rounds):
             round_last_capacity_err = None
+            # v0.3.2 R6: set when attempt 0 fails with CAPACITY_TRANSIENT
+            # (503 = G4 pool empty this round). Attempt 1 is then skipped
+            # outright — a second G4 `new` would hit the same empty pool
+            # in the same second — and the loop cuts straight to
+            # A100_HIGH_MEM (attempt 2). Reset every round; the
+            # three-step GPU_ATTEMPT_PLAN (G4, G4, A100_HIGH_MEM) is
+            # unchanged, so a TRANSPORT_TRANSIENT at attempt 0 still
+            # retries G4 at attempt 1 (see below).
+            fast_forward_to_a100 = False
             for attempt in range(len(GPU_ATTEMPT_PLAN)):
+                if attempt == 1 and fast_forward_to_a100:
+                    continue
                 choice = choose_gpu_candidate(attempt)
                 chosen_key = choice["key"]
                 session = allocate_managed_session(choice, args.run_id)
@@ -5175,6 +5198,32 @@ def _run_variant_inner(args) -> dict:
                         )
                     if err_class == "CAPACITY_TRANSIENT":
                         round_last_capacity_err = (err_class, str(e))
+                        if attempt == 0:
+                            # v0.3.2 R6: first G4 attempt hit an empty
+                            # pool (503). Do not spend attempt 1 on a
+                            # second G4 `new` in the same round — it
+                            # would fail against the same pool — cut
+                            # straight to A100_HIGH_MEM (attempt 2).
+                            # Round-level backoff (M1) is untouched:
+                            # only the intra-round G4 retry is skipped.
+                            fast_forward_to_a100 = True
+                            ff_payload = {
+                                "session": session, "gpu": chosen_key,
+                                "skipped_gpu": "G4",
+                                "next_gpu": "A100_HIGH_MEM",
+                                "round": round_idx + 1,
+                                "error_class": err_class,
+                                "error": str(e)[:300],
+                            }
+                            record({"event": "GPU_ALLOCATION_CAPACITY_FAST_FORWARD",
+                                    "run_id": args.run_id, **ff_payload})
+                            try:
+                                from h3_run_manifest import record_audit_event
+
+                                record_audit_event(ROOT, args.run_id, "GPU_ALLOCATION_CAPACITY_FAST_FORWARD", ff_payload)
+                            except Exception:
+                                pass
+                            continue
                         if attempt < len(GPU_ATTEMPT_PLAN) - 1:
                             continue
                         break  # inner round exhausted on CAPACITY_TRANSIENT

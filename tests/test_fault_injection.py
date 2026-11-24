@@ -856,15 +856,23 @@ class GpuFaultTest(unittest.TestCase):
     def tearDown(self):
         self.h.close()
 
-    def test_capacity_503_retries_once(self):
+    def test_capacity_503_fast_forwards_to_a100(self):
         h = self.h
+        # v0.3.2 R6: a 503 on the first G4 attempt cuts straight to
+        # A100_HIGH_MEM in the same round — the second G4 attempt is
+        # never spent on the same empty pool. The successful
+        # allocation lands on A100, so the fake probe reports A100.
+        h.probe_output = "NVIDIA A100 80GB PCIe, 81920"
         h.new_failures = [RuntimeError("HTTP 503 Service Unavailable")]
         result = h.run()
         self.assertEqual(h.manifest_state()[0], "TASK_COMPLETED")
         # Two minted ids (one per attempt), one successful `new`, and the
         # run owns the second id.
         self.assertEqual(len(h.allocate_ids), 2)
-        self.assertEqual(len([c for c in h.run_cli_calls if c[0] == "new"]), 2)
+        news = [c for c in h.run_cli_calls if c[0] == "new"]
+        self.assertEqual(len(news), 2)
+        self.assertEqual(news[0][news[0].index("--gpu") + 1], "G4")
+        self.assertEqual(news[1][news[1].index("--gpu") + 1], "A100")
         self.assertEqual(h.manifest().get("session_id"), h.allocate_ids[1])
         self.assertEqual(h.stop_cli_sessions, [h.allocate_ids[1]])
 

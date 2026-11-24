@@ -19,6 +19,7 @@ FAKE_PY = """#!/bin/sh
 if [ "$1" = "-c" ]; then exit 0; fi
 echo "FAKE_PY ARGS: $@"
 echo "COLAB_CLI_PATH=$COLAB_CLI_PATH"
+echo "COLAB_CLI_ASSIGN_RETRIES=$COLAB_CLI_ASSIGN_RETRIES"
 """
 
 
@@ -88,10 +89,17 @@ class ScriptResolutionTest(unittest.TestCase):
             colab.chmod(0o755)
         return root
 
-    def _run(self, root, *args):
+    def _run(self, root, *args, env=None):
+        # Default env strips COLAB_CLI_ASSIGN_RETRIES so the "default
+        # is 0" assertion is hermetic against the operator's shell.
+        if env is None:
+            import os
+            env = {k: v for k, v in os.environ.items()
+                   if k != "COLAB_CLI_ASSIGN_RETRIES"}
         return subprocess.run(
             ["bash", str(root / "scripts" / "run_h3_task.sh"), *args],
-            capture_output=True, text=True, timeout=30, cwd=str(root))
+            capture_output=True, text=True, timeout=30, cwd=str(root),
+            env=env)
 
     def _full_args(self):
         return ["--confirm-live", "--production-task-id", "task-0071",
@@ -117,6 +125,20 @@ class ScriptResolutionTest(unittest.TestCase):
                       + str(root / ".venv-colab-cli/bin/colab"), r.stdout)
         self.assertIn("h3_controller.py run --execute", r.stdout)
         self.assertIn("--task-spec config/task_spec.example.json", r.stdout)
+        # v0.3.2 R6: the CLI's internal assign retries default to 0.
+        self.assertIn("COLAB_CLI_ASSIGN_RETRIES=0", r.stdout)
+
+    def test_assign_retries_operator_value_passes_through(self):
+        import os
+        root = self._layout([".venv-colab-cli"])
+        env = {**os.environ, "COLAB_CLI_ASSIGN_RETRIES": "2"}
+        r = subprocess.run(
+            ["bash", str(root / "scripts" / "run_h3_task.sh"),
+             *self._full_args()],
+            capture_output=True, text=True, timeout=30, cwd=str(root),
+            env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("COLAB_CLI_ASSIGN_RETRIES=2", r.stdout)
 
     def test_falls_back_to_venv(self):
         root = self._layout([".venv"])
