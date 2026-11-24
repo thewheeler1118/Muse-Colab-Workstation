@@ -640,45 +640,130 @@ def _is_transient_api_error(exc) -> bool:
     return isinstance(exc, (TimeoutError, urllib.error.URLError, ConnectionError))
 
 
+# TASK-RELEASE-V032 R1 (P0): /prompt submit idempotency, tri-state lookup.
+# The old lookup swallowed every failure and returned None, which the
+# submit path read as "absent" and answered with a resubmit -- a first
+# POST that had already landed could then be queued a second time.
+# The lookup is now explicitly tri-state, and "unknown" NEVER authorises
+# another POST: it only authorises bounded reconciliation polling.
+PROMPT_RECONCILE_MAX_ATTEMPTS = 5
+PROMPT_RECONCILE_BASE_DELAY_SEC = 1.0
+PROMPT_RECONCILE_MAX_DELAY_SEC = 8.0
+PROMPT_RECONCILE_MAX_TOTAL_SEC = 60.0
+
+
 def _find_prompt_by_client_id(server, client_id, timeout=10):
     """Look for a prompt submitted under client_id in /queue (running +
-    pending) and /history. Returns the prompt_id, or None when the
-    submit never landed. A lookup failure returns None — the caller
-    treats 'not found' as 'not submitted', never as proof of failure."""
+    pending) and /history.
+
+    Returns an explicit tri-state tuple:
+      ("found", prompt_id)  -- client_id seen in /queue or /history.
+      ("absent", None)      -- BOTH /queue and /history answered
+        successfully and neither contains client_id. This is the ONLY
+        state that may authorise a (single, checked) resubmit.
+      ("unknown", detail)   -- either lookup failed (timeout, connection
+        error, HTTP error, malformed payload) or returned a malformed
+        response. "Unknown" is NOT "absent": the prompt may already be
+        queued, so the caller must never resubmit on this state.
+
+    A hit in /queue alone proves "found" (no /history read needed); a
+    failure of either endpoint alone proves "unknown" even if the other
+    endpoint answered cleanly, because neither endpoint alone can prove
+    the prompt never landed."""
     try:
         queue = get_json(server + '/queue', timeout=timeout)
-    except Exception:
-        queue = {}
+    except Exception as e:  # noqa: BLE001 - any lookup failure is "unknown"
+        return ("unknown", f"/queue lookup failed: {type(e).__name__}: {str(e)[:300]}")
+    if not isinstance(queue, dict):
+        return ("unknown", f"/queue returned malformed response: {type(queue).__name__}")
     for key in ('queue_running', 'queue_pending'):
         for item in (queue or {}).get(key) or []:
             try:
                 if len(item) >= 4 and isinstance(item[3], dict) \
                         and item[3].get('client_id') == client_id:
-                    return item[1]
+                    return ("found", item[1])
             except Exception:
                 continue
     try:
         history = get_json(server + '/history', timeout=timeout)
-    except Exception:
-        return None
+    except Exception as e:  # noqa: BLE001 - any lookup failure is "unknown"
+        return ("unknown", f"/history lookup failed: {type(e).__name__}: {str(e)[:300]}")
+    if not isinstance(history, dict):
+        return ("unknown", f"/history returned malformed response: {type(history).__name__}")
     for pid, event in (history or {}).items():
         try:
             prompt = (event or {}).get('prompt') or []
             extra = prompt[3] if len(prompt) >= 4 else {}
             if isinstance(extra, dict) and extra.get('client_id') == client_id:
-                return pid
+                return ("found", pid)
         except Exception:
             continue
-    return None
+    return ("absent", None)
 
 
-def _submit_prompt(server, api, client_id):
+def _reconcile_prompt_after_timeout(server, client_id, proc=None):
+    """Bounded reconciliation polling after a /prompt read timeout whose
+    state is "unknown": re-probe /queue + /history with exponential
+    backoff until the state resolves to "found" or "absent", or the
+    budget is spent and the state is still "unknown".
+
+    Bounds (all explicit, no open-ended loop):
+      * at most PROMPT_RECONCILE_MAX_ATTEMPTS probes,
+      * at most PROMPT_RECONCILE_MAX_TOTAL_SEC wall time (checked before
+        each probe; a single probe may still block up to its own
+        get_json timeout),
+      * backoff delays PROMPT_RECONCILE_BASE_DELAY_SEC, doubling, capped
+        at PROMPT_RECONCILE_MAX_DELAY_SEC (1, 2, 4, 8, ... seconds).
+    A dead ComfyUI process (proc.poll() is not None, when a proc handle
+    is supplied) raises immediately instead of polling a dead server.
+    Returns the same tri-state tuple as _find_prompt_by_client_id; it
+    NEVER submits anything itself."""
+    deadline = time.monotonic() + PROMPT_RECONCILE_MAX_TOTAL_SEC
+    last_detail = "no reconciliation probe ran"
+    for attempt in range(1, PROMPT_RECONCILE_MAX_ATTEMPTS + 1):
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f'ComfyUI process exited (returncode {proc.poll()}) during '
+                f'/prompt reconciliation for client_id {client_id} after '
+                f'{attempt - 1} reconciliation probes; refusing a resubmit '
+                f'against a dead server')
+        if time.monotonic() >= deadline:
+            return ("unknown",
+                    f"reconciliation window ({PROMPT_RECONCILE_MAX_TOTAL_SEC}s) "
+                    f"expired after {attempt - 1} probes; last lookup error: {last_detail}")
+        state, detail = _find_prompt_by_client_id(server, client_id)
+        if state in ("found", "absent"):
+            return (state, detail)
+        last_detail = detail
+        print('H3_PROMPT_RECONCILE_UNKNOWN', attempt,
+              f'/{PROMPT_RECONCILE_MAX_ATTEMPTS}',
+              f'submit state still unknown for client_id {client_id}: {detail}',
+              flush=True)
+        if attempt == PROMPT_RECONCILE_MAX_ATTEMPTS:
+            return ("unknown", last_detail)
+        delay = min(PROMPT_RECONCILE_BASE_DELAY_SEC * (2 ** (attempt - 1)),
+                    PROMPT_RECONCILE_MAX_DELAY_SEC)
+        remaining = deadline - time.monotonic()
+        time.sleep(min(delay, max(0.0, remaining)))
+    return ("unknown", last_detail)
+
+
+def _submit_prompt(server, api, client_id, proc=None):
     """Submit once with a fixed client_id; on a read timeout the request
-    may already be queued, so check /queue + /history for this client_id
-    before any resubmit. At most one checked resubmit; a second timeout
-    fails closed naming the client_id so the operator can see whether
-    the prompt landed. A deterministic rejection (node_errors / no
-    prompt_id) raises immediately — a rejected workflow never queues."""
+    may already be queued, so resolve the state tri-state before any
+    resubmit (see _find_prompt_by_client_id):
+      * "found"   -> recover, return the existing prompt_id (no resubmit).
+      * "unknown" -> bounded reconciliation polling only
+        (_reconcile_prompt_after_timeout); NO further POST /prompt while
+        unknown; still unknown at the bound -> fail closed naming the
+        client_id so the operator can see whether the prompt landed.
+      * "absent"  -> at most one checked resubmit (two POSTs total);
+        a second timeout fails closed naming the client_id -- a third
+        submit is refused even if the second probe also says "absent".
+    A deterministic rejection (node_errors / no prompt_id) raises
+    immediately — a rejected workflow never queues. proc, when supplied,
+    is the ComfyUI subprocess handle used for the liveness check during
+    reconciliation (None = no liveness check possible)."""
     payload = {'prompt': api, 'client_id': client_id}
     for attempt in (1, 2):
         try:
@@ -686,20 +771,57 @@ def _submit_prompt(server, api, client_id):
         except Exception as e:  # noqa: BLE001 - transient vs fatal split below
             if not _is_transient_api_error(e):
                 raise
-            found = _find_prompt_by_client_id(server, client_id)
-            if found:
-                print('H3_PROMPT_RECOVERED', found,
-                      'submit timed out but the prompt is already queued/running', flush=True)
-                return {'prompt_id': found}
-            if attempt == 2:
+            if proc is not None and proc.poll() is not None:
                 raise RuntimeError(
-                    f'ComfyUI /prompt submit timed out twice and no queued/running '
-                    f'prompt was found for client_id {client_id}; refusing a third '
-                    f'submit. Last error: {type(e).__name__}: {str(e)[:300]}') from e
-            print('H3_PROMPT_RESUBMIT',
-                  f'submit attempt {attempt} timed out and no queued prompt was found '
-                  f'for this client_id; one checked resubmit', flush=True)
-            continue
+                    f'ComfyUI process exited (returncode {proc.poll()}) while '
+                    f'submitting /prompt for client_id {client_id}; refusing '
+                    f'a resubmit against a dead server. '
+                    f'Last error: {type(e).__name__}: {str(e)[:300]}') from e
+            state, detail = _find_prompt_by_client_id(server, client_id)
+            if state == "found":
+                print('H3_PROMPT_RECOVERED', detail,
+                      'submit timed out but the prompt is already queued/running', flush=True)
+                return {'prompt_id': detail}
+            reconciled = False
+            if state == "unknown":
+                # Never resubmit while unknown: poll (bounded) until the
+                # state resolves, or fail closed if it never does.
+                state, detail = _reconcile_prompt_after_timeout(
+                    server, client_id, proc=proc)
+                reconciled = True
+                if state == "found":
+                    print('H3_PROMPT_RECOVERED', detail,
+                          'submit timed out but reconciliation found the prompt '
+                          'already queued/running', flush=True)
+                    return {'prompt_id': detail}
+                if state == "unknown":
+                    raise RuntimeError(
+                        f'ComfyUI /prompt submit timed out and the queued/running '
+                        f'prompt for client_id {client_id} could not be verified: '
+                        f'reconciliation stayed unknown after '
+                        f'{PROMPT_RECONCILE_MAX_ATTEMPTS} attempts within '
+                        f'{PROMPT_RECONCILE_MAX_TOTAL_SEC}s; refusing a resubmit '
+                        f'while the state is unknown. '
+                        f'Last lookup error: {detail}') from e
+                # state == "absent" after reconciliation: fall through to
+                # the single checked resubmit below.
+            if state == "absent":
+                if attempt == 2:
+                    raise RuntimeError(
+                        f'ComfyUI /prompt submit timed out twice and no queued/running '
+                        f'prompt was found for client_id {client_id}; refusing a third '
+                        f'submit. Last error: {type(e).__name__}: {str(e)[:300]}') from e
+                print('H3_PROMPT_RESUBMIT',
+                      f'submit attempt {attempt} timed out and no queued prompt was found '
+                      f'for this client_id'
+                      + (' (verified by reconciliation after an unknown lookup)'
+                         if reconciled else '')
+                      + '; one checked resubmit', flush=True)
+                continue
+            raise RuntimeError(
+                f'ComfyUI /prompt submit timed out with unexpected lookup state '
+                f'{state!r} for client_id {client_id}; refusing a resubmit. '
+                f'Last error: {type(e).__name__}: {str(e)[:300]}') from e
         if result.get('node_errors') or not result.get('prompt_id'):
             raise RuntimeError('ComfyUI rejected workflow: ' + json.dumps(result, ensure_ascii=False)[:1800])
         return result
@@ -1421,10 +1543,14 @@ def execute_prompt(server,api:dict,timeout_sec:float,proc=None):
     is supplied), a non-transient error, 9 consecutive transient
     failures, or the overall deadline ends the poll. The submit itself
     is idempotent: a fixed client_id is used for the whole call, and
-    a read timeout on /prompt is resolved by checking /queue +
-    /history before any resubmit (see _submit_prompt)."""
+    a read timeout on /prompt is resolved tri-state by checking /queue +
+    /history before any resubmit (see _submit_prompt): "found" recovers,
+    "unknown" only gets bounded reconciliation polling and never a
+    resubmit, and only a proven "absent" permits one checked resubmit.
+    The proc handle is passed to _submit_prompt so reconciliation can
+    fail fast if ComfyUI dies mid-submit."""
     client_id='muse-h3-'+uuid.uuid4().hex
-    result=_submit_prompt(server,api,client_id)
+    result=_submit_prompt(server,api,client_id,proc=proc)
     pid=result['prompt_id'];end=time.monotonic()+timeout_sec
     print('INFERENCE_SUBMITTED',pid,flush=True)
     transient=0
