@@ -1,5 +1,5 @@
 {
-  "generated_utc": "2026-11-20",
+  "generated_utc": "2026-11-24",
   "source": "~/workspace/Muse_Colab_H3_Drive_v3/ (production baseline; verbatim copies SHA-256-verified at migration)",
   "note": "Every file in this repo except SOURCE_MANIFEST.json itself. Regenerate after any change; verify with scripts/verify_manifest.py. Excluded by policy and therefore absent: model weights, poster binary, MP4s, live ledgers/sessions/depot state, .venv, __pycache__.",
   "files": [
@@ -29,26 +29,32 @@
     },
     {
       "path": ".gitignore",
-      "size_bytes": 904,
-      "sha256": "015494328818556fdbd25c4286ef1a91a7a951fe086b91d8de6596ea87b100c7",
+      "size_bytes": 1123,
+      "sha256": "8dcc9d8550d620269c8885d2a6e6f22b279c563dd654546ef15cfadeb8b74aeb",
       "role": "Supporting file"
     },
     {
       "path": "AGENTS.md",
-      "size_bytes": 4933,
-      "sha256": "06e27518d1c826b5d185a940c0a4c38d2d26aaf9b799983e164b15451841a1d4",
+      "size_bytes": 5180,
+      "sha256": "a3661920ed677ec6ba9530fbf242ddc6298b6cadde92a13b25a6ae9e0d8f9d9f",
       "role": "Supporting file"
     },
     {
       "path": "CHANGELOG.md",
-      "size_bytes": 42517,
-      "sha256": "7025bfa0afbc38b41bfadc300b8603a7c99da97742bd5f4c56393ec2a0e8f5d3",
+      "size_bytes": 54012,
+      "sha256": "6d0430cd5d6339d8f5c279ae55a15ce4864e13b7c1746d84cd9c65442f634249",
+      "role": "Supporting file"
+    },
+    {
+      "path": "LICENSE",
+      "size_bytes": 12334,
+      "sha256": "7e26b4dd980fdad0011f1dd53eacbbb38f0db37a59443920b72334ef45d3ffc7",
       "role": "Supporting file"
     },
     {
       "path": "README.md",
-      "size_bytes": 8432,
-      "sha256": "8670675fef89073fd4514e1c82b3db516fda6c4357315dc3da50a2a5d80e14fa",
+      "size_bytes": 8963,
+      "sha256": "004a71f3e8f48a759e0800425d0cd3f2954f0538c2174fed19de7603c7ca7f2f",
       "role": "Supporting file"
     },
     {
@@ -59,8 +65,8 @@
     },
     {
       "path": "adapters/muse/README.md",
-      "size_bytes": 4133,
-      "sha256": "1509535456644a040339c224c87934687467cffadc54b86aa6382c84534dcb07",
+      "size_bytes": 5155,
+      "sha256": "f732e9e74ce85298b1c5f8069edc9f56138314db3542628ed32c9420f76d98a8",
       "role": "Supporting file"
     },
     {
@@ -71,8 +77,8 @@
     },
     {
       "path": "adapters/muse/adapter.py",
-      "size_bytes": 13897,
-      "sha256": "afb48bb3bc6afb15041be56b95134f95ab9189c2c3bc9630ec6663c0cb43e18a",
+      "size_bytes": 17676,
+      "sha256": "80eff225aad944711ca1c733aa9e95af147730a4254829609dd8c60b9e72aa36",
       "role": "Supporting file"
     },
     {
@@ -113,14 +119,14 @@
     },
     {
       "path": "config/comfyui_source_manifest.example.json",
-      "size_bytes": 1441,
-      "sha256": "bbdaf9d30e05f7306cfb1d9ac50c07f7e2afeb08b9194bfab5f0c663b0886baf",
+      "size_bytes": 1457,
+      "sha256": "712fdac0a747f4d9b30d965228c5bd7c66037592b0567d93cf79f2a0f01eb0be",
       "role": "Configuration (mirrors code constants; asserted by tests)"
     },
     {
       "path": "config/depot_config.example.json",
-      "size_bytes": 339,
-      "sha256": "84c5d4725645588c5828f4b0c74e44a8cf23a96f30764bfa8859088400aaaea6",
+      "size_bytes": 331,
+      "sha256": "aa3e03af6587514a7f2c2bef840fc58a237855f327ddf180290b964dfa31d01f",
       "role": "Configuration (mirrors code constants; asserted by tests)"
     },
     {
@@ -131,8 +137,8 @@
     },
     {
       "path": "config/model_manifest.example.json",
-      "size_bytes": 2517,
-      "sha256": "51ad1aee57248bbcced179626281f16c406d79ebbd60d1e3e88cbc77fa7aece5",
+      "size_bytes": 2523,
+      "sha256": "1a458a8cc5989f67bfaad7326921e035d01c8865e785c18b890c5454e452dd5f",
       "role": "Configuration (mirrors code constants; asserted by tests)"
     },
     {
@@ -155,8 +161,8 @@
     },
     {
       "path": "config/video_profiles.yaml",
-      "size_bytes": 789,
-      "sha256": "8d3a999650590314f368c5b179bcfb2165154a79527a5fb6b81f4e9859de4ec4",
+      "size_bytes": 910,
+      "sha256": "33848050d08b58121b2c65d413602380822b451f7e51e036d16dc54d4ec4a9c7",
       "role": "Configuration (mirrors code constants; asserted by tests)"
     },
     {
@@ -233,8 +239,8 @@
     },
     {
       "path": "docs/deployment_status.json",
-      "size_bytes": 4190,
-      "sha256": "73cb12b6430f82a2a94b4e830b1aefd3eabc484923eda3ed226eec71248d0ac0",
+      "size_bytes": 4639,
+      "sha256": "f85b6ea1219890344d974581fb19c7bbfb8f7b8890459443f3711d4a66c13365",
       "role": "Documentation / evidence"
     },
     {
@@ -335,8 +341,8 @@
     },
     {
       "path": "docs/incidents/16-comfyui-pinned-install-source-cache.md",
-      "size_bytes": 874,
-      "sha256": "467279b84e0c94d094785eda14fb6f8f46137041ba7cae961d7000746ec8f8e3",
+      "size_bytes": 878,
+      "sha256": "a6dc1b09ab0476adcb0f670dbb1ef8da7f5d69576daf2756f1d71653b93f725b",
       "role": "Documentation / evidence"
     },
     {
@@ -527,8 +533,8 @@
     },
     {
       "path": "docs/runbooks/production-run.md",
-      "size_bytes": 4339,
-      "sha256": "23b0782a20e21402167740c1ac1ce1df6f7800152230ed6f5a8f3ffb88edff08",
+      "size_bytes": 6236,
+      "sha256": "663dc1b5cbe61d6a468779d9ea0d5360134284714368aa7992cf30ef293ab3b6",
       "role": "Documentation / evidence"
     },
     {
@@ -551,8 +557,8 @@
     },
     {
       "path": "docs/storyboard.md",
-      "size_bytes": 1332,
-      "sha256": "8536845ec69e4ca12d1139abc5a4251ec233db9f87eba0c1b5553c544161ac6f",
+      "size_bytes": 1321,
+      "sha256": "ac54bcbb6d93aa3370898ba883e79abd5a00458098d19e2f14e9e7fbecb34194",
       "role": "Documentation / evidence"
     },
     {
@@ -563,26 +569,26 @@
     },
     {
       "path": "docs/upstream/COMPATIBILITY_MATRIX.md",
-      "size_bytes": 7995,
-      "sha256": "4f4eb4edd0c234fc04a2b348df9d7a2c071b27984b874c841e310502b487a5bc",
+      "size_bytes": 11025,
+      "sha256": "c6d2623e9c2e977f97f8ef8cbb15291f281ece0919dc1ac98a962a7ddb3c3101",
       "role": "Documentation / evidence"
     },
     {
       "path": "docs/upstream/PORTING_LEDGER.md",
-      "size_bytes": 27858,
-      "sha256": "0a7854353501bafa6d2786ec6af14cda0dbb29ea0739a994bdfa75f4d85bc16d",
+      "size_bytes": 39649,
+      "sha256": "562389e03b5855140e8516c0d7aafdd01cf57c1d1cbb6e82f369843e90ce2645",
       "role": "Documentation / evidence"
     },
     {
       "path": "docs/upstream/UPSTREAM_LOCK.json",
-      "size_bytes": 1941,
-      "sha256": "1b261ce29d09ab69861bd1f6cef1a854ba1ce0778519a29815fc71712589d779",
+      "size_bytes": 4092,
+      "sha256": "641043cf487d18db3ba43f11297ce065766f30041db8d2541692d465c3efa5f1",
       "role": "Documentation / evidence"
     },
     {
       "path": "docs/v3_progress.md",
-      "size_bytes": 11973,
-      "sha256": "097248cca709b1843a44fa944e13f2516d61d02be8c97509ea9d139580d9180a",
+      "size_bytes": 11968,
+      "sha256": "487129be3ac62e74cb739271d31debf22248a8f24a17edcf05f3ef7aebe55310",
       "role": "Documentation / evidence"
     },
     {
@@ -605,8 +611,8 @@
     },
     {
       "path": "drive_depot.py",
-      "size_bytes": 50153,
-      "sha256": "a2601cdbee20bdc125ce36746fed7843ee13f7c66df92283649f325088e0ece8",
+      "size_bytes": 59081,
+      "sha256": "34d3a21920069bb94656c883ca890bf0b8743a10c10a88ec1f80ac8772d91124",
       "role": "Model depot init / seed / verify via Drive API (READY manifest)"
     },
     {
@@ -659,14 +665,14 @@
     },
     {
       "path": "h3_contract.py",
-      "size_bytes": 10998,
-      "sha256": "70a8b726f25f62d07b04eaa94e5af31a40a8f36176b9cd3e18d0f0f9fbde82f1",
+      "size_bytes": 15972,
+      "sha256": "538528c9847a87edf75e5051b706e4c2f317bd76e6c61a863cef320c1dd76b66",
       "role": "Video contract, A/B prompts, API workflow patch (pinned nodes)"
     },
     {
       "path": "h3_controller.py",
-      "size_bytes": 279143,
-      "sha256": "8bd33a3bd8d1d7c4b5aa041955a7c58a8f615ec63979cadc4de231485f4c032c",
+      "size_bytes": 303144,
+      "sha256": "8c52f8a733dc6f10458cf28e80e68832fc1e5f05a360dd6c3bd01ff7e2a4e2e6",
       "role": "Run orchestration: preflight, allocation, mount, worker exec, download, stop"
     },
     {
@@ -737,8 +743,8 @@
     },
     {
       "path": "h3_job_state.py",
-      "size_bytes": 5092,
-      "sha256": "148408079f49742688ecaa320e4a6a5975c65dadd5baff50b25af3da6a098eff",
+      "size_bytes": 6497,
+      "sha256": "9b7824950fc237eb3c0c2841ab958fc844f32f3ca9522f8c61ac7587b073bbd3",
       "role": "Supporting file"
     },
     {
@@ -767,14 +773,14 @@
     },
     {
       "path": "h3_reliability.py",
-      "size_bytes": 30838,
-      "sha256": "f31edbf5bd1ec5008b54e51cbc4cee87f120254a2d196bd9526f8ef184b9c331",
+      "size_bytes": 46157,
+      "sha256": "f9f44171c4fa7ff40f9442ea86811ccb38155c3841554e0324378780dc75ba0e",
       "role": "Supporting file"
     },
     {
       "path": "h3_remote_worker.py",
-      "size_bytes": 99783,
-      "sha256": "4500fe65b289efef45f2e70d8c6c5d690e91f631f7acaeea928ffdbe438b49af",
+      "size_bytes": 107218,
+      "sha256": "ec9fc5d57e670038b1d2009411110f236e0d01b9e01fa3ec58d588b7d8446a3d",
       "role": "Remote ComfyUI worker: restore, inference, find_rendered_video, assemble"
     },
     {
@@ -839,8 +845,8 @@
     },
     {
       "path": "jobs/minimax_h3_ab/job.yaml",
-      "size_bytes": 1625,
-      "sha256": "d10e2c3a31d5fe23880ead215fd1c1cbd23eba118173edd3f3bad39cb0fd3b1a",
+      "size_bytes": 1600,
+      "sha256": "6034f22328cb27b5545d2e71dafdc5d5607896ed6dd217387740e798ed12609a",
       "role": "Job definition / facade"
     },
     {
@@ -848,6 +854,12 @@
       "size_bytes": 1171,
       "sha256": "b149891e645453a0a9eaab319edfe4cbcc7520c46503798ec24ebc768e498ca1",
       "role": "Job definition / facade"
+    },
+    {
+      "path": "model_cache/local_drive_ids.example.json",
+      "size_bytes": 1421,
+      "sha256": "e8e7db0c3fbdceef742f5bdeeaebbfa70ab59acc1cd8566b06dccdd14193079a",
+      "role": "Supporting file"
     },
     {
       "path": "model_cache/verified_manifest.example.json",
@@ -959,8 +971,8 @@
     },
     {
       "path": "scripts/manifest_policy.py",
-      "size_bytes": 4675,
-      "sha256": "6442d9996cf1f003137b159a2d99cac31fdd78833e73ad1f9548146045c874ee",
+      "size_bytes": 4860,
+      "sha256": "39e7f58ff004968b6c8b63bb5ef1ef1e73ceec2e2e7f98105fc2234ba38916b0",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -977,8 +989,8 @@
     },
     {
       "path": "scripts/reliability_report.py",
-      "size_bytes": 1662,
-      "sha256": "5bd1084766425a4e3869cb7d409aee098d5de81f54f409b542b64d01896bcce5",
+      "size_bytes": 4472,
+      "sha256": "34464469c3db553ab1faa2188d93a0b847bb07626c258c5afa34dcc86524d75f",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -989,20 +1001,20 @@
     },
     {
       "path": "scripts/run_h3_task.sh",
-      "size_bytes": 8534,
-      "sha256": "72e7848636a02401eafc5e39825d548cd4b6e8a879f101dd985aa226e45ebbfc",
+      "size_bytes": 9041,
+      "sha256": "9b2dd54f9884461105f249358e9f645583795628cce573c7be69299409027f30",
       "role": "Operator wrapper / offline check"
     },
     {
       "path": "scripts/secret_scan.py",
-      "size_bytes": 5012,
-      "sha256": "ea49216469315d043637a4a8111f69569d959210122164e5ef00cb41b6973cd8",
+      "size_bytes": 7030,
+      "sha256": "7ad5bfa7c053dfa0fccc447e712746ae79923225a6a9915d9915ef1d8d11354d",
       "role": "Operator wrapper / offline check"
     },
     {
       "path": "scripts/verify_drive.sh",
-      "size_bytes": 1369,
-      "sha256": "5adead763e93c0941c5c2036c89eecd2c0aa0e3729b9e4cb9a486f8587cf564e",
+      "size_bytes": 1692,
+      "sha256": "bb71fb6dce9cc6b0f19d389a440a10d2069a424f518430e5ef35b7d535f19989",
       "role": "Operator wrapper / offline check"
     },
     {
@@ -1157,8 +1169,8 @@
     },
     {
       "path": "tests/test_fault_injection.py",
-      "size_bytes": 61835,
-      "sha256": "35f312cbd20dcbe97ab58fa6fd7a9b63caf95259df4da93a7fe456b252d0522f",
+      "size_bytes": 62326,
+      "sha256": "ca912f8046051171fc2dec0c343167b2490b528c1e1627d44bf94f4e8f905d8c",
       "role": "Tests"
     },
     {
@@ -1181,8 +1193,8 @@
     },
     {
       "path": "tests/test_h3_production.py",
-      "size_bytes": 42378,
-      "sha256": "5ccdeb25de161826a95ec4ceac92efe80334517843648a885fffaba694c74119",
+      "size_bytes": 42351,
+      "sha256": "d0bf63e97a53cfab773e0ba81318980fda8c0bc14fb48d685b14f3c448aa5e20",
       "role": "Tests: production flow incl. worker marker, stop, parsers (63 tests)"
     },
     {
@@ -1199,8 +1211,8 @@
     },
     {
       "path": "tests/test_muse_adapter.py",
-      "size_bytes": 24690,
-      "sha256": "648ae78794c66a2f575f5a61f917e041d19e388854c534d9d0ee593192c2a82f",
+      "size_bytes": 29484,
+      "sha256": "d5d52d5ab1a240ddbc8c25b8051fd9c2ef0f6e8e572d0fb0f0b3d908e9d32b99",
       "role": "Tests"
     },
     {
@@ -1241,8 +1253,8 @@
     },
     {
       "path": "tests/test_run_h3_task_script.py",
-      "size_bytes": 6941,
-      "sha256": "3f0a86b40b3e3a7fb07d2558928c9318182cacaae82ed9b24a5a9514c90ddb85",
+      "size_bytes": 7981,
+      "sha256": "6e8fbc0afe6b9a299e30a1df839a5bee75d2734c8936a5c21137553c9deff38c",
       "role": "Tests"
     },
     {
@@ -1313,8 +1325,8 @@
     },
     {
       "path": "tests/test_v030_m1_backoff.py",
-      "size_bytes": 13106,
-      "sha256": "dadd68e3c8a2b72146bf392c0fefea07bfbbe7b36e2fc4cf3ccaa00e0b9dda7c",
+      "size_bytes": 13884,
+      "sha256": "a38c2c7d69b15084b5ef127ebda93bd2df5881387ae8c56323ecd942a81d13c8",
       "role": "Tests"
     },
     {
@@ -1351,6 +1363,42 @@
       "path": "tests/test_v031_hotfix_stage_contract.py",
       "size_bytes": 12476,
       "sha256": "ceba9ecd748ae6b655a8f9a951d1a04adff1a1b46886573a391d0d214881b2d2",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v032_r1_prompt_idempotency.py",
+      "size_bytes": 12384,
+      "sha256": "c5846692b2cb8eac177acf884f522a8b023141362477e98534b1a9a51fd759e7",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v032_r2_delivery_verify.py",
+      "size_bytes": 20767,
+      "sha256": "5456f19b975803f28a7e04516a7b59e41d525e3c05d23d9a9c952c637201c0e5",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v032_r3_reliability.py",
+      "size_bytes": 22138,
+      "sha256": "da4bef28ffd54399a97769605c2c536f5218bce97bf13dfdf47c14921f27c7a2",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v032_r4_desensitize_acl.py",
+      "size_bytes": 20673,
+      "sha256": "f2f2003fe7ac9b866d1f5e4e76cb050e0b6c51bfab903732a9d20fe7dee91a4a",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v032_r5_stage_ast_gate.py",
+      "size_bytes": 21038,
+      "sha256": "502dfbab3e7b453ead06ce47cdb34cb0391883a3b67f6d17860ae354259a8dfe",
+      "role": "Tests"
+    },
+    {
+      "path": "tests/test_v032_r6_g4_fallback.py",
+      "size_bytes": 6114,
+      "sha256": "99eedc14a75c373bd37fb435afb5ac7e94f600dd408bc3d0d527533bf4f4e78e",
       "role": "Tests"
     },
     {

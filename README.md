@@ -12,7 +12,7 @@ Colab GPUs from a Drive-hosted model depot.
 > `TASK-002_SECURITY_CI_PRODUCTION_REMEDIATION.md` no longer applies.
 > Do not treat the repo as private.
 
-## Status (2026-11-20, v0.3.0 — integrated engine, PR #18)
+## Status (2026-11-24, v0.3.2 — delivery correctness, de-identification & G4 fast fallback, Issue #21)
 
 - **Variant A: SUCCEEDED** — run `h3-20261112T090027Z-8b07c6` (G4,
   274 frames, A.mp4 7,453,808 B, SHA-256
@@ -31,10 +31,18 @@ Colab GPUs from a Drive-hosted model depot.
 - **Budget (task `h3-ab-20261111`)**: baseline 162.77 CU, max observed
   spent 18.58 CU (2026-11-12T09:49 UTC). Per-task independent 30 CU —
   never cumulative (see `docs/decisions/ADR-001.md`).
-- **Tests in this repo**: 1048 total (1046 via the CI entry point).
-  **1046 pass, 0 failures** (`python tests/run_ci_tests.py`); the
+- **Tests in this repo**: 1200 total (1200 via the CI entry point).
+  **1200 pass, 0 failures** (`python tests/run_ci_tests.py`); the
   plain discovery shows the same 2 asset-gated poster errors below —
   expected, not a regression.
+- **v0.3.2 (2026-11-24)**: R1 tri-state `/prompt` idempotency, R2
+  tamper-evident delivery + 0-CU local restore, R3 metric F lease
+  cross-check + Wilson 95% CI, R4 `EXAMPLE_*` de-identification +
+  Drive ACL `audit-acl` + Apache-2.0 `LICENSE`, R5 worker stage AST
+  gate + Muse adapter contract, R6 G4-first with
+  `COLAB_CLI_ASSIGN_RETRIES=0` fast fallback. No Colab GPU was
+  created and no CU was spent for this release; live E2E not yet run;
+  production not upgraded (see `CHANGELOG.md`).
 - **No Colab GPU was created, no CU was spent, and no Drive content was
   touched by this migration.**
 
@@ -57,7 +65,7 @@ those two tests with a printed reason. Run the plain discovery locally
 only if the poster asset is present:
 
 ```bash
-python -m unittest discover -s tests -q   # 1048 tests, 2 poster-gated errors in a clean checkout
+python -m unittest discover -s tests -q   # 1200 tests, 2 poster-gated errors in a clean checkout
 python tests/run_ci_tests.py               # 1046 tests, 0 failures, 2 asset-gated skips
 ```
 

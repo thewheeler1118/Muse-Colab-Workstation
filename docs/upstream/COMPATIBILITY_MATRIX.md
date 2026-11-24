@@ -2,10 +2,13 @@
 
 Locked refs: `docs/upstream/UPSTREAM_LOCK.json`.
 Ledger: `docs/upstream/PORTING_LEDGER.md`.
-License verdict: **no license found upstream — verbatim copying is
-NOT permitted** (see `adapters/antigravity/COMPATIBILITY.md`).
+License verdict: **upstream v0.3.0 carried no license; upstream
+v0.3.1 (2026-11-21) carries a standard Apache-2.0 `LICENSE`** (see
+`docs/upstream/UPSTREAM_LOCK.json`, `license_v0_3_1`). Muse v0.3.2
+adopts the canonical Apache-2.0 text at repo root `LICENSE` (R4).
 Porting mode is therefore behavioral specification + Muse-original
-reimplementation, per module, with tests.
+reimplementation, per module, with tests — no upstream code is
+imported verbatim.
 
 ## Version map
 
@@ -16,7 +19,8 @@ reimplementation, per module, with tests.
 | v0.2.0 (integrated) | v0.2.0 | `46a6a6d6` | 223 | INTEGRATED — F1–F5 merged via PR #18 (`0e3c114`, 2026-11-20); OFFLINE_VERIFIED (1046 tests at v0.3.0); live NOT_OBSERVED |
 | v0.2.1 (integrated) | v0.2.1 | `f043ebd0` | 223 | INTEGRATED — P1–P3 merged via PR #18; OFFLINE_VERIFIED; live NOT_OBSERVED |
 | v0.3.0 (integrated) | v0.3.0 | `2fa7ba48` | 232 | INTEGRATED — M1–M4 merged via PR #18; OFFLINE_VERIFIED; live NOT_OBSERVED (only in-repo live record is the FAILED v0.3.0 E2E run) |
-| v0.3.1 (Muse) | v0.3.1 | `418797a4` | 235 | REFERENCE ONLY — R5 registers the tag (P0-1/P0-2/P1-3~P1-6); P0-2 adapted behaviourally (R5: `init` mapping + `read_job_state` tightening + Muse-original AST gate), the rest not imported; `LICENSE` Apache-2.0 at tag (see `PORTING_LEDGER.md`) |
+| v0.3.1 (Muse) | v0.3.1 | `418797a4` | 235 | REFERENCE ONLY at R5 — R5 registers the tag (P0-1/P0-2/P1-3~P1-6); P0-2 adapted behaviourally (R5: `init` mapping + `read_job_state` tightening + Muse-original AST gate); `LICENSE` Apache-2.0 at tag (see `PORTING_LEDGER.md`). P1-3~P1-6 were adapted behaviourally by v0.3.2 R1–R4 (see v0.3.2 row) |
+| v0.3.2 (Muse) | v0.3.1 | `418797a4` | 235 | INTEGRATED — P1-3 adapted (R1: tri-state `/prompt` idempotency, 18 tests), P1-4 adapted (R2: tamper-evident delivery + 0-CU local restore, 20 tests), P1-5 adapted (R3: metric F lease cross-check + Wilson 95% CI + startup breakdown, 15 tests), P1-6 adapted (R4: `EXAMPLE_*` desensitization + `audit-acl` + root Apache-2.0 `LICENSE`, 24 tests); P0-2 AST gate (R5, 12 tests) and R6 G4 second-level fallback (`COLAB_CLI_ASSIGN_RETRIES=0`, 6 tests) are Muse-original, not upstream items; OFFLINE_VERIFIED (1200 tests, 0 failures); live NOT_OBSERVED |
 
 ## File inventory (verified 2026-11-20, names only)
 
