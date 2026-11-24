@@ -81,6 +81,32 @@ Rules
   scopes the runs, so a task with no runs inside the window cannot be
   judged and is listed separately (`f_time_window_excluded_tasks`)
   instead of being counted as a failure.
+- Metric F cross-checks the GPU lease registry
+  (`model_cache/h3_gpu_leases.json`, TASK-RELEASE-V032 R3): for the
+  same production_task_id (and its run_ids), any lease with real
+  allocation evidence that is not confirmed STOPPED fails F — that
+  includes warm_idle / WARM_POOLED sessions not yet stopped and
+  recycled, and leases whose session_id was never written back to any
+  manifest. The only carve-out is a lease already confirmed STOPPED:
+  the P0-B pre-registration path marks a failed `colab new` STOPPED
+  once the live-list check confirms no remote session exists, and
+  that is not a leak. A missing or unreadable registry file is
+  fail-safe, not a silent pass: F is judged from manifest/audit
+  evidence only and the absence is recorded on every verdict
+  (`lease_evidence`: "missing" / "corrupt") and on the metric
+  (`lease_cross_check`).
+- Every ratio metric carries both the legacy `confidence_interval_95`
+  list and a `wilson_95_ci` dict {"lower", "upper"} (None when the
+  denominator is 0): the same two-sided 95% Wilson interval, in both
+  shapes, so existing readers keep working. The report also carries
+  an `a_vs_f_comparison` side-by-side summary of metrics A and F
+  (different denominators — runs vs tasks — never pooled), a
+  `startup_mode_breakdown` (cold_start vs warm_reuse vs unknown, each
+  with first-attempt and eventual rates), and the honest F 95%
+  conclusion as `f_95_verified` / `f_95_status`
+  ("F_95_VERIFIED" / "F_95_NOT_VERIFIED") / `f_95_evidence`. With zero
+  failures a two-sided 95% Wilson lower bound >= 0.95 needs 73/73
+  successes (73/73 -> 0.95; 60/60 reaches only 0.9398).
 
 Current honest baseline (2026-11-13): the only real production runs
 (A first-attempt success, B interrupted by a VM restart) predate the
@@ -124,11 +150,27 @@ def wilson_interval(k: int, n: int, z: float = WILSON_Z) -> list[float] | None:
             round(min(1.0, (centre + margin) / denom), 4)]
 
 
+def wilson_95_ci(k: int, n: int, z: float = WILSON_Z) -> dict | None:
+    """Two-sided 95% Wilson score interval as {"lower", "upper"}.
+
+    The same interval `wilson_interval` returns as a list, in dict
+    form (TASK-RELEASE-V032 R3). None when n <= 0: no sample, no
+    interval. Known anchors: 73/73 -> {"lower": 0.95, "upper": 1.0}
+    (the zero-failure threshold for a 0.95 lower bound); 60/60 ->
+    lower 0.9398; 0/10 -> {"lower": 0.0, "upper": 0.2775}.
+    """
+    interval = wilson_interval(k, n, z)
+    if interval is None:
+        return None
+    return {"lower": interval[0], "upper": interval[1]}
+
+
 def _metric(k: int, n: int, definition: str,
             unknown_reason: str | None = None) -> dict:
     if n == 0:
         return {"definition": definition, "rate": None, "numerator": k,
                 "denominator": 0, "confidence_interval_95": None,
+                "wilson_95_ci": None,
                 "status": "UNKNOWN",
                 "unknown_reason": unknown_reason or "empty sample"}
     interval = wilson_interval(k, n)
@@ -136,7 +178,8 @@ def _metric(k: int, n: int, definition: str,
               else "INSUFFICIENT_SAMPLE")
     return {"definition": definition, "rate": round(k / n, 4),
             "numerator": k, "denominator": n,
-            "confidence_interval_95": interval, "status": status,
+            "confidence_interval_95": interval,
+            "wilson_95_ci": wilson_95_ci(k, n), "status": status,
             "unknown_reason": None}
 
 
@@ -337,6 +380,112 @@ def _evaluate_run_f(root: Path, manifest: dict) -> list[str]:
     return failed
 
 
+# ---------------------------------------------------------------------------
+# Metric F lease cross-check (TASK-RELEASE-V032 R3).
+#
+# The run manifest is not the only allocation evidence: the GPU lease
+# registry (h3_gpu_lease_registry.REGISTRY_PATH) records every session
+# the controller pre-registered BEFORE `colab new`, keyed by
+# session_id, with run_id / production_task_id and a
+# last_confirmed_state that only becomes STOPPED on a confirmed stop
+# verdict. A manifest whose session_id was never written back (the
+# pre-registration write failed, or the run died in the allocation
+# window) still leaves a lease behind — the registry is what catches
+# that GPU. There is no literal `pending_session_id` field anywhere in
+# this codebase: the pre-registration evidence IS the lease entry
+# itself (session_id pre-registered, deadline_final False,
+# last_confirmed_state ACTIVE until the outcome is known), plus the
+# manifest's session_id written by the same pre-registration step
+# (TASK-HOTFIX-016 P0-B).
+# ---------------------------------------------------------------------------
+
+LEASE_REGISTRY_NAME = "h3_gpu_leases.json"
+
+
+def _load_gpu_leases(root: Path) -> tuple[list[dict], dict]:
+    """Read the lease registry under `root`.
+
+    Returns (leases, status); status is {"registry": "present" |
+    "missing" | "corrupt", "detail": str | None, "leases_total": int}.
+    Missing or unreadable is fail-safe, never a crash: the caller
+    judges F from manifest/audit evidence only and records the gap.
+    """
+    path = root / "model_cache" / LEASE_REGISTRY_NAME
+    if not path.is_file():
+        return [], {"registry": "missing",
+                    "detail": ("no lease evidence: "
+                               "model_cache/h3_gpu_leases.json not found; "
+                               "F judged from manifest/audit evidence only"),
+                    "leases_total": 0}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("leases"), list):
+            raise ValueError(
+                "lease registry is not a lease document (leases list missing)")
+        leases = [x for x in data["leases"] if isinstance(x, dict)]
+        return leases, {"registry": "present", "detail": None,
+                        "leases_total": len(leases)}
+    except Exception as e:  # noqa: BLE001 - fail-safe, recorded by caller
+        return [], {"registry": "corrupt",
+                    "detail": (f"no lease evidence: lease registry unreadable "
+                               f"({type(e).__name__}); F judged from "
+                               "manifest/audit evidence only"),
+                    "leases_total": 0}
+
+
+def _lease_is_outstanding(lease: dict) -> bool:
+    """True unless the lease is confirmed STOPPED.
+
+    Only a confirmed STOPPED verdict clears allocation evidence. A
+    missing/unknown state is outstanding (fail-closed): it is
+    unconfirmed, not proven absent. This is the exact split the P0-B
+    pre-registration path relies on — a failed `colab new` whose
+    live-list check confirmed no remote session is marked STOPPED (not
+    a leak), while anything still ACTIVE — including warm_idle /
+    WARM_POOLED sessions not yet stopped and recycled — is a live,
+    possibly billable GPU.
+    """
+    return lease.get("last_confirmed_state") != "STOPPED"
+
+
+def _leases_for_task(leases: list[dict], task_id: str,
+                     run_ids: list[str], session_ids: set[str]) -> list[dict]:
+    """Leases belonging to one task: by production_task_id, by run_id
+    (including warm_run_ids, which survive a warm-pool claim that
+    rewrites run_id / production_task_id), or by a session_id that
+    appears on one of the task's manifests."""
+    run_id_set = set(run_ids)
+    matched: list[dict] = []
+    for lease in leases:
+        lease_runs = {lease.get("run_id")}
+        lease_runs |= set(lease.get("warm_run_ids") or [])
+        if (lease.get("production_task_id") == task_id
+                or lease_runs & run_id_set
+                or (lease.get("session_id")
+                    and lease.get("session_id") in session_ids)):
+            matched.append(lease)
+    return matched
+
+
+def _lease_failure_reason(lease: dict, manifest_session_ids: set[str]) -> str:
+    """One failed_condition naming the outstanding lease and why it
+    counts: real allocation evidence, not confirmed STOPPED."""
+    sid = lease.get("session_id") or "<unknown>"
+    run_id = lease.get("run_id") or "<unknown>"
+    state = lease.get("last_confirmed_state")
+    warm = lease.get("warm_idle") is True
+    if sid not in manifest_session_ids:
+        where = (f"lease-only evidence: session {sid} was never written "
+                 f"back to any manifest session_id for this task")
+    else:
+        where = f"session {sid}"
+    warm_note = " (warm_idle: not yet stopped/recycled)" if warm else ""
+    return (f"lease: {where} (run {run_id}) has real allocation evidence "
+            f"but is not confirmed STOPPED "
+            f"(last_confirmed_state={state}, warm_idle={warm}, "
+            f"deadline_final={lease.get('deadline_final')}){warm_note}")
+
+
 def _evaluate_task_f(root: Path, task_id: str, runs: list[dict],
                      ledger: dict, now_dt: datetime,
                      time_filter_active: bool) -> dict:
@@ -428,6 +577,38 @@ def _evaluate_task_f(root: Path, task_id: str, runs: list[dict],
                           f"project_budget_cu {budget}")
     except (TypeError, ValueError):
         failed.append("budget: ledger spend unreadable")
+    # (b2) TASK-RELEASE-V032 R3: lease-registry cross-check. The
+    # manifest-only check (b) above can only see sessions a manifest
+    # names; the registry also sees pre-registered sessions whose
+    # session_id was never written back, warm-pooled sessions, and
+    # leases whose run_id matches no manifest. Any task lease with
+    # real allocation evidence but no confirmed STOPPED fails F.
+    # A missing/corrupt registry adds no failure (fail-safe: judged
+    # from manifest/audit evidence only) but is recorded on the
+    # verdict so the gap is visible, never silent.
+    leases, lease_status = _load_gpu_leases(root)
+    run_ids = [m.get("run_id") or "" for m in runs]
+    manifest_session_ids = {m.get("session_id") for m in runs
+                            if m.get("session_id")}
+    task_leases = _leases_for_task(leases, task_id, run_ids,
+                                   manifest_session_ids)
+    outstanding = [x for x in task_leases if _lease_is_outstanding(x)]
+    verdict["lease_evidence"] = lease_status["registry"]
+    verdict["lease_checked"] = len(task_leases)
+    verdict["lease_outstanding"] = [
+        {"session_id": x.get("session_id"), "run_id": x.get("run_id"),
+         "last_confirmed_state": x.get("last_confirmed_state"),
+         "warm_idle": bool(x.get("warm_idle"))} for x in outstanding]
+    if lease_status["registry"] == "present":
+        verdict["lease_cross_check"] = (
+            f"checked {len(task_leases)} lease(s) for this task; "
+            f"{len(outstanding)} outstanding (not confirmed STOPPED)")
+    else:
+        verdict["lease_cross_check"] = (
+            f"unavailable ({lease_status['registry']}): "
+            f"{lease_status['detail']}")
+    for lease in outstanding:
+        failed.append(_lease_failure_reason(lease, manifest_session_ids))
     verdict["failed_conditions"] = failed
     verdict["verdict"] = "success" if not failed else "failure"
     return verdict
@@ -478,10 +659,82 @@ def _deadline_bound_e2e(root: Path, manifests: list[dict],
         and metric["confidence_interval_95"] is not None
         and metric["confidence_interval_95"][0] >= TARGET_RATE)
     metric["verdicts"] = verdicts
+    # R3: metric-level lease cross-check summary. The registry is one
+    # file for the whole root, so its status is read once here; the
+    # per-task counts come from the verdicts above (in-denominator
+    # tasks only).
+    leases, lease_status = _load_gpu_leases(root)
+    leases_checked = sum(v.get("lease_checked", 0) for v in verdicts)
+    outstanding_all: list[dict] = []
+    for v in verdicts:
+        for o in v.get("lease_outstanding", []):
+            outstanding_all.append({"production_task_id":
+                                    v["production_task_id"], **o})
+    if lease_status["detail"] is not None:
+        lease_detail = lease_status["detail"]
+    else:
+        lease_detail = (
+            f"{lease_status['leases_total']} lease(s) in registry; "
+            f"{leases_checked} matched tasks in scope; "
+            f"{len(outstanding_all)} outstanding (not confirmed STOPPED)")
+    metric["lease_cross_check"] = {
+        "registry": lease_status["registry"],
+        "detail": lease_detail,
+        "leases_total": lease_status["leases_total"],
+        "leases_checked": leases_checked,
+        "outstanding_leases": outstanding_all,
+    }
     return {"metric": metric,
             "in_flight_tasks": sorted(in_flight_tasks),
             "deadline_unknown_tasks": sorted(deadline_unknown_tasks),
             "time_window_excluded_tasks": sorted(window_excluded_tasks)}
+
+
+def _startup_mode(manifest: dict) -> str:
+    """cold_start / warm_reuse / unknown for one run (R3).
+
+    warm: coldstart_metrics or artifacts record warm_session_reused
+    True (the worker report carries the key only when warm; the
+    controller also stamps artifacts on the warm path). cold: a
+    coldstart report exists and says nothing about warm reuse.
+    unknown: no report and no warm flag — the mode cannot be proven,
+    so it is not guessed as cold.
+    """
+    cold = manifest.get("coldstart_metrics") or {}
+    arts = manifest.get("artifacts") or {}
+    if cold.get("warm_session_reused") is True \
+            or arts.get("warm_session_reused") is True:
+        return "warm_reuse"
+    if isinstance(manifest.get("coldstart_metrics"), dict):
+        return "cold_start"
+    return "unknown"
+
+
+def _startup_mode_breakdown(terminal: list[dict]) -> dict:
+    """Per-startup-mode first-attempt and eventual rates over terminal
+    runs, each a full _metric dict (with wilson_95_ci)."""
+    out: dict[str, dict] = {}
+    for mode in ("cold_start", "warm_reuse", "unknown"):
+        runs = [m for m in terminal if _startup_mode(m) == mode]
+        completed = [m for m in runs
+                     if m.get("task_state") == "TASK_COMPLETED"]
+        first = sum(1 for m in completed
+                    if m.get("recovery_generation", 0) == 0)
+        out[mode] = {
+            "runs": len(runs),
+            "completed": len(completed),
+            "first_attempt_success_rate": _metric(
+                first, len(runs),
+                "TASK_COMPLETED with recovery_generation == 0 / terminal "
+                f"runs in startup mode {mode}",
+                unknown_reason=f"no terminal {mode} runs in scope"),
+            "eventual_task_success_rate": _metric(
+                len(completed), len(runs),
+                "TASK_COMPLETED / terminal runs in startup mode "
+                f"{mode}",
+                unknown_reason=f"no terminal {mode} runs in scope"),
+        }
+    return out
 
 
 def compute_reliability(root: str | Path, production_task_id: str | None = None,
@@ -611,6 +864,57 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             f"{metric_b['denominator']} terminal runs; "
             f"the 95% target is not verified.")
 
+    # R3: the honest F 95% conclusion, mirroring target_95_* for B.
+    # F_95_VERIFIED only when F is MEASURED and its Wilson lower bound
+    # is >= 0.95; anything else stays F_95_NOT_VERIFIED — an
+    # unverified F is never reported as verified.
+    f_target_verified = bool(metric_f["target_verified"])
+    f_95_status = ("F_95_VERIFIED" if f_target_verified
+                   else "F_95_NOT_VERIFIED")
+    if metric_f["status"] == "UNKNOWN":
+        f_95_evidence = (
+            "No task in scope was authorised with a budget and a "
+            "deadline; the 95% deadline-bound target is unverified "
+            "(F_95_NOT_VERIFIED).")
+    elif metric_f["status"] == "INSUFFICIENT_SAMPLE":
+        f_95_evidence = (
+            f"Only {metric_f['denominator']} task(s) in scope; Wilson 95% "
+            f"interval for deadline-bound success is "
+            f"{metric_f['confidence_interval_95']} — too small a sample "
+            "to verify a 95% rate (F_95_NOT_VERIFIED).")
+    elif f_target_verified:
+        f_95_evidence = (
+            f"Wilson 95% lower bound for deadline-bound success is "
+            f"{metric_f['confidence_interval_95'][0]} (>= 0.95) over "
+            f"{metric_f['denominator']} tasks (F_95_VERIFIED).")
+    else:
+        f_95_evidence = (
+            f"Wilson 95% lower bound for deadline-bound success is "
+            f"{metric_f['confidence_interval_95'][0]} (< 0.95) over "
+            f"{metric_f['denominator']} tasks; the 95% target is not "
+            "verified (F_95_NOT_VERIFIED).")
+
+    def _rate_summary(metric: dict) -> dict:
+        summary = {"rate": metric["rate"],
+                   "numerator": metric["numerator"],
+                   "denominator": metric["denominator"],
+                   "wilson_95_ci": metric["wilson_95_ci"],
+                   "status": metric["status"]}
+        if "target_verified" in metric:
+            summary["target_verified"] = metric["target_verified"]
+        return summary
+
+    a_vs_f = {
+        "first_attempt_success_rate": _rate_summary(metric_a),
+        "deadline_bound_e2e_success_rate": _rate_summary(metric_f),
+        "note": ("A counts terminal runs (first-attempt success); F counts "
+                 "authorised tasks completing end to end within deadline. "
+                 "Different denominators — compared side by side, never "
+                 "pooled. With zero failures, a two-sided 95% Wilson lower "
+                 "bound >= 0.95 needs 73/73 successes (73/73 -> lower bound "
+                 "0.95; 60/60 reaches only 0.9398); any failure needs more."),
+    }
+
     # v0.2.0 F5: cold-start telemetry. A run counts when its manifest
     # carries a validated coldstart_metrics report. Latencies are
     # P50/P90 over the reported setup_seconds; the wheelhouse hit rate
@@ -678,6 +982,11 @@ def compute_reliability(root: str | Path, production_task_id: str | None = None,
             "deadline_bound_e2e_success_rate": metric_f,
         },
         "coldstart": coldstart,
+        "a_vs_f_comparison": a_vs_f,
+        "f_95_verified": f_target_verified,
+        "f_95_status": f_95_status,
+        "f_95_evidence": f_95_evidence,
+        "startup_mode_breakdown": _startup_mode_breakdown(terminal),
         "target_95_verified": target_verified,
         "target_95_evidence": target_evidence,
         "e_unknown_ledger_runs": sorted(e_unknown_runs),
