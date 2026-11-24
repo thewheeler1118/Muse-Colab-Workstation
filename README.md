@@ -19,8 +19,8 @@ Colab GPUs from a Drive-hosted model depot.
   `907a23dcf7fba719a3fd7d622c3477280698c2e1dd6a795c0f0ffd6593a63cbb`,
   poster-tail PSNR 31.38 dB). Archived to Drive
   `Muse-H3-Video-Outputs/h3-20261112T090027Z-8b07c6/` (folder
-  `1t4PXRCytvIvQAYzhZkXfxPI3sR63cYo8`, 6 files; A.mp4 Drive ID
-  `17tMh9D_a6a1tz0bPgPHZoaAI6YflyS_S`, local MD5 = server MD5
+  `EXAMPLE_DRIVE_VIDEO_OUTPUTS_FOLDER_ID`, 6 files; A.mp4 Drive ID
+  `EXAMPLE_DRIVE_VIDEO_A_MP4_ID`, local MD5 = server MD5
   `77f132fdf32c4a1a3ca1246b54371303`) — verified 2026-11-12 in the H3
   production session, not re-checked inside TASK-002.
 - **Variant B: CANCELLED** — run `h3-20261112T093207Z-7ab515` was
@@ -103,7 +103,7 @@ Muse-Colab-Workstation/
 | Final | 1080×1920, 274 frames, ~11.42 s |
 | GPU plan | G4, G4 retry, then A100 High-Mem once (A100 40GB never allowed) |
 | Budget | 30.00 CU per task, 25.00 CU per session, 0.75 CU cleanup reserve |
-| READY manifest (Drive) | `1jLYefARIDs8VLtsCXJPuTU7zHXw0coly`, depot root `1YmCfFOOsoMvREhdyHusBDy95C1eI4KE_` |
+| READY manifest (Drive) | `EXAMPLE_DRIVE_READY_MANIFEST_ID`, depot root `EXAMPLE_DRIVE_DEPOT_ROOT_ID` |
 
 Config YAMLs mirror these constants and are asserted by
 `tests/test_config_contract.py`.

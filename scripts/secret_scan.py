@@ -12,6 +12,21 @@ Rules (same shapes as the previous CI grep step):
   github-pat          ghp_ / github_pat_ token prefixes
   private-key-block   -----BEGIN ... PRIVATE KEY-----
   credential-assign   refresh_token / client_secret / etc. assigned a value
+  drive-file-id       real-shape Google Drive file/folder ID (33 chars,
+                      starts with '1', mixed case). Added TASK-RELEASE-V032
+                      R4: real Drive IDs locate private assets, so they must
+                      never be committed. Whitelist (by construction, not by
+                      an allow-list file):
+                      - EXAMPLE_* placeholders (never start with '1', and
+                        have no lowercase letter);
+                      - test fake ids ('abc', 'id1', 'fid-0', 'root123':
+                        too short / single case);
+                      - local incident filenames `NN-<slug>.md` (no
+                        uppercase letter, and followed by '.md');
+                      - hex hashes / commit SHAs (hex-only, and/or longer
+                        than the 33-char token, so the token-boundary
+                        lookarounds reject them).
+                      See contains_real_drive_id() below.
 
 Narrow, documented exception (TASK-002 §3.5): the redaction-regex table
 in reference_v2/colab_manager.py MUST contain those shapes — the patterns
@@ -35,6 +50,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Real-shape Google Drive file/folder ID: exactly 33 chars, starts with
+# '1', mixed case (the two lookaheads require one upper- and one
+# lower-case letter inside the token). Token-boundary lookarounds keep
+# longer hex hashes / commit SHAs out; (?!\.md) keeps local incident
+# filenames (NN-<slug>.md) out. EXAMPLE_* placeholders never start
+# with '1' and have no lowercase letter, so they are not matched.
+DRIVE_ID_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])1"
+    r"(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[a-z])"
+    r"[A-Za-z0-9_-]{32}(?!\.md)(?![A-Za-z0-9_-])")
+
+
+def contains_real_drive_id(text: str) -> bool:
+    """True when `text` contains a real-shape Google Drive file/folder ID.
+
+    EXAMPLE_* placeholders, test fake ids, incident filenames and hex
+    hashes are not flagged (see the module docstring for the whitelist).
+    Same classifier as h3_contract.looks_like_real_drive_id(); keep both
+    in sync.
+    """
+    return DRIVE_ID_PATTERN.search(text) is not None
+
+
 RULES = [
     ("ya29-access-token", "HIGH", re.compile(r"ya29\.[A-Za-z0-9_\-\.]{10,}")),
     ("github-pat", "HIGH", re.compile(r"(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
@@ -47,6 +85,7 @@ RULES = [
             r"""\s*["']?\s*[:=]\s*["'][A-Za-z0-9._\-/]{10,}"""
         ),
     ),
+    ("drive-file-id", "HIGH", DRIVE_ID_PATTERN),
 ]
 
 TEXT_SUFFIXES = {".py", ".sh", ".md", ".json", ".yaml", ".yml", ".toml", ".txt", ".cfg", ".ini"}

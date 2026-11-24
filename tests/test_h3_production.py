@@ -34,7 +34,7 @@ def _good_manifest():
               "server_verified": True, "hf_revision": "54472221d27c695fca9621b0c3ed52f06c4af707"} for p in MODEL_FILES]
     return {"status": "READY", "verification_method": "drive_v3_server_api",
             "account_verified": True, "verified_at_utc": "2026-11-10T01:00:00Z", "files": files,
-            "depot_root_id": "1YmCfFOOsoMvREhdyHusBDy95C1eI4KE_", "hf_revision": "54472221d27c695fca9621b0c3ed52f06c4af707"}
+            "depot_root_id": "EXAMPLE_DRIVE_DEPOT_ROOT_ID", "hf_revision": "54472221d27c695fca9621b0c3ed52f06c4af707"}
 
 
 def _api_stub():
@@ -81,8 +81,8 @@ class ProductionTest(unittest.TestCase):
                 validate_poster(bad)
 
     def test_storyboard_drive_id_locked(self):
-        self.assertEqual(STORY_DRIVE_ID, "1TTv-xyLsSLSvTL1jy9ewOFM4qXUKBwpP")
-        self.assertEqual(POSTER_DRIVE_ID, "1Punsy8qZKQktUcYyrNDpG46XMu_SWAJO")
+        self.assertEqual(STORY_DRIVE_ID, "EXAMPLE_DRIVE_STORY_ID")
+        self.assertEqual(POSTER_DRIVE_ID, "EXAMPLE_DRIVE_POSTER_ID")
 
     def test_project_budget_30cu(self):
         self.assertEqual(PROJECT_BUDGET_CU, 30.0)

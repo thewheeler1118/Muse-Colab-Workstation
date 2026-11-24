@@ -1085,7 +1085,45 @@ def preflight(args) -> dict:
         # existence (their SHA-256 is verified at materialisation,
         # still before any GPU).
         check("task_spec_ref_images", lambda: _check_task_spec_refs(spec))
-    check("storyboard_drive_id", lambda: STORY_DRIVE_ID == "1TTv-xyLsSLSvTL1jy9ewOFM4qXUKBwpP" or (_ for _ in ()).throw(RuntimeError("Storyboard Drive ID mismatch")))
+    def _storyboard_id():
+        # v0.3.2 R4: the real storyboard ID is no longer committed, so
+        # there is no hardcoded value to lock against. The check now
+        # asserts an ID is present and reports whether it is the offline
+        # EXAMPLE_* default (a live run must configure H3_DRIVE_ID_STORY
+        # or model_cache/local_drive_ids.json first) or a configured
+        # value. The value itself is never printed.
+        if not STORY_DRIVE_ID:
+            raise RuntimeError("Storyboard Drive ID is not configured")
+        if STORY_DRIVE_ID.startswith("EXAMPLE_"):
+            return ("EXAMPLE_* offline default; configure H3_DRIVE_ID_STORY "
+                    "or model_cache/local_drive_ids.json for live runs")
+        return "configured storyboard Drive ID present"
+
+    check("storyboard_drive_id", _storyboard_id)
+
+    def _drive_acl_audit():
+        # Live-only gate (TASK-RELEASE-V032 R4): the read-only ACL audit
+        # runs only when the depot is locally configured
+        # (model_cache/depot_config.json exists). Without local config
+        # there is nothing to audit, so the check passes with an explicit
+        # SKIPPED detail instead of failing offline/mock preflight for
+        # lack of credentials. In a live run the
+        # same_account_and_drive_ready check above already proved Drive
+        # is reachable, so a skip here means "no local depot config"
+        # and the operator must run `python drive_depot.py audit-acl`
+        # on the depot machine. An exposure raises here, which the
+        # check() wrapper records as a failed check and preflight then
+        # raises on (fail-closed, like every other gate).
+        import drive_depot as _drive_depot
+        if not _drive_depot.CFG.exists():
+            return ("ACL_AUDIT_SKIPPED: no local depot config "
+                    "(model_cache/depot_config.json); run "
+                    "`python drive_depot.py audit-acl` on the operator machine")
+        report = _drive_depot.audit_acl(_drive_depot.drive_service())
+        return (f"ACL_PRIVATE_VERIFIED: {report['targets']} target(s) "
+                f"checked, 0 exposed")
+
+    check("drive_acl_audit", _drive_acl_audit)
 
     def _workflow():
         if spec is None:
