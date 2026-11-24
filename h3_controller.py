@@ -1446,9 +1446,18 @@ def deliver_variant_to_drive_idempotent(variant: str, run_id: str, video_info: d
             manifest_artifacts = load_run_manifest(ROOT, run_id).get("artifacts") or {}
         except Exception:
             pass
-        return _existing_delivery_evidence(
+        # R2: the recorded file just re-verified against the validated
+        # local MP4 — persist the trusted output identity now, so a
+        # later re-verification can prove the bytes, not just the id.
+        trusted = _record_trusted_output(run_id, local_path, video_info)
+        evidence = _existing_delivery_evidence(
             variant, run_id, video_info, recorded_id,
             manifest_artifacts.get("drive_output_folder_id"), "recorded_id")
+        if trusted:
+            evidence.update({"output_size": trusted["output_size"],
+                             "output_md5": trusted["output_md5"],
+                             "output_sha256": trusted["output_sha256"]})
+        return evidence
     return deliver_variant_to_drive(variant, run_id, video_info,
                                     archive_fn=archive_fn, max_attempts=max_attempts, spec=spec)
 
@@ -1487,6 +1496,11 @@ def deliver_variant_to_drive(variant: str, run_id: str, video_info: dict,
             entry = (result.get("files") or {}).get(f"{variant}.mp4")
             if not entry or not entry.get("drive_file_id"):
                 raise RuntimeError("Archive returned no Drive file id for the MP4")
+            # R2: the local MP4 was just re-proven against video_info and
+            # the Drive archive succeeded — persist the trusted output
+            # identity (size / MD5 / SHA-256 of the validated bytes) so a
+            # later re-verification can prove the bytes, not just the id.
+            trusted = _record_trusted_output(run_id, local_path, video_info)
             evidence = {
                 "variant": variant, "run_id": run_id,
                 "local_video_validated": True,
@@ -1498,6 +1512,10 @@ def deliver_variant_to_drive(variant: str, run_id: str, video_info: dict,
                 "drive_output_folder_id": result.get("output_folder_id"),
                 "state": "DELIVERY_COMPLETED",
             }
+            if trusted:
+                evidence.update({"output_size": trusted["output_size"],
+                                 "output_md5": trusted["output_md5"],
+                                 "output_sha256": trusted["output_sha256"]})
             record({"event": "drive_upload_verified", "variant": variant, "run_id": run_id,
                     "drive_file_id": entry["drive_file_id"]})
             _manifest_update(run_id, artifacts={"delivery_state": "DURABLE_UPLOAD_VERIFIED"})
@@ -2311,12 +2329,13 @@ def recover_from_drive_archive(
             if not meta or meta.get("id") != file_id or meta.get("trashed"):
                 file_id = None
             else:
-                remote = artifacts.get("remote_upload") or {}
-                if remote.get("size") is not None and int(meta.get("size", -1)) != int(remote["size"]):
+                # R2: check the server metadata against the trusted
+                # manifest identity (canonical output_* first, worker
+                # remote_upload evidence as fallback) — an id alone is
+                # not proof the right bytes are there.
+                trusted = _trusted_output_identity(artifacts)
+                if _meta_mismatch_reason(meta, trusted, file_id, run_id) is not None:
                     file_id = None
-                if file_id and remote.get("md5"):
-                    if (meta.get("md5Checksum") or "").lower() != str(remote["md5"]).lower():
-                        file_id = None
                 if file_id and not folder_id:
                     parents = meta.get("parents") or []
                     if parents:
@@ -2365,6 +2384,27 @@ def recover_from_drive_archive(
     tmp_path = Path(tmp_name)
     try:
         _call_with_transient_retry(lambda: _download_drive_file(file_id, tmp_path, drive=svc))
+        # R2: hash-check the downloaded bytes against the trusted
+        # manifest identity before trusting them — the metadata check
+        # above proves what Drive stores, not the bytes that arrived.
+        # A mismatch raises into the handler below: no landing, no
+        # partial file at the destination.
+        from drive_api import file_digests
+
+        downloaded = file_digests(tmp_path)
+        downloaded_trusted = _trusted_output_identity(artifacts)
+        if downloaded_trusted.get("size") is not None and downloaded["size"] != downloaded_trusted["size"]:
+            raise RuntimeError(
+                f"recovered bytes size mismatch: downloaded {downloaded['size']}, "
+                f"trusted {downloaded_trusted['size']}")
+        if downloaded_trusted.get("md5") is not None and downloaded["md5"] != downloaded_trusted["md5"]:
+            raise RuntimeError(
+                f"recovered bytes md5 mismatch: downloaded {downloaded['md5']}, "
+                f"trusted {downloaded_trusted['md5']}")
+        if downloaded_trusted.get("sha256") is not None and downloaded["sha256"] != downloaded_trusted["sha256"]:
+            raise RuntimeError(
+                f"recovered bytes sha256 mismatch: downloaded {downloaded['sha256']}, "
+                f"trusted {downloaded_trusted['sha256']}")
         info = validate_final_video(
             tmp_path,
             expected_frames=spec.total_frames if spec is not None else 274,
@@ -2388,6 +2428,11 @@ def recover_from_drive_archive(
                 tmp_path.unlink()
             except OSError:
                 pass
+
+    # R2: the restored bytes passed the full local validation — persist
+    # the trusted output identity so later re-verification can prove
+    # the bytes, not just the Drive id.
+    restored_trusted = _record_trusted_output(run_id, dest_path, info)
 
     _manifest_update(
         run_id,
@@ -2425,6 +2470,10 @@ def recover_from_drive_archive(
         "local_frames": info.get("frame_count"),
         "recovered_from_drive_archive": True,
     }
+    if restored_trusted:
+        delivery.update({"output_size": restored_trusted["output_size"],
+                         "output_md5": restored_trusted["output_md5"],
+                         "output_sha256": restored_trusted["output_sha256"]})
     record({
         "event": "drive_archive_recovered_0gpu",
         "run_id": run_id,
@@ -2490,14 +2539,16 @@ def _resume_stopped_session(args, manifest: dict) -> dict:
             # TASK-006 P1-A: when the worker's remote-upload evidence is
             # on record, the metadata check also compares size + MD5
             # against it — an id alone is not proof the right bytes are
-            # there. Without that evidence the id + not-trashed check
-            # keeps its previous meaning.
-            remote = (manifest.get("artifacts") or {}).get("remote_upload") or {}
+            # there. R2: the trusted manifest identity (canonical
+            # output_* first, remote_upload as fallback) is the
+            # comparison source. Without that evidence the id +
+            # not-trashed check keeps its previous meaning.
+            trusted = _trusted_output_identity((manifest.get("artifacts") or {}))
             ok = meta.get("id") == drive_file_id and not meta.get("trashed")
-            if ok and remote.get("size") is not None:
-                ok = int(meta.get("size", -1)) == int(remote["size"])
-            if ok and remote.get("md5"):
-                ok = (meta.get("md5Checksum") or "").lower() == str(remote["md5"]).lower()
+            if ok and trusted.get("size") is not None:
+                ok = int(meta.get("size", -1)) == int(trusted["size"])
+            if ok and trusted.get("md5"):
+                ok = (meta.get("md5Checksum") or "").lower() == str(trusted["md5"]).lower()
             if ok:
                 # TASK-006 P1-A: the session is known STOPPED here (the
                 # tristate query said so); record it with the
@@ -3861,21 +3912,283 @@ def _provisional_ledger(live_balance_cu: float) -> dict:
     }
 
 
-def _verify_completed_delivery(manifest: dict) -> tuple[str, dict | str | None]:
+def _normalize_md5(value) -> str | None:
+    """Normalised MD5: 32 lowercase hex chars, or None when absent /
+    malformed. Drive returns lowercase hex, but callers and stored
+    evidence must never depend on case."""
+    if value is None:
+        return None
+    norm = str(value).strip().lower()
+    if len(norm) != 32 or any(c not in "0123456789abcdef" for c in norm):
+        return None
+    return norm
+
+
+def _normalize_sha256(value) -> str | None:
+    """Normalised SHA-256: 64 lowercase hex chars, or None."""
+    if value is None:
+        return None
+    norm = str(value).strip().lower()
+    if len(norm) != 64 or any(c not in "0123456789abcdef" for c in norm):
+        return None
+    return norm
+
+
+def _trusted_output_identity(artifacts: dict) -> dict:
+    """The trusted identity of the delivered MP4, from the manifest.
+
+    Priority: the canonical output_size / output_md5 / output_sha256
+    (TASK-RELEASE-V032 R2, written at first local acceptance + Drive
+    archive), then the worker-side remote_upload evidence, then the
+    legacy local_sha256. A field is None when no source records it —
+    the caller then cannot check that field and must say so, never
+    invent a value."""
+    artifacts = artifacts or {}
+    remote = artifacts.get("remote_upload") or {}
+
+    def _size(raw):
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    size = _size(artifacts.get("output_size"))
+    if size is None:
+        size = _size(remote.get("size"))
+    md5 = _normalize_md5(artifacts.get("output_md5"))
+    if md5 is None:
+        md5 = _normalize_md5(remote.get("md5"))
+    sha256 = _normalize_sha256(artifacts.get("output_sha256"))
+    if sha256 is None:
+        sha256 = _normalize_sha256(remote.get("sha256"))
+    if sha256 is None:
+        sha256 = _normalize_sha256(artifacts.get("local_sha256"))
+    return {"size": size, "md5": md5, "sha256": sha256}
+
+
+def _recorded_output_identity_corrupt(artifacts: dict) -> str | None:
+    """Fail-closed check on the canonical output_* record itself: a
+    present-but-malformed value means the trusted record cannot be
+    relied on, so the delivery is lost, not merely unverifiable.
+    Returns the reason, or None when the record is usable."""
+    artifacts = artifacts or {}
+    if artifacts.get("output_md5") is not None and _normalize_md5(artifacts.get("output_md5")) is None:
+        return "recorded output_md5 is malformed (expected 32 lowercase hex chars)"
+    if artifacts.get("output_sha256") is not None and _normalize_sha256(artifacts.get("output_sha256")) is None:
+        return "recorded output_sha256 is malformed (expected 64 lowercase hex chars)"
+    if artifacts.get("output_size") is not None:
+        try:
+            int(artifacts.get("output_size"))
+        except (TypeError, ValueError):
+            return "recorded output_size is malformed (expected an integer byte count)"
+    return None
+
+
+def _meta_mismatch_reason(meta: dict, trusted: dict, drive_file_id: str,
+                          run_id: str) -> str | None:
+    """Compare Drive server metadata against the trusted manifest
+    identity. Any mismatch (or a missing checksum the trusted record
+    requires) is tamper/loss, not a transient error. Returns the
+    reason, or None when every recorded field matches. Fields the
+    trusted record does not have are not checked here."""
+    if trusted.get("size") is not None:
+        try:
+            remote_size = int(meta.get("size"))
+        except (TypeError, ValueError):
+            remote_size = -1
+        if remote_size != trusted["size"]:
+            return (f"Drive file {drive_file_id} for run {run_id} size mismatch: "
+                    f"server {remote_size}, trusted {trusted['size']}")
+    if trusted.get("md5") is not None:
+        remote_md5 = _normalize_md5(meta.get("md5Checksum"))
+        if remote_md5 is None:
+            return (f"Drive file {drive_file_id} for run {run_id} has no "
+                    f"md5Checksum but the trusted record requires md5 "
+                    f"{trusted['md5']}")
+        if remote_md5 != trusted["md5"]:
+            return (f"Drive file {drive_file_id} for run {run_id} md5 mismatch: "
+                    f"server {remote_md5}, trusted {trusted['md5']}")
+    if trusted.get("sha256") is not None:
+        remote_sha256 = _normalize_sha256(meta.get("sha256Checksum"))
+        if remote_sha256 is not None and remote_sha256 != trusted["sha256"]:
+            return (f"Drive file {drive_file_id} for run {run_id} sha256 mismatch: "
+                    f"server {remote_sha256}, trusted {trusted['sha256']}")
+    return None
+
+
+def _output_identity_artifacts(local_path: Path, info: dict | None) -> dict:
+    """Canonical trusted-output artifacts for a locally validated MP4:
+    output_size / output_md5 / output_sha256 computed from the file on
+    disk, plus the legacy local_sha256 / local_frames fields. The MD5
+    is always the normalised 32-char lowercase hex of the file bytes."""
+    from drive_api import file_digests
+
+    info = info or {}
+    digests = file_digests(Path(local_path))
+    sha256 = _normalize_sha256(info.get("sha256")) or digests["sha256"]
+    artifacts = {
+        "output_size": digests["size"],
+        "output_md5": digests["md5"],
+        "output_sha256": sha256,
+        "local_sha256": sha256,
+    }
+    if info.get("frame_count") is not None:
+        artifacts["local_frames"] = info["frame_count"]
+    return artifacts
+
+
+def _record_trusted_output(run_id: str, local_path: Path,
+                           info: dict | None = None) -> dict | None:
+    """Best-effort persistence of the trusted output identity into
+    run_manifest.json["artifacts"] (TASK-RELEASE-V032 R2). Never raises
+    into the delivery flow: a manifest write failure is recorded and
+    the caller keeps its own delivery verdict."""
+    try:
+        artifacts = _output_identity_artifacts(local_path, info)
+    except Exception as e:  # noqa: BLE001 - manifest must not break delivery
+        try:
+            record({"event": "trusted_output_record_failed", "run_id": run_id,
+                    "error": str(e)[:200]})
+        except Exception:
+            pass
+        return None
+    _manifest_update(run_id, artifacts=artifacts)
+    return artifacts
+
+
+def _restore_local_from_drive(manifest: dict, *, drive=None,
+                              validate_fn=None, meta=None):
+    """0-GPU / 0-CU restore of a missing local MP4 from its Drive
+    archive. Downloads to a temp file in the run output dir (reusing
+    the existing _download_drive_file read-only path — no new transport
+    layer), hash-checks the downloaded bytes against the trusted
+    manifest identity (size / MD5 / SHA-256 when recorded, else the
+    Drive metadata MD5), runs the full validate_final_video check
+    (frames / resolution / fps), and only then atomically replaces the
+    destination. Returns ("restored", info), ("lost", reason), or
+    ("unverifiable", reason). A failed validation or hash check never
+    leaves a partial file at the destination. This helper never
+    allocates a GPU and never retries: the caller (deliver_task's
+    transient retry) owns the retry policy."""
+    artifacts = manifest.get("artifacts") or {}
+    run_id = manifest.get("run_id") or ""
+    variant = manifest.get("variant") or ""
+    drive_file_id = artifacts.get("drive_file_id")
+    if not drive_file_id:
+        return "lost", f"run {run_id} records no drive_file_id; nothing to restore from"
+    try:
+        from drive_depot import drive_service, get_file_evidence
+
+        service = drive or drive_service()
+        if meta is None:
+            meta = get_file_evidence(service, drive_file_id)
+    except Exception as e:  # noqa: BLE001 - classified below
+        text = str(e)
+        if "404" in text or "notFound" in text:
+            return "lost", f"Drive file {drive_file_id} for run {run_id} is gone ({text[:200]})"
+        return "unverifiable", (f"Drive evidence lookup failed for run {run_id}: "
+                                f"{type(e).__name__}: {text[:200]}")
+    if not meta or meta.get("trashed"):
+        return "lost", f"Drive file {drive_file_id} for run {run_id} is missing or trashed"
+    trusted = _trusted_output_identity(artifacts)
+    mismatch = _meta_mismatch_reason(meta, trusted, drive_file_id, run_id)
+    if mismatch:
+        return "lost", mismatch
+    dest_dir = OUTPUT_ROOT / run_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"{variant}.mp4"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".recover_{variant}_", suffix=".mp4",
+                                    dir=str(dest_dir))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        try:
+            _download_drive_file(drive_file_id, tmp_path, drive=service)
+        except Exception as e:  # noqa: BLE001 - classified below
+            text = str(e)
+            if "404" in text or "notFound" in text:
+                return "lost", (f"Drive download for {drive_file_id} (run {run_id}) "
+                               f"failed: file gone ({text[:200]})")
+            return "unverifiable", (f"Drive download for {drive_file_id} (run {run_id}) "
+                                    f"failed: {type(e).__name__}: {text[:200]}")
+        from drive_api import file_digests
+
+        digests = file_digests(tmp_path)
+        if trusted.get("size") is not None and digests["size"] != trusted["size"]:
+            return "lost", (f"restored bytes for run {run_id} size mismatch: "
+                           f"downloaded {digests['size']}, trusted {trusted['size']}")
+        if trusted.get("md5") is not None and digests["md5"] != trusted["md5"]:
+            return "lost", (f"restored bytes for run {run_id} md5 mismatch: "
+                           f"downloaded {digests['md5']}, trusted {trusted['md5']}")
+        if trusted.get("sha256") is not None and digests["sha256"] != trusted["sha256"]:
+            return "lost", (f"restored bytes for run {run_id} sha256 mismatch: "
+                           f"downloaded {digests['sha256']}, trusted {trusted['sha256']}")
+        if trusted.get("md5") is None:
+            remote_md5 = _normalize_md5(meta.get("md5Checksum"))
+            if remote_md5 is not None and digests["md5"] != remote_md5:
+                return "lost", (f"restored bytes for run {run_id} md5 mismatch against "
+                               f"Drive metadata: downloaded {digests['md5']}, "
+                               f"server {remote_md5}")
+        spec = _spec_from_manifest(manifest)
+        validator = validate_fn
+        if validator is None:
+            from h3_video_qa import validate_final_video
+
+            validator = validate_final_video
+        try:
+            info = validator(
+                tmp_path,
+                expected_frames=spec.total_frames if spec is not None else 274,
+                expected_fps=spec.fps if spec is not None else 24,
+                expected_width=spec.output_width if spec is not None else 1080,
+                expected_height=spec.output_height if spec is not None else 1920)
+        except Exception as e:  # noqa: BLE001 - a failed QA is definitive
+            return "lost", (f"restored video for run {run_id} failed final validation: {e}")
+        os.replace(tmp_path, dest_path)
+        _record_trusted_output(run_id, dest_path, info)
+        try:
+            record({"event": "drive_archive_restored_0gpu", "run_id": run_id,
+                    "variant": variant, "drive_file_id": drive_file_id,
+                    "sha256": (info.get("sha256") or "")[:16]})
+        except Exception:
+            pass
+        return "restored", info
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _verify_completed_delivery(manifest: dict, restore_local: bool = False,
+                               drive=None, validate_fn=None) -> tuple[str, dict | str | None]:
     """Re-prove a TASK_COMPLETED run's recorded delivery (0 CU).
     Returns ("verified", evidence), ("lost", reason), or
-    ("unverifiable", reason). The Drive file must still exist and not
-    be trashed; when the local MP4 is still present it must verify
-    against the recorded file (size + MD5)."""
+    ("unverifiable", reason). The Drive file is always queried and
+    checked against the trusted manifest identity (not trashed, size
+    and normalised md5Checksum): any mismatch or tampering is "lost",
+    a transiently unreachable Drive query is "unverifiable". When the
+    local MP4 is present it must also verify against the recorded file
+    (size + MD5) and against the trusted identity. When the local MP4
+    is missing, restore_local=True downloads it back from Drive (0 GPU
+    / 0 CU, hash-checked and fully validated before it lands) and only
+    then may local_video_validated be True; restore_local=False (the
+    read-only probe default) never claims the local copy verified."""
     artifacts = manifest.get("artifacts") or {}
     drive_file_id = artifacts.get("drive_file_id")
     run_id = manifest.get("run_id") or ""
     if not drive_file_id:
         return "lost", f"run {run_id} is TASK_COMPLETED but records no drive_file_id"
+    corrupt = _recorded_output_identity_corrupt(artifacts)
+    if corrupt:
+        return "lost", f"run {run_id}: {corrupt}"
     try:
         from drive_depot import drive_service, get_file_evidence
 
-        service = drive_service()
+        service = drive or drive_service()
         meta = get_file_evidence(service, drive_file_id)
     except Exception as e:  # noqa: BLE001 - classified below
         text = str(e)
@@ -3884,27 +4197,65 @@ def _verify_completed_delivery(manifest: dict) -> tuple[str, dict | str | None]:
         return "unverifiable", f"Drive evidence lookup failed for run {run_id}: {type(e).__name__}: {text[:200]}"
     if not meta or meta.get("trashed"):
         return "lost", f"Drive file {drive_file_id} for run {run_id} is missing or trashed"
+    trusted = _trusted_output_identity(artifacts)
+    mismatch = _meta_mismatch_reason(meta, trusted, drive_file_id, run_id)
+    if mismatch:
+        return "lost", mismatch
     local_path = OUTPUT_ROOT / run_id / f"{manifest.get('variant') or ''}.mp4"
     if local_path.is_file():
         try:
-            from drive_api import verify_uploaded_file
+            from drive_api import file_digests, verify_uploaded_file
 
             verify_uploaded_file(service, drive_file_id, local_path)
+            local_digests = file_digests(local_path)
         except Exception as e:  # noqa: BLE001 - a mismatch is definitive
             return "lost", (f"recorded Drive file {drive_file_id} does not verify "
                            f"against the local MP4 for run {run_id}: {e}")
-    return "verified", {
-        "variant": manifest.get("variant"), "run_id": run_id,
-        "local_video_validated": True,
-        "drive_file_id": drive_file_id,
-        "drive_upload_verified": True,
-        "frames": artifacts.get("local_frames"),
-        "sha256": artifacts.get("local_sha256"),
-        "drive_output_folder_id": artifacts.get("drive_output_folder_id"),
-        "state": "DELIVERY_COMPLETED",
-        "reused_existing": True,
-        "reused_via": "task_completed_manifest",
-    }
+        if trusted.get("size") is not None and local_digests["size"] != trusted["size"]:
+            return "lost", (f"local MP4 for run {run_id} size mismatch: "
+                           f"local {local_digests['size']}, trusted {trusted['size']}")
+        if trusted.get("md5") is not None and local_digests["md5"] != trusted["md5"]:
+            return "lost", (f"local MP4 for run {run_id} md5 mismatch: "
+                           f"local {local_digests['md5']}, trusted {trusted['md5']}")
+        if trusted.get("sha256") is not None and local_digests["sha256"] != trusted["sha256"]:
+            return "lost", (f"local MP4 for run {run_id} sha256 mismatch: "
+                           f"local {local_digests['sha256']}, trusted {trusted['sha256']}")
+        return "verified", {
+            "variant": manifest.get("variant"), "run_id": run_id,
+            "local_video_validated": True,
+            "drive_file_id": drive_file_id,
+            "drive_upload_verified": True,
+            "frames": artifacts.get("local_frames"),
+            "sha256": artifacts.get("local_sha256"),
+            "drive_output_folder_id": artifacts.get("drive_output_folder_id"),
+            "state": "DELIVERY_COMPLETED",
+            "reused_existing": True,
+            "reused_via": "task_completed_manifest",
+        }
+    if not restore_local:
+        return "unverifiable", (
+            f"local MP4 missing for run {run_id} ({local_path}): the Drive file "
+            f"{drive_file_id} matches the trusted manifest identity, but the local "
+            f"copy was not restored (restore_local=False, read-only probe); "
+            f"local_video_validated is not claimed")
+    status, payload = _restore_local_from_drive(
+        manifest, drive=service, validate_fn=validate_fn, meta=meta)
+    if status == "restored":
+        info = payload
+        return "verified", {
+            "variant": manifest.get("variant"), "run_id": run_id,
+            "local_video_validated": True,
+            "drive_file_id": drive_file_id,
+            "drive_upload_verified": True,
+            "frames": info.get("frame_count", artifacts.get("local_frames")),
+            "sha256": info.get("sha256", artifacts.get("local_sha256")),
+            "drive_output_folder_id": artifacts.get("drive_output_folder_id"),
+            "state": "DELIVERY_COMPLETED",
+            "reused_existing": True,
+            "reused_via": "task_completed_manifest",
+            "restored_from_drive": True,
+        }
+    return status, payload
 
 
 def _wait_for_session_stopped(session_id: str,
@@ -4013,11 +4364,17 @@ def deliver_task(args) -> dict:
                                    _attempts_used(task_id), max_attempts, steps,
                                    "deliver loop exceeded its iteration guard; refusing to continue")
         runs = _task_runs(ROOT, task_id)
-        # 1. Reuse an already-delivered run (0 CU).
+        # 1. Reuse an already-delivered run (0 CU). R2: a plain
+        # --deliver is a read-only probe (restore_local=False) and
+        # never claims a missing local copy verified; --restore-local
+        # lets the verifier pull the local MP4 back from Drive (0 GPU
+        # / 0 CU, hash-checked and fully validated before it lands).
+        restore_local = bool(getattr(args, "restore_local", False))
         completed = [m for m in runs if m.get("task_state") == "TASK_COMPLETED"]
         for manifest in sorted(completed, key=lambda m: m.get("created_at_utc", ""), reverse=True):
             status, payload = _call_with_transient_retry(
-                lambda m=manifest: _verify_completed_delivery(m),
+                lambda m=manifest: _verify_completed_delivery(
+                    m, restore_local=restore_local),
                 max_attempts=5,
                 delays=(5, 10, 20, 30),
             )
@@ -5368,6 +5725,13 @@ def main():
     parser.add_argument("--auto-recover", action="store_true",
                         help="TASK-008: run as the deliver supervisor instead of a "
                              "single attempt (same loop as the deliver action).")
+    parser.add_argument("--restore-local", action="store_true",
+                        help="TASK-RELEASE-V032 R2, deliver only: when a "
+                             "TASK_COMPLETED run's local MP4 is missing, pull it "
+                             "back from its Drive archive (0 GPU / 0 CU, "
+                             "hash-checked and fully validated before it lands). "
+                             "Without this flag deliver is a read-only probe and "
+                             "never claims a missing local copy verified.")
     parser.add_argument("--max-task-attempts", type=int, default=DEFAULT_MAX_TASK_ATTEMPTS,
                         help="TASK-008: deliver / run --auto-recover: maximum GPU "
                              "attempts for the whole task (1..3, default 2).")
