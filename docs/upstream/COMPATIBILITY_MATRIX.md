@@ -2,20 +2,25 @@
 
 Locked refs: `docs/upstream/UPSTREAM_LOCK.json`.
 Ledger: `docs/upstream/PORTING_LEDGER.md`.
-License verdict: **no license found upstream — verbatim copying is
-NOT permitted** (see `adapters/antigravity/COMPATIBILITY.md`).
+License verdict: **upstream v0.3.0 carried no license; upstream
+v0.3.1 (2026-11-21) carries a standard Apache-2.0 `LICENSE`** (see
+`docs/upstream/UPSTREAM_LOCK.json`, `license_v0_3_1`). Muse v0.3.2
+adopts the canonical Apache-2.0 text at repo root `LICENSE` (R4).
 Porting mode is therefore behavioral specification + Muse-original
-reimplementation, per module, with tests.
+reimplementation, per module, with tests — no upstream code is
+imported verbatim.
 
 ## Version map
 
 | Muse | Upstream | Upstream commit | Files (upstream) | Status |
 |---|---|---|---|---|
 | v0.1.0 | — (baseline) | `61aa33a9` (own root commit) | 209 | RELEASED 2026-11-20 — [Release](https://github.com/thewheeler1118/Muse-Colab-Workstation/releases/tag/v0.1.0), tag `v0.1.0`, CI 6/6 on run 43782755112 |
-| v0.1.0 + adapter (Stage 1) | — | `61aa33a9` + `feat/muse-adapter` | 209 + adapter files | IN PROGRESS — this branch |
-| v0.2.0 (planned) | v0.2.0 | `46a6a6d6` | 223 | NOT STARTED — F1–F5, each its own PR |
-| v0.2.1 (planned) | v0.2.1 | `f043ebd0` | 223 | NOT STARTED — P1–P3 |
-| v0.3.0 (planned) | v0.3.0 | `2fa7ba48` | 232 | NOT STARTED — M1–M4 |
+| v0.1.0 + adapter (Stage 1) | — | `61aa33a9` + `feat/muse-adapter` | 209 + adapter files | MERGED — in main since the v0.3.0 release (PR #18); adapter unchanged by v0.3.1 |
+| v0.2.0 (integrated) | v0.2.0 | `46a6a6d6` | 223 | INTEGRATED — F1–F5 merged via PR #18 (`0e3c114`, 2026-11-20); OFFLINE_VERIFIED (1046 tests at v0.3.0); live NOT_OBSERVED |
+| v0.2.1 (integrated) | v0.2.1 | `f043ebd0` | 223 | INTEGRATED — P1–P3 merged via PR #18; OFFLINE_VERIFIED; live NOT_OBSERVED |
+| v0.3.0 (integrated) | v0.3.0 | `2fa7ba48` | 232 | INTEGRATED — M1–M4 merged via PR #18; OFFLINE_VERIFIED; live NOT_OBSERVED (only in-repo live record is the FAILED v0.3.0 E2E run) |
+| v0.3.1 (Muse) | v0.3.1 | `418797a4` | 235 | REFERENCE ONLY at R5 — R5 registers the tag (P0-1/P0-2/P1-3~P1-6); P0-2 adapted behaviourally (R5: `init` mapping + `read_job_state` tightening + Muse-original AST gate); `LICENSE` Apache-2.0 at tag (see `PORTING_LEDGER.md`). P1-3~P1-6 were adapted behaviourally by v0.3.2 R1–R4 (see v0.3.2 row) |
+| v0.3.2 (Muse) | v0.3.1 | `418797a4` | 235 | INTEGRATED — P1-3 adapted (R1: tri-state `/prompt` idempotency, 18 tests), P1-4 adapted (R2: tamper-evident delivery + 0-CU local restore, 20 tests), P1-5 adapted (R3: metric F lease cross-check + Wilson 95% CI + startup breakdown, 15 tests), P1-6 adapted (R4: `EXAMPLE_*` desensitization + `audit-acl` + root Apache-2.0 `LICENSE`, 24 tests); P0-2 AST gate (R5, 12 tests) and R6 G4 second-level fallback (`COLAB_CLI_ASSIGN_RETRIES=0`, 6 tests) are Muse-original, not upstream items; OFFLINE_VERIFIED (1200 tests, 0 failures); live NOT_OBSERVED |
 
 ## File inventory (verified 2026-11-20, names only)
 
@@ -51,6 +56,13 @@ Files present upstream but absent in Muse v0.1.0:
   `tests/test_v030_m4_warm_infra.py`,
   `tests/test_v030_scripts_guard.py`
 
+**v0.3.1 (additional +3 vs v0.3.0):**
+
+- `LICENSE` (standard Apache-2.0, `Copyright 2026 SkyOneBranch`)
+- `tests/test_stage_contract_ast.py` (P0-2 static AST gate — behaviour
+  reference for R5's Muse-original gate; no code copied)
+- `tests/test_v031_hardening.py` (v0.3.1 hardening tests — reference only)
+
 Files present in Muse v0.1.0 but absent upstream (must be retained):
 
 - `scripts/manifest_policy.py`
@@ -78,18 +90,18 @@ brief — a counting-method difference, not a finding).
 
 | Feature | Upstream version | Key files + diffstat vs Muse v0.1.0 | Muse status |
 |---|---|---|---|
-| F1 high-concurrency zero-merge download | v0.2.0 | `h3_drive_download.py` (+902/−350, frozen after v0.2.0); `tests/test_drive_download_v2.py`, `tests/test_drive_download.py` | IMPLEMENTED — PR #4 (`2f3c425`), CI run 44662119661 6/6 pass, 760 tests 0 failures; live NOT_VERIFIED |
-| F2 ComfyUI offline wheelhouse | v0.2.0 | `h3_comfyui_cache.py` (+833/−45); `scripts/setup_isolated_account.py`; controller wiring; `tests/test_comfyui_wheelhouse.py`, `tests/test_controller_wheelhouse_telemetry.py` | IMPLEMENTED — PR #6 (`fd61ece`), 763 tests 0 failures locally; `setup_isolated_account.py` NOT-APPLICABLE (no Muse equivalent); live NOT_VERIFIED |
-| F3 parallel install + model restore | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F4); `tests/test_remote_worker_v020.py` (CHANGELOG says `test_remote_worker_v2.py`, shipped file is `…_v020.py`) | SPEC READY — reimplement from behavior, own PR |
-| F4 standalone NVMe model storage + VRAM optimization | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F3); `tests/test_remote_worker_v020.py` | SPEC READY — reimplement from behavior, own PR |
-| F5 Remote Seed + cold-start telemetry | v0.2.0 | `drive_depot.py` (+572/−6); `h3_run_manifest.py`; `scripts/reliability_report.py`; `tests/test_drive_depot_remote_seed.py`, `tests/test_reliability_coldstart.py`; triple-flag gated | SPEC READY — Remote Seed stays optional, no live GPU without separate approval |
-| P1 MD5 normalization (compare first) | v0.2.1 | `h3_remote_worker.py`, `h3_drive_upload.py`, `tests/test_drive_upload.py` | SPEC READY — Muse already has MD5 normalization (PR #62); diff first, only add tests where equivalent |
-| P2 Python 3.13 + slim offline wheelhouse | v0.2.1 | `h3_comfyui_cache.py` (+36/−7); `h3_remote_worker.py`; `py313` handled via generic tag normalization, no hardcoded list | SPEC READY — verify dependency provenance + platform + integrity |
-| P3 monotonic `MODELS_READY` backfill + reliability stats fix | v0.2.1 | `h3_controller.py`, `h3_reliability.py`, `tests/test_reliability.py`, `tests/test_fault_injection.py` | SPEC READY — reimplement from behavior, own PR |
-| M1 GPU 503 capacity backoff + error classification | v0.3.0 | `h3_budget.py` (+75/−0); `h3_controller.py`; `scripts/run_h3_task.sh`; `tests/test_v030_m1_backoff.py`; classes `AUTH_FATAL` / `QUOTA_EXCEEDED` / `CAPACITY_TRANSIENT` (503/429/502/504/412) / `TRANSPORT_TRANSIENT` / `UNKNOWN_FATAL`; backoff 15s/45s/90s ±20% | SPEC READY — Fatal/Auth/Quota must never retry infinitely |
-| M2 two-stage bundled bootstrap | v0.3.0 | `h3_bootstrap_stage1.py`, `h3_bootstrap_stage2.py` (new); `tests/test_v030_m2_bundled_bootstrap.py`; tar members validated pre-extraction (absolute paths, `..`, symlinks/hardlinks, device nodes, escape from `/content/muse_h3` rejected); 0600 downscoped tokens; `MUSE_DRIVE_DOWNLOAD_PROBE_OK` gate | SPEC READY — strict archive-entry rejection is a hard gate |
-| M3 network-drop self-healing + Drive 0-GPU finished-video recovery | v0.3.0 | `h3_controller.py`; `h3_drive_token.py` (+47/−0, `ensure_token_freshness(min_remaining_sec=900)`); `tests/test_v030_m3_self_healing.py` | SPEC READY — finished video recovers first, never blind re-inference |
-| M4 controlled warm pool | v0.3.0 | `h3_controller.py` (largest v0.3.0 change, +1,264/−279); `h3_gpu_lease_registry.py` (+165/−1); `h3_shutdown_executor.py`; `h3_warm_health_probe.py` (new); `scripts/run_shutdown_guardian.py`; `scripts/verify_shutdown.sh`; 3 test suites; default OFF (`--keep-warm-ttl` default 0, allowed 0 or 60–900s); caps 14400s / 25.0 CU / 30.0 CU / 0.75 CU reserve; reuse requires `MUSE_WARM_HEALTH_OK` | SPEC READY — default OFF, guardian unverified until proven; no live warm pool without separate approval |
+| F1 high-concurrency zero-merge download | v0.2.0 | `h3_drive_download.py` (+902/−350, frozen after v0.2.0); `tests/test_drive_download_v2.py`, `tests/test_drive_download.py` | IMPLEMENTED — PR #4 branch work (`2f3c425`) re-landed via PR #18 (`0e3c114`); CI run 44662119661 6/6 pass, 760 tests 0 failures; live NOT_OBSERVED |
+| F2 ComfyUI offline wheelhouse | v0.2.0 | `h3_comfyui_cache.py` (+833/−45); `scripts/setup_isolated_account.py`; controller wiring; `tests/test_comfyui_wheelhouse.py`, `tests/test_controller_wheelhouse_telemetry.py` | IMPLEMENTED — PR #6 branch work (`fd61ece`) re-landed via PR #18 (`0e3c114`); 763 tests 0 failures locally; `setup_isolated_account.py` NOT-APPLICABLE (no Muse equivalent); live NOT_OBSERVED |
+| F3 parallel install + model restore | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F4); `tests/test_remote_worker_v020.py` (CHANGELOG says `test_remote_worker_v2.py`, shipped file is `…_v020.py`) | IMPLEMENTED — PR #8 branch work re-landed via PR #18 (`0e3c114`); OFFLINE_VERIFIED (818 tests at PR time, 1046 at v0.3.0); live NOT_OBSERVED (observed failing live in run `h3-20261120T071209Z-4ea108`, fixed by P0-A in PR #20) |
+| F4 standalone NVMe model storage + VRAM optimization | v0.2.0 | `h3_remote_worker.py` (+756/−133, shared with F3); `tests/test_remote_worker_v020.py` | IMPLEMENTED — merged via PR #18 (Issue #9); OFFLINE_VERIFIED (878 tests at integration); live NOT_OBSERVED |
+| F5 Remote Seed + cold-start telemetry | v0.2.0 | `drive_depot.py` (+572/−6); `h3_run_manifest.py`; `scripts/reliability_report.py`; `tests/test_drive_depot_remote_seed.py`, `tests/test_reliability_coldstart.py`; triple-flag gated | IMPLEMENTED — merged via PR #18 (Issue #10); OFFLINE_VERIFIED (917 tests); Remote Seed stays optional (triple-gated), no live GPU without separate approval; live NOT_OBSERVED |
+| P1 MD5 normalization (compare first) | v0.2.1 | `h3_remote_worker.py`, `h3_drive_upload.py`, `tests/test_drive_upload.py` | IMPLEMENTED — merged via PR #18 (Issue #11); Muse `_normalize_md5` verified (PR #62 lineage), worker `_md5_hex` added; OFFLINE_VERIFIED (925 tests); live NOT_OBSERVED |
+| P2 Python 3.13 + slim offline wheelhouse | v0.2.1 | `h3_comfyui_cache.py` (+36/−7); `h3_remote_worker.py`; `py313` handled via generic tag normalization, no hardcoded list | IMPLEMENTED — merged via PR #18 (Issue #12); OFFLINE_VERIFIED (934 tests); no py313 bundle built or published; live NOT_OBSERVED |
+| P3 monotonic `MODELS_READY` backfill + reliability stats fix | v0.2.1 | `h3_controller.py`, `h3_reliability.py`, `tests/test_reliability.py`, `tests/test_fault_injection.py` | IMPLEMENTED — merged via PR #18 (Issue #13); OFFLINE_VERIFIED (947 tests); live NOT_OBSERVED |
+| M1 GPU 503 capacity backoff + error classification | v0.3.0 | `h3_budget.py` (+75/−0); `h3_controller.py`; `scripts/run_h3_task.sh`; `tests/test_v030_m1_backoff.py`; classes `AUTH_FATAL` / `QUOTA_EXCEEDED` / `CAPACITY_TRANSIENT` (503/429/502/504/412) / `TRANSPORT_TRANSIENT` / `UNKNOWN_FATAL`; backoff 15s/45s/90s ±20% | IMPLEMENTED — merged via PR #18 (Issue #14); OFFLINE_VERIFIED (968 tests); Fatal/Auth/Quota fail fast; live NOT_OBSERVED (capacity behaviour observed in the failed v0.3.0 E2E run, not verified) |
+| M2 two-stage bundled bootstrap | v0.3.0 | `h3_bootstrap_stage1.py`, `h3_bootstrap_stage2.py` (new); `tests/test_v030_m2_bundled_bootstrap.py`; tar members validated pre-extraction (absolute paths, `..`, symlinks/hardlinks, device nodes, escape from `/content/muse_h3` rejected); 0600 downscoped tokens; `MUSE_DRIVE_DOWNLOAD_PROBE_OK` gate | IMPLEMENTED — merged via PR #18 (Issue #15); OFFLINE_VERIFIED (986 tests); strict archive-entry rejection enforced; live NOT_OBSERVED |
+| M3 network-drop self-healing + Drive 0-GPU finished-video recovery | v0.3.0 | `h3_controller.py`; `h3_drive_token.py` (+47/−0, `ensure_token_freshness(min_remaining_sec=900)`); `tests/test_v030_m3_self_healing.py` | IMPLEMENTED — merged via PR #18 (Issue #16); OFFLINE_VERIFIED (1003 tests); finished video recovers first, never blind re-inference; live NOT_OBSERVED |
+| M4 controlled warm pool | v0.3.0 | `h3_controller.py` (largest v0.3.0 change, +1,264/−279); `h3_gpu_lease_registry.py` (+165/−1); `h3_shutdown_executor.py`; `h3_warm_health_probe.py` (new); `scripts/run_shutdown_guardian.py`; `scripts/verify_shutdown.sh`; 3 test suites; default OFF (`--keep-warm-ttl` default 0, allowed 0 or 60–900s); caps 14400s / 25.0 CU / 30.0 CU / 0.75 CU reserve; reuse requires `MUSE_WARM_HEALTH_OK` | IMPLEMENTED — merged via PR #18 (Issue #17, closed 2026-11-20); OFFLINE_VERIFIED (1046 tests); default OFF; no live warm pool without separate approval; live NOT_OBSERVED |
 
 Note on upstream performance claims: the v0.2.1 CHANGELOG cites a
 live A100 run (489s→230.9s, 4.44→3.70 CU). That is upstream's claim,
@@ -100,6 +112,12 @@ GPU run with a run id proves it.
 
 - `OFFLINE_VERIFIED` — offline tests + CI green, no GPU.
 - `LIVE_E2E_VERIFIED` — real GPU end-to-end with a run id.
-- `NOT_VERIFIED` — everything else. No v0.2.0–v0.3.0 feature is
-  `LIVE_E2E_VERIFIED` in this repo; the ≥95% reliability target is a
-  TARGET, never a proven result, until a real GPU run proves it.
+- `NOT_OBSERVED` — no in-repo live run record for the feature
+  (neither verified nor refuted live). No v0.2.0–v0.3.1 feature is
+  `LIVE_E2E_VERIFIED` in this repo: no successful live E2E run is
+  recorded in-repo at this baseline (CHANGELOG v0.3.1:
+  `LIVE_E2E_NOT_YET_RETESTED`). The only in-repo live E2E record
+  is the FAILED v0.3.0 run `h3-20261120T071209Z-4ea108`
+  (TASK-LIVE-E2E-015), which observed M1/F3 failing live. The ≥95%
+  reliability target is a TARGET, never a proven result, until a
+  real GPU run proves it.

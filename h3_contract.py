@@ -5,13 +5,117 @@ Do not attempt to submit the GUI JSON directly to ComfyUI /prompt.
 from __future__ import annotations
 import hashlib
 import json
+import os
+import stat
+import sys
 from pathlib import Path
 
+# --- Drive ID resolution (TASK-RELEASE-V032 R4 desensitization) --------
+# Real Google Drive file/folder IDs are NEVER committed: the public tree
+# carries only EXAMPLE_* placeholders. A live run resolves the real IDs
+# in this precedence order (first non-empty value wins):
+#   1. H3_DRIVE_ID_<KEY> environment variable (per-run override),
+#   2. model_cache/local_drive_ids.json (gitignored, must be mode 0600;
+#      a file with group/other permission bits is ignored with a warning),
+#   3. the EXAMPLE_* offline/test default below.
+# The local file is read at import time; a missing file is normal in a
+# fresh checkout and is silently ignored.
+LOCAL_DRIVE_IDS_PATH = Path(__file__).resolve().parent / "model_cache" / "local_drive_ids.json"
+
+DRIVE_ID_DEFAULTS = {
+    "POSTER": "EXAMPLE_DRIVE_POSTER_ID",
+    "STORY": "EXAMPLE_DRIVE_STORY_ID",
+    "DEPOT_ROOT": "EXAMPLE_DRIVE_DEPOT_ROOT_ID",
+    "READY_MANIFEST": "EXAMPLE_DRIVE_READY_MANIFEST_ID",
+    "MODEL_DIFFUSION": "EXAMPLE_DRIVE_MODEL_DIFFUSION_ID",
+    "MODEL_TEXT_ENCODER": "EXAMPLE_DRIVE_MODEL_TEXT_ENCODER_ID",
+    "MODEL_VIDEO_VAE": "EXAMPLE_DRIVE_MODEL_VIDEO_VAE_ID",
+    "MODEL_AUDIO_VAE": "EXAMPLE_DRIVE_MODEL_AUDIO_VAE_ID",
+    "LEGACY_VIDEO_VAE": "EXAMPLE_DRIVE_LEGACY_VIDEO_VAE_ID",
+    "LEGACY_AUDIO_VAE": "EXAMPLE_DRIVE_LEGACY_AUDIO_VAE_ID",
+    "MODEL_DIFFUSION_FOLDER": "EXAMPLE_DRIVE_MODEL_DIFFUSION_FOLDER_ID",
+    "MODEL_TEXT_ENCODER_FOLDER": "EXAMPLE_DRIVE_MODEL_TEXT_ENCODER_FOLDER_ID",
+    "MODEL_VAE_FOLDER": "EXAMPLE_DRIVE_MODEL_VAE_FOLDER_ID",
+    "COMFYUI_CACHE_FOLDER": "EXAMPLE_DRIVE_COMFYUI_CACHE_FOLDER_ID",
+    "COMFYUI_TARBALL": "EXAMPLE_DRIVE_COMFYUI_TARBALL_ID",
+    "COMFYUI_TARBALL_SHA256": "EXAMPLE_DRIVE_COMFYUI_TARBALL_SHA256_ID",
+    "COMFYUI_SOURCE_MANIFEST": "EXAMPLE_DRIVE_COMFYUI_SOURCE_MANIFEST_ID",
+    "VIDEO_OUTPUTS_FOLDER": "EXAMPLE_DRIVE_VIDEO_OUTPUTS_FOLDER_ID",
+    "VIDEO_A_MP4": "EXAMPLE_DRIVE_VIDEO_A_MP4_ID",
+    "DEPOT_CANARY": "EXAMPLE_DRIVE_DEPOT_CANARY_ID",
+}
+
+
+def is_example_drive_id(value) -> bool:
+    """True for the committed EXAMPLE_* placeholders (never a real asset)."""
+    return isinstance(value, str) and value.startswith("EXAMPLE_DRIVE_")
+
+
+def looks_like_real_drive_id(value) -> bool:
+    """Shape check for a real Drive ID: 33 chars, starts with '1', mixed
+    case (this excludes EXAMPLE_* placeholders, hashes, test fake ids
+    and local `NN-<slug>.md` incident filenames). Mirrors the
+    drive-file-id rule in scripts/secret_scan.py; keep both in sync."""
+    if not isinstance(value, str) or len(value) != 33 or not value.startswith("1"):
+        return False
+    if not all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+               for c in value):
+        return False
+    return any(c.isupper() for c in value) and any(c.islower() for c in value)
+
+
+def load_local_drive_ids(path=None) -> dict:
+    """Read the gitignored local ID file. Returns {} when the file is
+    absent (fresh checkout), unreadable, malformed, or too permissive.
+    A too-permissive file is ignored with a stderr warning, never used:
+    real asset IDs must not sit in a group/other-readable file."""
+    path = Path(path) if path is not None else LOCAL_DRIVE_IDS_PATH
+    try:
+        if not path.is_file():
+            return {}
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if mode & 0o077:
+            print(f"WARNING: {path} has permissions {mode:03o}; refusing to "
+                  f"use it (must be 0600). Configure H3_DRIVE_ID_* env vars "
+                  f"or fix the permissions.", file=sys.stderr)
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"WARNING: ignoring unreadable local Drive ID file {path}: {e}",
+              file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"WARNING: ignoring local Drive ID file {path}: not a JSON object",
+              file=sys.stderr)
+        return {}
+    return {str(k): v for k, v in data.items()
+            if isinstance(v, str) and v.strip()}
+
+
+def resolve_drive_id(key: str, default=None) -> str:
+    """Resolve one Drive ID: H3_DRIVE_ID_<KEY> env var, then the local
+    gitignored file, then `default` or the EXAMPLE_* default for the key.
+    Never raises for a missing source; the EXAMPLE_* default keeps
+    offline tests and fresh checkouts working."""
+    env_value = os.environ.get("H3_DRIVE_ID_" + key, "").strip()
+    if env_value:
+        return env_value
+    local = load_local_drive_ids()
+    if isinstance(local.get(key), str) and local[key].strip():
+        return local[key].strip()
+    if default is not None:
+        return default
+    return DRIVE_ID_DEFAULTS.get(key, "")
+
+
 POSTER_SHA256 = 'bd6d45312f340234d0fa06af0de5284949b2196f280677dd44468a300075c7bb'
-POSTER_DRIVE_ID = '1Punsy8qZKQktUcYyrNDpG46XMu_SWAJO'
-STORY_DRIVE_ID = '1TTv-xyLsSLSvTL1jy9ewOFM4qXUKBwpP'
+# Offline/test defaults are EXAMPLE_* placeholders (v0.3.2 R4). Live runs
+# resolve the real IDs via resolve_drive_id (env / local_drive_ids.json).
+POSTER_DRIVE_ID = resolve_drive_id("POSTER")
+STORY_DRIVE_ID = resolve_drive_id("STORY")
 # Pinned Hugging Face revision of the four model files (CACHE_READY
-# 2026-11-10; READY manifest Drive ID 1jLYefARIDs8VLtsCXJPuTU7zHXw0coly).
+# 2026-11-10; READY manifest Drive ID is EXAMPLE_DRIVE_READY_MANIFEST_ID
+# in this public tree — the real ID lives only in local_drive_ids.json).
 # Previously a bare literal in h3_controller.archive_variant_to_drive;
 # named here so the environment manifest and the upload path share one
 # source of truth (TASK-005 §6, Issue #29).

@@ -1,5 +1,206 @@
 # CHANGELOG
 
+## v0.3.2 — Delivery Correctness, De-identification & G4 Fast Fallback (TASK-RELEASE-V032, Issue #21)
+
+Release status: `V032_RELEASE_PUBLISHED` / `OFFLINE_VERIFIED`
+(1200 offline tests, 0 failures, incl. 107 new v0.3.2 tests; GitHub
+Actions 6/6 on the PR HEAD) — `V032_LIVE_E2E_NOT_YET_RUN` (no GPU
+session was started, no CU spent; the release must be proven live
+with a NEW task id and a NEW budget ledger after release — v0.3.1
+history runs are never force-taken-over by the v0.3.2 controller) —
+`PRODUCTION_NOT_UPGRADED` (the production directory was never
+touched; upgrading production needs separate approval) —
+`F_95_NOT_VERIFIED` (metric F 95% reliability is not claimed; see R3).
+
+No budget / safety-constant changes: 30 CU/task, 25 CU/session,
+0.75 CU cleanup reserve, 14400 s cap, TaskLock, tri-state shutdown
+(only `STOPPED` confirms), and the v0.3.1 P0-B strict session
+pre-registration + `owner_id` recovery check are unchanged.
+`GPU_ATTEMPT_PLAN` stays `("G4", "G4", "A100_HIGH_MEM")`.
+
+Upstream: `SkyOneBranch/Antigravity-Colab-Workstation` v0.3.1
+(`418797a4`, 2026-11-21) was verified read-only via the GitHub API.
+Its root `LICENSE` is standard Apache-2.0 (blob SHA
+`5ccb567fa1902a3cdd867288299aac2387bbac72`, 197 lines, 10,999 bytes,
+`Copyright 2026 SkyOneBranch`). Muse adopts the canonical Apache-2.0
+text (apache.org) at repo root `LICENSE` with an attribution header
+citing that blob SHA; the upstream LICENSE wording differs from the
+canonical text in places, so the canonical text was used, not a
+verbatim copy. No upstream code was imported — no `.agents/` Hook,
+no macOS script, no private path, no real TaskSpec, no Drive ID.
+See `docs/upstream/UPSTREAM_LOCK.json`, `PORTING_LEDGER.md`,
+`COMPATIBILITY_MATRIX.md`.
+
+### R1 (P0) — ComfyUI `/prompt` tri-state submit idempotency
+
+- `h3_remote_worker.py`: `_find_prompt_by_client_id` now returns
+  explicit `("found", pid)` / `("absent", None)` /
+  `("unknown", detail)` tuples — `absent` only when `/queue` AND
+  `/history` both succeed and both lack the `client_id`; any lookup
+  failure is `unknown`, never mistaken for `absent`. `_submit_prompt`
+  recovers directly on `found`, polls with bounded exponential
+  backoff (max 5 probes, 1/2/4/8 s, 60 s window, ComfyUI liveness
+  check) while `unknown` and **never re-POSTs while `unknown`**
+  (still `unknown` after the window → fail-closed error carrying the
+  `client_id`); at most 1 checked resubmit, only on explicit
+  `absent`. Root cause fixed: the old code swallowed `/queue` /
+  `/history` errors as `None` and treated them as "not queued",
+  risking a duplicate inference submission while the 40 GB model
+  load blocked the event loop.
+- Tests: `tests/test_v032_r1_prompt_idempotency.py` (18 tests,
+  written first — 4 failures + 14 errors pre-fix).
+
+### R2 (P0) — Tamper-proof completed-delivery re-verification + 0-CU local self-heal
+
+- `run_manifest.json["artifacts"]` now persists trusted
+  `output_size` / `output_md5` (32-char lowercase hex) /
+  `output_sha256` at first local acceptance + Drive archival
+  (backward-compatible with `local_sha256` / `remote_upload`).
+  `_verify_completed_delivery` always queries Drive and checks
+  `trashed == False` / size / normalized `md5Checksum` (and
+  `sha256Checksum` when a trusted SHA-256 exists): any mismatch or
+  tampering → `"lost"`; transient query failure → `"unverifiable"`.
+  When the local MP4 is missing, `restore_local=True` (`--deliver`
+  / recovery path, `--restore-local` flag, default off) streams the
+  Drive file back atomically at 0 CU, hash-checks it and runs
+  `validate_final_video()` (frames/resolution/codec) before atomic
+  placement — only then may `local_video_validated: True` be set.
+  Read-only probe mode (`restore_local=False`, the default) never
+  claims `local_video_validated: True` for a missing local file.
+  Root cause fixed: the old code returned `("verified",
+  {"local_video_validated": True, ...})` whenever the Drive file
+  was not trashed, without comparing size/MD5 or restoring the
+  local file.
+- Tests: `tests/test_v032_r2_delivery_verify.py` (20 tests,
+  written first — 3 failures + 6 errors pre-fix). Note:
+  `_resume_stopped_session`'s metadata-only fallback was left
+  untouched (pre-existing design, locked by M3 tests); `--deliver`
+  on such runs reports `"unverifiable"` until `--restore-local`
+  re-proves the file.
+
+### R3 (P0) — Reliability metric F lease cross-check + Wilson 95% CI
+
+- `h3_reliability.py`: `_evaluate_task_f` now cross-checks
+  `model_cache/h3_gpu_leases.json` (lease entries are the
+  pre-registration evidence — Muse has no literal
+  `pending_session_id` field): any lease for the same
+  `production_task_id` / `run_id` with real allocation evidence but
+  no confirmed `STOPPED` (incl. `WARM_POOLED` / `warm_idle`) fails
+  F with specific reasons; a pre-registered lease whose `colab new`
+  failed and which is confirmed `STOPPED` is not a leak. A missing
+  or corrupt lease file is fail-safe (recorded as
+  `lease_evidence: "missing"/"corrupt"`, never silently treated as
+  a pass or a failure). Every ratio metric gains `wilson_95_ci`
+  (`{"lower", "upper"}`); `a_vs_f_comparison` (A vs F side by side,
+  noting the denominators differ) and `startup_mode_breakdown`
+  (cold start vs warm-pool reuse vs unknown) are added; top-level
+  JSON fields stay backward-compatible. Zero failures need 73/73
+  samples for a two-sided 95% lower bound of 0.95.
+  `scripts/reliability_report.py` gains a `--summary` flag (human
+  summary on stderr, stdout stays pure JSON).
+- Tests: `tests/test_v032_r3_reliability.py` (15 tests, written
+  first — 12 failures + 8 errors pre-fix).
+
+### R4 (P0) — Public-repo minimum disclosure, 0-CU Drive ACL audit & license
+
+- 20 distinct real Google Drive file/folder IDs (59 occurrences)
+  in tracked source and public docs/examples were replaced with
+  `EXAMPLE_*` placeholders. Runtime resolves real IDs from the
+  gitignored `model_cache/local_drive_ids.json` (0600; refused with
+  a warning if group/other-readable) or `H3_DRIVE_ID_*` env vars,
+  falling back to `EXAMPLE_*` defaults for offline tests. A
+  `model_cache/local_drive_ids.example.json` template is committed.
+  `docs/deployment_status.json` is templated and records the
+  history boundary: **Git history was not rewritten and still
+  contains the real IDs** — treat pre-desensitization commits as
+  sensitive. `scripts/secret_scan.py` gains a `drive-file-id` rule
+  (HIGH) so real asset IDs cannot re-enter the tree.
+- `drive_depot.py audit-acl` (read-only `files.get` / `files.list` /
+  `permissions.list`): audits the model depot root + all weight
+  files, the video-output archive directory, the ComfyUI source /
+  Wheelhouse cache directory and the lease-registry mirror
+  directory. Any `type == "anyone"` permission fail-closes with a
+  non-zero exit and lists the exposed objects; no exposure prints
+  `ACL_PRIVATE_VERIFIED`. Wired into `scripts/verify_drive.sh` and
+  `h3_controller.py::preflight()` (skips explicitly when no local
+  depot config exists, so offline/mock preflights do not fail for
+  lack of credentials). A live read-only `audit-acl` run with
+  credentials is recorded in the release report (0.00 CU).
+- Root `LICENSE`: canonical Apache-2.0 (see upstream note above).
+- Tests: `tests/test_v032_r4_desensitize_acl.py` (24 tests,
+  written first — 5 failures + 18 errors pre-fix; real-form IDs in
+  tests are built by concatenating short fragments, never written
+  as literals).
+
+### R5 (P1) — Worker full-stage static AST gate + Muse adapter contract + upstream ledger
+
+- `h3_job_state.py`: `WORKER_PHASE_TO_JOB_STAGE` gains
+  `"init": "JOB_STARTED"` (the only missing phase after auditing
+  every phase the worker actually uses); `read_job_state()` now
+  raises `ValueError` on any stage name outside `JOB_STAGES`.
+  `h3_remote_worker.py` needed no code change: its `.get(name,
+  name)` fallback is provably unreachable for audited phases.
+- New static AST gate `tests/test_v032_r5_stage_ast_gate.py`
+  (12 tests): scans `h3_remote_worker.py` for every `set_stage` /
+  `write_job_state` / `_LAST_STAGE` assignment and upload/telemetry
+  stage write, proving 100% land in the legal contract set
+  (string-concatenated / f-string stage names are rejected).
+- `adapters/muse/adapter.py`: `Authorization` and
+  `to_wrapper_args()` now explicitly support and strictly validate
+  `allocation_rounds` (`None` or 1..5), `bootstrap_mode` (`None` or
+  `"bundled" | "legacy"`), `keep_warm_ttl` (0 or 60..900, **default
+  0 — warm pooling stays OFF by default**, never silently paid
+  warm-pooling). Invalid values (incl. bools and wrong-case modes) raise
+  `ValueError`.
+- `docs/upstream/*` refreshed: all `NOT STARTED` / `SPEC PENDING`
+  staleness cleared; `CODE_INTEGRATED` / `OFFLINE_VERIFIED` /
+  `LIVE_VERIFIED` / `NOT_OBSERVED` distinguished honestly (live is
+  `NOT_OBSERVED` throughout — no successful live E2E run is
+  recorded in-repo). Upstream v0.3.1 P0-1..P1-6 registered; P1-3 /
+  P1-4 / P1-5 / P1-6 updated to ADAPTED by R1–R4 in the integration
+  step (R5 had recorded them against the v0.3.1 baseline).
+- Tests: `tests/test_muse_adapter.py` gains
+  `AuthorizationExtendedParamsTest` (12 boundary tests).
+
+### R6 (P0/P1) — Launch rules: G4 first + `COLAB_CLI_ASSIGN_RETRIES=0` fast fallback
+
+- `GPU_ATTEMPT_PLAN` is **unchanged**:
+  `("G4", "G4", "A100_HIGH_MEM")` in `h3_budget.py` and
+  `config/gpu_policy.yaml` — attempt 0 `TRANSPORT_TRANSIENT`
+  (proxy/TLS blip) still `continue`s into attempt 1, which must
+  still be `"G4"` ("retry the same card once, never downgrade to
+  A100 on a network blip").
+- `h3_controller.py::run_cli()` and `scripts/run_h3_task.sh` now
+  default `COLAB_CLI_ASSIGN_RETRIES` to `"0"` (env-overridable;
+  `REQUEST_TIMEOUT` 120 and `COLAB_CLI_REQUEST_TIMEOUT` 180 kept,
+  as is the 5 s delayed `inspect()` reconciliation after an
+  allocation error). Root cause: `google-colab-cli 0.7.5`
+  `client.py::assign()` defaults to `COLAB_CLI_ASSIGN_RETRIES="3"`
+  (10 s / 20 s / 40 s backoff), burning ~212–214 s inside the CLI
+  on every 503; with `0` a single 503 returns to the controller
+  in seconds. G4 (RTX PRO 6000 Blackwell 96 GB, native hardware
+  FP4, ~8.8 CU/h) stays first priority.
+- In the inner allocation loop, attempt 0 G4 failing with
+  `CAPACITY_TRANSIENT` (e.g. HTTP 503) now fast-forwards within the
+  same round to `A100_HIGH_MEM` (attempt 2, skipping the doomed
+  second G4 at attempt 1) with a `GPU_ALLOCATION_CAPACITY_FAST_FORWARD`
+  audit event; attempt 0 `TRANSPORT_TRANSIENT` still retries G4 at
+  attempt 1. Multi-round backoff (M1) is unchanged.
+- Launch scheduling rules are now documented in
+  `docs/runbooks/production-run.md` and `adapters/muse/README.md`:
+  never run bare `colab new` outside the controller on a timer
+  (prevents idle burn and `CRITICAL_ORPHAN_GPU_SESSION`); an
+  urgent single task may start any time via `--deliver` (G4 in
+  seconds, else A100 80 GB in seconds); non-urgent/batch tasks
+  prefer Beijing 06:00–11:00 or 14:00–20:00 (North-America
+  evening/late-night idle window, higher G4 hit rate); after a
+  multi-round all-503 exit (0.00 CU), the outer reschedule cooldown
+  is forced to **>= 15 minutes** (avoids `/tun/m/assign` 429 /
+  412 `TooManyAssignmentsError`).
+- Tests: `tests/test_v032_r6_g4_fallback.py` (6 new tests, written
+  first — 3 failed pre-fix) + updated M1/fault-injection/script
+  tests that had encoded the old retry-twice-on-503 behaviour.
+
 ## v0.3.1 — Live E2E Recovery Hotfix (TASK-HOTFIX-016, Issue #19)
 
 Hotfix for the two defects `TASK-LIVE-E2E-015` exposed on real Colab

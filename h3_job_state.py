@@ -43,7 +43,17 @@ JOB_STAGES = (
 # MODELS_READY is NOT set by the mapping: it is written explicitly only
 # after object_info validation passes. INFERENCE_COMPLETED is written
 # explicitly after find_rendered_video/rescue succeeds.
+# "init" is the worker's _LAST_STAGE before the first set_stage call
+# (TASK-RELEASE-V032 R5, closing the CHANGELOG v0.3.1 §5.2 residual
+# note): a token refresh before the first set_stage rewrites the job
+# state with the mapped stage JOB_STARTED instead of leaking the raw
+# phase "init", which the controller would refuse as unknown. This
+# mirrors upstream v0.3.1 P0-2, which maps "init" the same way
+# (upstream h3_job_state.py, tag v0.3.1); Muse has no
+# "dual_track_setup" / "link_models" phases, so those upstream
+# entries deliberately have no Muse counterpart.
 WORKER_PHASE_TO_JOB_STAGE = {
+    "init": "JOB_STARTED",
     # TASK-HOTFIX-016 (Issue #19) P0-A: the v0.3.0 F3 dual-track setup
     # phase. It is setup work, not a finished model restore, so it maps
     # to RESTORING_MODELS — exactly how upstream Antigravity's
@@ -109,9 +119,19 @@ def write_job_state(root, run_id: str, variant: str, stage: str,
 
 def read_job_state(root) -> dict:
     """Read and validate the job state file. Raises FileNotFoundError
-    when the worker has not written one yet, ValueError on a corrupt or
-    incomplete file — both are poll failures for the controller, never
-    silent 'no worker' answers."""
+    when the worker has not written one yet, ValueError on a corrupt,
+    incomplete, or unknown-stage file — both are poll failures for the
+    controller, never silent 'no worker' answers.
+
+    TASK-RELEASE-V032 R5: a stage outside JOB_STAGES is rejected
+    explicitly. The worker can only write a canonical stage (every
+    set_stage/write_job_state site is pinned by the static AST gate
+    in tests/test_v032_r5_stage_ast_gate.py), so an unknown stage on
+    disk means a stale pre-hotfix file, a foreign writer, or a
+    tampered file — never a legitimate worker state. write_job_state
+    deliberately stays non-validating (worker bookkeeping must never
+    kill an inference); the rejection happens here, at the read
+    boundary, mirroring upstream v0.3.1 P0-2."""
     path = Path(root) / JOB_STATE_FILENAME
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
@@ -124,4 +144,9 @@ def read_job_state(root) -> dict:
     for key in ("run_id", "variant", "stage"):
         if not state.get(key):
             raise ValueError(f"Job state file is missing required field: {key}")
+    if state["stage"] not in JOB_STAGES:
+        raise ValueError(
+            f"Job state file carries an unknown stage: {state['stage']!r} "
+            f"(not in JOB_STAGES {list(JOB_STAGES)})"
+        )
     return state

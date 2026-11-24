@@ -25,6 +25,10 @@ __pycache__/
 # Live local state (ledgers, sessions, depot state) — never commit.
 model_cache/*
 !model_cache/verified_manifest.example.json
+!model_cache/local_drive_ids.example.json
+# Real Drive IDs live ONLY in gitignored model_cache/local_drive_ids.json
+# (mode 0600) or H3_DRIVE_ID_* env vars — never in committed files.
+model_cache/local_drive_ids.json
 logs/
 runs/
 output/

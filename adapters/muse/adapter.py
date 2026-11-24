@@ -47,6 +47,24 @@ BUDGET_SESSION_CU = PER_SESSION_BUDGET_CU
 BUDGET_CLEANUP_RESERVE_CU = CLEANUP_RESERVE_CU
 BUDGET_MAX_SESSION_SECONDS = MAX_SESSION_SECONDS
 
+# TASK-RELEASE-V032 R5: wrapper-parameter contract for the three
+# v0.3.0 M1/M2/M4 options the adapter maps. The bounds are the
+# controller's and the wrapper's, duplicated here as literals (same
+# practice as assert_budget_constants): h3_controller
+# resolve_allocation_rounds (1..MAX_ALLOCATION_ROUNDS=5),
+# resolve_bootstrap_mode (bundled|legacy, default bundled),
+# _validate_keep_warm_ttl (0 or 60..900); scripts/run_h3_task.sh
+# validates the identical ranges and refuses anything else. The
+# adapter is stricter than the controller in two deliberate ways: it
+# rejects bools (True == 1 in Python) and it never case-folds
+# bootstrap_mode — "Bundled" is refused, not silently corrected.
+ALLOCATION_ROUNDS_MIN = 1
+ALLOCATION_ROUNDS_MAX = 5
+BOOTSTRAP_MODES = ("bundled", "legacy")
+KEEP_WARM_TTL_OFF = 0
+KEEP_WARM_TTL_MIN_SEC = 60
+KEEP_WARM_TTL_MAX_SEC = 900
+
 
 def assert_budget_constants() -> dict:
     """Assert the production budget constants are unchanged.
@@ -88,12 +106,49 @@ class Authorization:
     max_task_attempts: int = 2
     task_deadline_utc: str | None = None
     run_id: str | None = None
+    # TASK-RELEASE-V032 R5: explicit v0.3.0 M1/M2/M4 wrapper options.
+    # allocation_rounds None means "omit the flag": the controller
+    # default applies (3 for deliver / --auto-recover, 1 for a raw
+    # run). bootstrap_mode None likewise omits the flag (controller
+    # default bundled). keep_warm_ttl defaults to 0 — the warm pool
+    # is OFF unless a caller explicitly passes 60..900. A warm pool
+    # costs CU while idle, so the adapter never defaults it on and
+    # always maps the value explicitly (including 0) so the OFF state
+    # is visible in the wrapper args, never an omission.
+    allocation_rounds: int | None = None
+    bootstrap_mode: str | None = None
+    keep_warm_ttl: int = KEEP_WARM_TTL_OFF
 
     def __post_init__(self) -> None:
         if not isinstance(self.production_task_id, str) or not self.production_task_id.strip():
             raise ValueError("production_task_id is required (never reused silently)")
         if self.max_task_attempts not in (1, 2, 3):
             raise ValueError("max_task_attempts must be 1, 2 or 3")
+        if self.allocation_rounds is not None:
+            if (isinstance(self.allocation_rounds, bool)
+                    or not isinstance(self.allocation_rounds, int)):
+                raise ValueError(
+                    "allocation_rounds must be None or an integer "
+                    f"{ALLOCATION_ROUNDS_MIN}..{ALLOCATION_ROUNDS_MAX}")
+            if not ALLOCATION_ROUNDS_MIN <= self.allocation_rounds <= ALLOCATION_ROUNDS_MAX:
+                raise ValueError(
+                    "allocation_rounds must be None or an integer "
+                    f"{ALLOCATION_ROUNDS_MIN}..{ALLOCATION_ROUNDS_MAX}, "
+                    f"got {self.allocation_rounds!r}")
+        if self.bootstrap_mode is not None and self.bootstrap_mode not in BOOTSTRAP_MODES:
+            raise ValueError(
+                f"bootstrap_mode must be None or one of {BOOTSTRAP_MODES}, "
+                f"got {self.bootstrap_mode!r}")
+        if isinstance(self.keep_warm_ttl, bool) or not isinstance(self.keep_warm_ttl, int):
+            raise ValueError(
+                "keep_warm_ttl must be an integer: 0 (warm pool disabled) "
+                f"or {KEEP_WARM_TTL_MIN_SEC}..{KEEP_WARM_TTL_MAX_SEC}")
+        if not (self.keep_warm_ttl == KEEP_WARM_TTL_OFF
+                or KEEP_WARM_TTL_MIN_SEC <= self.keep_warm_ttl <= KEEP_WARM_TTL_MAX_SEC):
+            raise ValueError(
+                "keep_warm_ttl must be 0 (warm pool disabled) or "
+                f"{KEEP_WARM_TTL_MIN_SEC}..{KEEP_WARM_TTL_MAX_SEC} seconds, "
+                f"got {self.keep_warm_ttl!r}")
 
 
 def to_wrapper_args(auth: Authorization, task_spec_path: Path | str) -> list[str]:
@@ -125,6 +180,14 @@ def to_wrapper_args(auth: Authorization, task_spec_path: Path | str) -> list[str
         args += ["--task-deadline-utc", auth.task_deadline_utc]
     if auth.run_id:
         args += ["--run-id", auth.run_id]
+    # TASK-RELEASE-V032 R5: explicit M1/M2/M4 options. None omits the
+    # flag (controller default applies); keep_warm_ttl always maps,
+    # including the 0 default, so OFF is explicit in the args.
+    if auth.allocation_rounds is not None:
+        args += ["--allocation-rounds", str(auth.allocation_rounds)]
+    if auth.bootstrap_mode is not None:
+        args += ["--bootstrap-mode", auth.bootstrap_mode]
+    args += ["--keep-warm-ttl", str(auth.keep_warm_ttl)]
     return args
 
 
@@ -357,11 +420,17 @@ def status_report(
 check_restart_state = check_existing_task_state
 
 __all__ = [
+    "ALLOCATION_ROUNDS_MAX",
+    "ALLOCATION_ROUNDS_MIN",
     "Authorization",
+    "BOOTSTRAP_MODES",
     "BUDGET_CLEANUP_RESERVE_CU",
     "BUDGET_MAX_SESSION_SECONDS",
     "BUDGET_SESSION_CU",
     "BUDGET_TASK_CU",
+    "KEEP_WARM_TTL_MAX_SEC",
+    "KEEP_WARM_TTL_MIN_SEC",
+    "KEEP_WARM_TTL_OFF",
     "assert_budget_constants",
     "build_task_spec",
     "check_existing_task_state",

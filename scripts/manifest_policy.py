@@ -29,8 +29,10 @@ import subprocess
 from pathlib import Path
 
 # (path prefix, risk category). A tracked path equal to the prefix or
-# under it is refused. model_cache/ is refused except for the one
-# sanitized example file that is meant to be public.
+# under it is refused. model_cache/ is refused except for the
+# sanitized example files that are meant to be public (placeholder
+# values only — secret_scan + tests enforce that no real Drive ID
+# can appear in them).
 SENSITIVE_PREFIXES = [
     (".venv/", "private-venv"),
     (".venv-colab-cli/", "private-venv"),
@@ -46,7 +48,10 @@ SENSITIVE_PREFIXES = [
     ("model_cache/", "model-cache"),
 ]
 
-MODEL_CACHE_ALLOWED = {"model_cache/verified_manifest.example.json"}
+MODEL_CACHE_ALLOWED = {
+    "model_cache/verified_manifest.example.json",
+    "model_cache/local_drive_ids.example.json",  # v0.3.2 R4: EXAMPLE_* only
+}
 
 # Credential-like basenames (same shape as scripts/secret_scan.py).
 CREDENTIAL_BASENAME = re.compile(

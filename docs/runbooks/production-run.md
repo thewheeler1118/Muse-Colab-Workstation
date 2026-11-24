@@ -74,6 +74,44 @@ derives a fresh run_id. A failed delivery exits non-zero (the
 `deliver` / `run --auto-recover` command prints the JSON verdict
 first, then exits 1), so a script must not treat exit 0 as success.
 
+## Launch scheduling rules (v0.3.2 R6)
+
+Allocation order is G4 first, always (`GPU_ATTEMPT_PLAN = (G4, G4,
+A100_HIGH_MEM)` in `h3_budget.py` / `config/gpu_policy.yaml`):
+
+- A 503 (capacity) on the first G4 attempt fast-forwards within the
+  same round straight to A100 80GB High-Mem — the second G4 attempt
+  is never spent on the same empty pool. A transport blip
+  (proxy/TLS, `TRANSPORT_TRANSIENT`) on the first G4 attempt still
+  retries the same G4 once and never cuts to A100. Multi-round
+  elastic backoff (15s / 45s / 90s ±20%) is unchanged.
+- `COLAB_CLI_ASSIGN_RETRIES` defaults to `0` in
+  `h3_controller.run_cli` and `scripts/run_h3_task.sh` (an
+  operator-set value passes through): the vendored CLI's internal
+  assign retries are off, so a 503 returns to the controller at once
+  instead of hiding inside the CLI for minutes.
+
+When to launch:
+
+1. **Never run bare `colab new` outside the controller on a timer
+   to "grab" a card.** An untracked live GPU burns CU with no
+   watchdog, no lease and no shutdown, and trips
+   `CRITICAL_ORPHAN_GPU_SESSION`. All allocation goes through
+   `scripts/run_h3_task.sh` (controller-owned, pre-registered,
+   lease-tracked).
+2. **Urgent single task: launch any time via `--deliver`.** G4
+   available means seconds to allocation; G4 empty means a
+   seconds-scale cut to A100 80GB in the same round — no waiting for
+   a "good hour".
+3. **Non-urgent or batched tasks: prefer Beijing 06:00–11:00 or
+   14:00–20:00.** Those windows are North-America evening / late
+   night, when the shared pool is quieter and G4 hit rate is higher.
+4. **After an extreme-peak exit (all rounds 503, 0.00 CU spent):
+   the outer reschedule must cool down >= 15 minutes before the
+   next launch.** Hammering `/tun/m/assign` back-to-back risks
+   429 / 412 `TooManyAssignmentsError`; the controller's own
+   backoff does not cover a fresh outer launch.
+
 ## If the VM restarts mid-run
 
 See vm-restart-orphan-recovery.md FIRST: check/download the orphan session
