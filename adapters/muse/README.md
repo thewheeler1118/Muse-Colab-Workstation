@@ -67,6 +67,27 @@ running me".
 - Replace `h3_shutdown_executor.py`.
 - Bypass the controller's production authorization checks.
 
+## Launch scheduling (v0.3.2 R6)
+
+The adapter surfaces the controller's launch rules; it never
+implements its own allocation path (see
+`docs/runbooks/production-run.md`, "Launch scheduling rules"):
+
+- G4 first, always. A 503 on the first G4 attempt fast-forwards
+  within the same round to A100 80GB High-Mem; a transport blip on
+  the first G4 attempt retries the same G4 once and never cuts to
+  A100. `COLAB_CLI_ASSIGN_RETRIES` defaults to `0` (operator value
+  passes through).
+- Never launch a bare `colab new` outside the controller, timed or
+  otherwise — an untracked GPU burns CU and trips
+  `CRITICAL_ORPHAN_GPU_SESSION`.
+- Urgent single task: any time, via `--deliver`. Non-urgent or
+  batched tasks: prefer Beijing 06:00–11:00 or 14:00–20:00 (North
+  America evening / late night, higher G4 hit rate).
+- After an extreme-peak exit (all rounds 503, 0.00 CU spent), the
+  outer reschedule cools down >= 15 minutes before the next launch,
+  to avoid 429 / 412 `TooManyAssignmentsError` on `/tun/m/assign`.
+
 ## Enforcement lives outside the prompt
 
 Muse has no equivalent of Antigravity's `.agents/hooks.json`

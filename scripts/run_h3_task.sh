@@ -144,6 +144,14 @@ if [ -n "$MISSING" ]; then
   fi
   exit 2
 fi
+# v0.3.2 R6: disable the CLI's internal /tun/m/assign retries by
+# default (the vendored CLI defaults to 3 internal retries, ~minutes
+# of hidden waiting on a 503). With 0 the 503 returns to the
+# controller at once, which fast-forwards G4 -> A100_HIGH_MEM within
+# the same round. An operator may override by exporting
+# COLAB_CLI_ASSIGN_RETRIES before invoking this script; the value is
+# passed through untouched by h3_controller.run_cli.
+export COLAB_CLI_ASSIGN_RETRIES="${COLAB_CLI_ASSIGN_RETRIES:-0}"
 EXTRA=()
 if [ "$AUTHORIZE_NEW_TASK" -eq 1 ]; then EXTRA+=(--authorize-new-task); fi
 if [ -n "$TASK_SPEC" ]; then EXTRA+=(--task-spec "$TASK_SPEC"); else EXTRA+=(--variant "$VARIANT"); fi

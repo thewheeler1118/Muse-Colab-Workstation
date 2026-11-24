@@ -144,7 +144,11 @@ class ElasticBackoffExecutionTest(unittest.TestCase):
 
     def test_round1_503_exhaustion_sleeps_and_succeeds_in_round2(self):
         h = self.h
-        # Round 1: G4 (503), G4 (503), A100 (503) -> backoff 15.0s -> Round 2: G4 succeeds!
+        # v0.3.2 R6: Round 1: G4 (503) -> fast-forward -> A100 (503) ->
+        # backoff 15.0s -> Round 2: G4 (503) -> fast-forward -> A100
+        # succeeds. The successful allocation lands on A100, so the
+        # fake probe reports A100 hardware.
+        h.probe_output = "NVIDIA A100 80GB PCIe, 81920"
         h.new_failures = [
             RuntimeError("HTTP 503 Service Unavailable"),
             RuntimeError("HTTP 503 Service Unavailable"),
@@ -221,11 +225,16 @@ class ElasticBackoffExecutionTest(unittest.TestCase):
             hc.run_variant(args)
         # Aborted immediately without sleeping 15.0s
         self.assertNotIn(15.0, sleeps)
-        self.assertEqual(len(h.allocate_ids), 3)
+        # v0.3.2 R6: round 1 spends 2 attempts (G4 503 -> fast-forward
+        # -> A100 503), not 3 — the second G4 attempt is skipped.
+        self.assertEqual(len(h.allocate_ids), 2)
 
     def test_stale_historical_ledger_deadline_ignored_for_backoff(self):
         h = self.h
         # Ledger carries a historical deadline already in the past; args.task_deadline_utc is unset.
+        # v0.3.2 R6: the successful allocation lands on A100 after the
+        # round-2 fast-forward, so the fake probe reports A100 hardware.
+        h.probe_output = "NVIDIA A100 80GB PCIe, 81920"
         h.new_failures = [
             RuntimeError("HTTP 503 Service Unavailable"),
             RuntimeError("HTTP 503 Service Unavailable"),
@@ -280,7 +289,11 @@ class ElasticBackoffExecutionTest(unittest.TestCase):
             stopped_order.append(session)
             registry.confirm_stopped(session, "STOPPED")
 
-        # Full Round 1 (G4, G4, A100) fails with 503, then Round 2 G4 succeeds
+        # v0.3.2 R6: Round 1 (G4 503 -> fast-forward -> A100 503) fails,
+        # then Round 2 G4 (503) fast-forwards to A100 which succeeds.
+        # The successful allocation lands on A100, so the fake probe
+        # reports A100 hardware.
+        h.probe_output = "NVIDIA A100 80GB PCIe, 81920"
         h.new_failures = [
             RuntimeError("HTTP 503 Service Unavailable"),
             RuntimeError("HTTP 503 Service Unavailable"),
